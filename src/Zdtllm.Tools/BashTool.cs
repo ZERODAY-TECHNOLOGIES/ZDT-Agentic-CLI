@@ -67,6 +67,15 @@ public sealed class BashTool : ITool
 
     public string CurrentWorkingDirectory => _cwd;
 
+    /// <summary>Bash mutates _cwd — concurrent calls to the same instance race.</summary>
+    public bool CanRunInParallel => false;
+
+    /// <summary>
+    /// Each subagent gets its own BashTool that starts at the parent's CURRENT
+    /// working directory. After that, subagent and parent track cd independently.
+    /// </summary>
+    public ITool CloneForSubagent() => new BashTool(_cwd);
+
     public string? GetSpecifierForPermissions(JsonElement args) =>
         args.TryGetProperty("command", out var c) && c.ValueKind == JsonValueKind.String
             ? c.GetString()

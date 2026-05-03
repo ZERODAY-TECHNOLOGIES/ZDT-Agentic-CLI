@@ -20,6 +20,13 @@ public sealed class EditTool : ITool
             required = new[] { "file_path", "old_string", "new_string" },
         }));
 
+    /// <summary>
+    /// Edit is read-modify-write — two concurrent Edits to the same file can lose
+    /// the first write. We can't tell from the tool surface whether two concurrent
+    /// calls target the same path, so the conservative answer is "don't parallelise".
+    /// </summary>
+    public bool CanRunInParallel => false;
+
     public string? GetSpecifierForPermissions(JsonElement args) =>
         args.TryGetProperty("file_path", out var p) && p.ValueKind == JsonValueKind.String
             ? p.GetString()

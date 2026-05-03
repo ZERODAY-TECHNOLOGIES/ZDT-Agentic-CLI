@@ -62,12 +62,24 @@ public sealed class SubagentRunner : ISubagentRunner
             MaxTurns = request.MaxTurns,
         };
 
+        // Each subagent gets its OWN ContextManager mirroring the parent's settings —
+        // so its threshold tracking and auto-compact behaviour are independent from
+        // the parent's. Without this, a long-running subagent (e.g. a code-reviewer
+        // crawling 50 files) would silently exhaust its window without ever auto-compacting.
+        var subContext = _parent.Context is { } parentContext
+            ? new ContextManager(
+                parentContext.ContextWindow,
+                parentContext.MediumModel,
+                parentContext.SoftThreshold,
+                parentContext.HardThreshold)
+            : null;
+
         var subAgent = new AgentLoop(
             _parent.Client,
             subRegistry,
             _parent.Permissions,
             subOptions,
-            context: null); // subagent runs short — no own context manager
+            context: subContext);
 
         using var session = Session.NewEphemeral(subOptions.Model, subOptions.ToolCallingMode);
 
@@ -93,7 +105,9 @@ public sealed class SubagentRunner : ISubagentRunner
     /// <summary>
     /// Builds a registry for the requested type. The Task tool is always excluded
     /// to prevent recursive sub-spawning — if a subagent could call Task, you'd get
-    /// fork-bombs at best and exploding bills at worst.
+    /// fork-bombs at best and exploding bills at worst. Stateful tools (anything whose
+    /// CloneForSubagent override returns a fresh instance) are isolated per subagent so
+    /// parallel subagents don't race on shared mutable state (Bash's cwd, TodoWrite's list).
     /// </summary>
     internal static ToolRegistry BuildRegistryForType(string type, ToolRegistry parent)
     {
@@ -104,7 +118,7 @@ public sealed class SubagentRunner : ISubagentRunner
             foreach (var tool in parent.All)
             {
                 if (allowed.Contains(tool.Schema.Name))
-                    result.Register(tool);
+                    result.Register(tool.CloneForSubagent());
             }
         }
         else
@@ -113,7 +127,7 @@ public sealed class SubagentRunner : ISubagentRunner
             foreach (var tool in parent.All)
             {
                 if (tool.Schema.Name != "Task")
-                    result.Register(tool);
+                    result.Register(tool.CloneForSubagent());
             }
         }
 

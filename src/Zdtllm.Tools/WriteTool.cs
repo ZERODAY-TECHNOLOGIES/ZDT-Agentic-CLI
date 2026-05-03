@@ -18,6 +18,9 @@ public sealed class WriteTool : ITool
             required = new[] { "file_path", "content" },
         }));
 
+    /// <summary>Two concurrent Writes to the same path race — keep them serial.</summary>
+    public bool CanRunInParallel => false;
+
     public string? GetSpecifierForPermissions(JsonElement args) =>
         args.TryGetProperty("file_path", out var p) && p.ValueKind == JsonValueKind.String
             ? p.GetString()

@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using Spectre.Console;
 
 namespace Zdtllm.Tools;
 
@@ -68,8 +69,8 @@ public sealed class TaskTool : ITool
 
         try
         {
-            var result = await _runner.RunAsync(
-                new SubagentRequest(description!, prompt!, type, maxTurns), ct).ConfigureAwait(false);
+            var request = new SubagentRequest(description!, prompt!, type, maxTurns);
+            var result = await RunWithSpinnerAsync(request, ct).ConfigureAwait(false);
 
             var sb = new StringBuilder();
             sb.Append("[subagent ").Append(type)
@@ -86,6 +87,25 @@ public sealed class TaskTool : ITool
         {
             return ToolResult.Error($"Task: subagent failed: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// On a real terminal, wrap the subagent call in a Spectre Status spinner so the
+    /// user sees that something is happening (subagents can take 10-60s). Spectre
+    /// auto-falls-back to plain output when stdout isn't a TTY (CI, piped invocations,
+    /// most unit tests), so this never breaks scripted use.
+    /// </summary>
+    private async Task<SubagentResult> RunWithSpinnerAsync(SubagentRequest request, CancellationToken ct)
+    {
+        if (!AnsiConsole.Console.Profile.Capabilities.Interactive)
+            return await _runner.RunAsync(request, ct).ConfigureAwait(false);
+
+        var label = $"[#1BEACD]subagent ▸ {request.Type}[/] [#687B89]({Markup.Escape(request.Description)})[/]";
+        return await AnsiConsole.Status()
+            .Spinner(Spinner.Known.Dots)
+            .SpinnerStyle(new Style(new Color(0x1B, 0xEA, 0xCD)))
+            .StartAsync(label, async _ => await _runner.RunAsync(request, ct).ConfigureAwait(false))
+            .ConfigureAwait(false);
     }
 
     private static string? ReadString(JsonElement args, string name) =>

@@ -156,6 +156,65 @@ public sealed class SubagentRunnerTests
     }
 
     [Fact]
+    public void Subagent_registry_clones_stateful_tools_so_parent_state_is_isolated()
+    {
+        var parent = new ToolRegistry();
+        parent.Register(new ReadTool());
+        parent.Register(new BashTool(Path.GetTempPath()));
+        parent.Register(new TodoWriteTool());
+
+        var sub = SubagentRunner.BuildRegistryForType("general-purpose", parent);
+
+        // Stateless tool reuses the parent's instance.
+        sub.Get("Read").Should().BeSameAs(parent.Get("Read"));
+
+        // Stateful tools — fresh instances so parallel subagents don't race.
+        sub.Get("Bash").Should().NotBeSameAs(parent.Get("Bash"));
+        sub.Get("TodoWrite").Should().NotBeSameAs(parent.Get("TodoWrite"));
+    }
+
+    [Fact]
+    public async Task RunAsync_attaches_a_fresh_context_manager_when_parent_has_one()
+    {
+        var handler = new StubHandler(Sse(SimpleResponseSse("ok")));
+        var registry = new ToolRegistry();
+        var http = new HttpClient(handler);
+        var client = new LiteLLMClient(http, new LiteLLMClientOptions
+        {
+            BaseUrl = "http://stub", ApiKey = "k", MaxRetries = 0,
+            InitialBackoff = TimeSpan.FromMilliseconds(1),
+        });
+
+        // Parent has a ContextManager configured; we'll observe whether the subagent's
+        // own ContextManager picks up the streamed usage chunks (proving an instance was
+        // actually created and wired into the sub AgentLoop).
+        var parentContext = new ContextManager(contextWindow: 10_000, mediumModel: "med");
+        var parent = new AgentLoop(client, registry, PermissionRuleSet.Empty,
+            new AgentLoopOptions { Model = "test-model" }, context: parentContext);
+
+        var runner = new SubagentRunner(parent);
+        var result = await runner.RunAsync(new SubagentRequest("x", "do x"), CancellationToken.None);
+
+        // Parent's manager wasn't touched (subagent has its OWN).
+        parentContext.LastPromptTokens.Should().Be(0);
+        result.FinalText.Should().Be("ok");
+    }
+
+    [Fact]
+    public async Task RunAsync_skips_context_manager_when_parent_has_none()
+    {
+        var handler = new StubHandler(Sse(SimpleResponseSse("plain")));
+        var registry = new ToolRegistry();
+        var parent = BuildParentAgent(handler, registry);
+        // parent has Context == null
+
+        var runner = new SubagentRunner(parent);
+        var result = await runner.RunAsync(new SubagentRequest("x", "do x"), CancellationToken.None);
+
+        result.FinalText.Should().Be("plain");
+    }
+
+    [Fact]
     public async Task RunAsync_does_not_pollute_parent_via_streaming_to_real_console()
     {
         // The subagent should buffer its output internally — the parent's stdout never

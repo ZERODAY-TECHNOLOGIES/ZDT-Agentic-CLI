@@ -206,6 +206,28 @@ public sealed class AgentLoop
                 await ExecuteXmlRoundAsync(session, assistantText, xmlCalls, turn, ctx, output, status, ct)
                     .ConfigureAwait(false);
             }
+
+            // Mid-turn auto-compact: if the just-finished iteration pushed us past
+            // the hard threshold, summarise older history before the next iteration
+            // sends an even bigger context. This is the only path that fires inside
+            // a subagent (subagents have their own ContextManager and never hit the
+            // pre-prompt path that the parent's REPL might run).
+            if (_context is not null && _context.IsBeyondHardThreshold)
+            {
+                await status.WriteLineAsync(
+                    Palette.Red($"[auto-compact at {_context.UsagePercent}%]") + " " +
+                    Palette.Mute("summarising older turns mid-task to free context"))
+                    .ConfigureAwait(false);
+                try
+                {
+                    await _context.CompactAsync(session, _client, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    await status.WriteLineAsync(Palette.Red($"auto-compact failed: {ex.Message}"))
+                        .ConfigureAwait(false);
+                }
+            }
         }
 
         throw new InvalidOperationException(
@@ -228,14 +250,9 @@ public sealed class AgentLoop
         if (assistantText.Length > 0)
             await output.WriteLineAsync().ConfigureAwait(false);
 
-        foreach (var call in calls)
-        {
-            await status.WriteLineAsync(FormatStatusLine(call.FunctionName, call.Arguments))
-                .ConfigureAwait(false);
-
-            var resultContent = await ExecuteToolAsync(call, ctx, ct).ConfigureAwait(false);
-            session.AddTool(call.Id, resultContent);
-        }
+        var results = await DispatchToolCallsAsync(calls, ctx, status, ct).ConfigureAwait(false);
+        for (var i = 0; i < calls.Length; i++)
+            session.AddTool(calls[i].Id, results[i]);
     }
 
     private async Task ExecuteXmlRoundAsync(
@@ -259,18 +276,65 @@ public sealed class AgentLoop
         // session resumes and feeds back into its context next turn.
         session.AddAssistant(content: assistantText.ToString(), toolCalls: ImmutableArray<ToolCall>.Empty);
 
+        var calls = ImmutableArray.CreateBuilder<ToolCall>(xmlCalls.Count);
         for (var i = 0; i < xmlCalls.Count; i++)
         {
             var xml = xmlCalls[i];
-            var syntheticId = $"xml_{turn}_{i}";
-            var call = new ToolCall(syntheticId, xml.FunctionName, xml.ArgumentsJson);
+            calls.Add(new ToolCall($"xml_{turn}_{i}", xml.FunctionName, xml.ArgumentsJson));
+        }
+        var callsArr = calls.ToImmutable();
 
+        var results = await DispatchToolCallsAsync(callsArr, ctx, status, ct).ConfigureAwait(false);
+        for (var i = 0; i < callsArr.Length; i++)
+        {
+            session.AddUser($"EXECUTION RESULT of [{callsArr[i].FunctionName}]:\n{results[i]}");
+        }
+    }
+
+    /// <summary>
+    /// Run a batch of tool calls, parallelising via Task.WhenAll when every tool
+    /// in the batch reports CanRunInParallel, otherwise serialising. Status lines
+    /// are emitted before dispatch so the user sees both calls register up-front
+    /// when running concurrently. Each call's result text is returned in the same
+    /// order the calls were given so the caller can pair them with tool_call_ids.
+    /// </summary>
+    private async Task<string[]> DispatchToolCallsAsync(
+        ImmutableArray<ToolCall> calls,
+        ToolContext ctx,
+        TextWriter status,
+        CancellationToken ct)
+    {
+        if (calls.Length == 0) return Array.Empty<string>();
+
+        var allParallelisable = calls.All(c =>
+        {
+            var tool = _tools.Get(c.FunctionName);
+            return tool is not null && tool.CanRunInParallel;
+        });
+
+        foreach (var call in calls)
+        {
             await status.WriteLineAsync(FormatStatusLine(call.FunctionName, call.Arguments))
                 .ConfigureAwait(false);
-
-            var resultContent = await ExecuteToolAsync(call, ctx, ct).ConfigureAwait(false);
-            session.AddUser($"EXECUTION RESULT of [{call.FunctionName}]:\n{resultContent}");
         }
+        if (allParallelisable && calls.Length > 1)
+        {
+            await status.WriteLineAsync(Palette.Mute($"  ↳ dispatching {calls.Length} calls in parallel"))
+                .ConfigureAwait(false);
+        }
+
+        if (!allParallelisable || calls.Length == 1)
+        {
+            var sequential = new string[calls.Length];
+            for (var i = 0; i < calls.Length; i++)
+                sequential[i] = await ExecuteToolAsync(calls[i], ctx, ct).ConfigureAwait(false);
+            return sequential;
+        }
+
+        var tasks = new Task<string>[calls.Length];
+        for (var i = 0; i < calls.Length; i++)
+            tasks[i] = ExecuteToolAsync(calls[i], ctx, ct);
+        return await Task.WhenAll(tasks).ConfigureAwait(false);
     }
 
     private async Task<string> ExecuteToolAsync(ToolCall call, ToolContext ctx, CancellationToken ct)

@@ -83,24 +83,10 @@ public sealed class Repl
 
     private async Task ProcessUserTurnAsync(string prompt, CancellationToken ct)
     {
-        var ctx = _agent.Context;
-        if (ctx is not null && ctx.IsBeyondHardThreshold)
-        {
-            await _error.WriteLineAsync(
-                Palette.Red($"[auto-compact at {ctx.UsagePercent}%]") + " " +
-                Palette.Mute("summarizing older turns to free context"))
-                .ConfigureAwait(false);
-            try
-            {
-                await ctx.CompactAsync(_session, _agent.Client, ct).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                await _error.WriteLineAsync(Palette.Red($"zdt: auto-compact failed: {ex.Message}"))
-                    .ConfigureAwait(false);
-            }
-        }
-
+        // Mid-turn auto-compact (hard threshold) is now AgentLoop's responsibility — it
+        // fires between iterations regardless of whether we're driving the parent here
+        // or a subagent inside SubagentRunner. We keep ONLY the post-turn soft-threshold
+        // hint here because it's a UI nudge specific to the interactive REPL.
         try
         {
             await _agent.RunTurnAsync(_session, prompt, _output, _error, ct).ConfigureAwait(false);
@@ -114,6 +100,7 @@ public sealed class Repl
             await _error.WriteLineAsync(Palette.Red($"zdt: {ex.Message}")).ConfigureAwait(false);
         }
 
+        var ctx = _agent.Context;
         if (ctx is not null && ctx.IsBeyondSoftThreshold && !ctx.IsBeyondHardThreshold)
         {
             await _error.WriteLineAsync(

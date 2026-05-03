@@ -49,6 +49,12 @@ public sealed class TodoWriteTool : ITool
             required = new[] { "todos" },
         }));
 
+    /// <summary>Todo list is shared mutable state — concurrent rewrites would clobber each other.</summary>
+    public bool CanRunInParallel => false;
+
+    /// <summary>Each subagent maintains its own todo list independent of the parent's.</summary>
+    public ITool CloneForSubagent() => new TodoWriteTool();
+
     public string? GetSpecifierForPermissions(JsonElement args) => null;
 
     public Task<ToolResult> ExecuteAsync(JsonElement args, ToolContext ctx, CancellationToken ct)

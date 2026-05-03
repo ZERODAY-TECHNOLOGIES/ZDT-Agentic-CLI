@@ -24,4 +24,21 @@ public interface ITool
     string? GetSpecifierForPermissions(JsonElement args);
 
     Task<ToolResult> ExecuteAsync(JsonElement args, ToolContext ctx, CancellationToken ct);
+
+    /// <summary>
+    /// True when concurrent calls to the SAME tool instance are safe. AgentLoop
+    /// parallelises a turn's tool calls only if every tool involved in the batch
+    /// returns true. Tools with mutable instance state (Bash's working dir,
+    /// TodoWriteTool's todo list) and tools that race on a shared file (Edit / Write
+    /// targeting the same path) should return false. Default: true.
+    /// </summary>
+    bool CanRunInParallel => true;
+
+    /// <summary>
+    /// Returns an instance to use inside a subagent. Stateless tools return <c>this</c>
+    /// (their default). Stateful tools (BashTool's cwd, TodoWriteTool's list) return a
+    /// fresh instance so the subagent can mutate without affecting the parent. Defaults
+    /// to <c>this</c>.
+    /// </summary>
+    ITool CloneForSubagent() => this;
 }
