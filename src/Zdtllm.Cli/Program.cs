@@ -76,6 +76,8 @@ internal static class Program
 
         var registry = new ToolRegistry();
         registry.Register(new ReadTool());
+        registry.Register(new WriteTool());
+        registry.Register(new EditTool());
         registry.Register(new BashTool(cwd));
 
         var sessionsDir = Path.Combine(cwd, ".zdtllm", "sessions");
