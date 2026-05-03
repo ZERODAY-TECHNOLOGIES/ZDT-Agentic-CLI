@@ -68,8 +68,15 @@ public sealed class ReadTool : ITool
         }
     }
 
-    private static int TryGetInt(JsonElement args, string name, int fallback) =>
-        args.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var i)
-            ? i
-            : fallback;
+    private static int TryGetInt(JsonElement args, string name, int fallback)
+    {
+        if (!args.TryGetProperty(name, out var v)) return fallback;
+        return v.ValueKind switch
+        {
+            JsonValueKind.Number when v.TryGetInt32(out var n) => n,
+            // XML-mode tool calls deliver integers as strings; coerce gracefully.
+            JsonValueKind.String when int.TryParse(v.GetString(), out var s) => s,
+            _ => fallback,
+        };
+    }
 }

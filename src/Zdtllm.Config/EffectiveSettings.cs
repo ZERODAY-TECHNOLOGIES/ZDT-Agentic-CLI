@@ -71,6 +71,7 @@ public sealed record LiteLLMSettings(
     string? BaseUrl,
     string? ApiKey,
     int? TimeoutSeconds,
+    string? ToolCallingMode,
     ImmutableDictionary<string, string> Models,
     ImmutableDictionary<string, int> ContextWindows)
 {
@@ -78,6 +79,7 @@ public sealed record LiteLLMSettings(
         BaseUrl: null,
         ApiKey: null,
         TimeoutSeconds: null,
+        ToolCallingMode: null,
         Models: ImmutableDictionary<string, string>.Empty,
         ContextWindows: ImmutableDictionary<string, int>.Empty);
 
@@ -85,6 +87,7 @@ public sealed record LiteLLMSettings(
         BaseUrl: higher.BaseUrl ?? BaseUrl,
         ApiKey: higher.ApiKey ?? ApiKey,
         TimeoutSeconds: higher.TimeoutSeconds ?? TimeoutSeconds,
+        ToolCallingMode: higher.ToolCallingMode ?? ToolCallingMode,
         Models: EffectiveSettings.MergeOverride(Models, higher.Models),
         ContextWindows: EffectiveSettings.MergeOverride(ContextWindows, higher.ContextWindows));
 }

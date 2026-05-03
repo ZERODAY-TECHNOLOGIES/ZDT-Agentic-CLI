@@ -78,9 +78,7 @@ public sealed class BashTool : ITool
             return ToolResult.Error("Bash: missing 'command' parameter.");
 
         var command = cmdProp.GetString()!;
-        var timeoutMs = DefaultTimeoutMs;
-        if (args.TryGetProperty("timeout", out var t) && t.ValueKind == JsonValueKind.Number && t.TryGetInt32(out var tv))
-            timeoutMs = Math.Max(1, tv);
+        var timeoutMs = ResolveTimeoutMs(args);
 
         var wrapper = $"cd {ShellQuote(ToShellPath(_cwd))} || exit 1\n{command}\n__ZDT_EXIT=$?\nprintf '\\n%s\\n' '{CwdMarker}'\npwd\nexit $__ZDT_EXIT";
 
@@ -214,6 +212,18 @@ public sealed class BashTool : ITool
         s.Length <= MaxOutputBytes ? s : s[..MaxOutputBytes] + "\n[output truncated]";
 
     private static string ShellQuote(string s) => "'" + s.Replace("'", @"'\''") + "'";
+
+    private static int ResolveTimeoutMs(JsonElement args)
+    {
+        if (!args.TryGetProperty("timeout", out var t)) return DefaultTimeoutMs;
+        var resolved = t.ValueKind switch
+        {
+            JsonValueKind.Number when t.TryGetInt32(out var n) => n,
+            JsonValueKind.String when int.TryParse(t.GetString(), out var s) => s,
+            _ => DefaultTimeoutMs,
+        };
+        return Math.Max(1, resolved);
+    }
 
     private static void TryKill(Process p)
     {

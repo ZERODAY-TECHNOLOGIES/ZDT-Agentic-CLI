@@ -121,6 +121,7 @@ internal sealed class RawLiteLLM
     public string? BaseUrl { get; set; }
     public string? ApiKey { get; set; }
     public int? TimeoutSeconds { get; set; }
+    public string? ToolCallingMode { get; set; }
     public Dictionary<string, string>? Models { get; set; }
     public Dictionary<string, int>? ContextWindows { get; set; }
 
@@ -128,6 +129,7 @@ internal sealed class RawLiteLLM
         BaseUrl: EnvironmentExpander.ExpandNullable(BaseUrl, envRead),
         ApiKey: EnvironmentExpander.ExpandNullable(ApiKey, envRead),
         TimeoutSeconds: TimeoutSeconds,
+        ToolCallingMode: EnvironmentExpander.ExpandNullable(ToolCallingMode, envRead),
         Models: ToStringDict(Models, envRead),
         ContextWindows: ToIntDict(ContextWindows));
 

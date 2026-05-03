@@ -97,11 +97,16 @@ internal static class Program
         registry.Register(new ReadTool());
         registry.Register(new BashTool(cwd));
 
+        var toolCallingMode = ToolCallingModeParse.FromString(
+            parsed.ToolCallingMode ?? settings.LiteLLM.ToolCallingMode,
+            fallback: ToolCallingMode.Native);
+
         var agent = new AgentLoop(client, registry, perms, new AgentLoopOptions
         {
             Model = modelName,
             MaxTurns = parsed.MaxTurns ?? 30,
             SkipPermissions = parsed.DangerouslySkipPermissions,
+            ToolCallingMode = toolCallingMode,
         });
 
         await agent.RunOneShotAsync(
@@ -134,6 +139,9 @@ internal static class Program
                     break;
                 case "--dangerously-skip-permissions":
                     result.DangerouslySkipPermissions = true;
+                    break;
+                case "--tool-calling":
+                    result.ToolCallingMode = NextValue(args, ref i, "--tool-calling");
                     break;
                 case "--version":
                     result.ShowVersion = true;
@@ -177,6 +185,7 @@ internal static class Program
         Console.WriteLine("  --model <alias|name>           model alias (light/medium/heavy) or full name");
         Console.WriteLine("  --max-turns <n>                cap agent loop iterations (default 30)");
         Console.WriteLine("  --dangerously-skip-permissions auto-allow tools that would otherwise prompt");
+        Console.WriteLine("  --tool-calling <native|xml>    transport for tool calls (default: native)");
         Console.WriteLine("  --version                      print version and exit");
         Console.WriteLine("  -h, --help                     show this help");
         Console.WriteLine();
@@ -189,6 +198,7 @@ internal static class Program
         public string? Model { get; set; }
         public int? MaxTurns { get; set; }
         public bool DangerouslySkipPermissions { get; set; }
+        public string? ToolCallingMode { get; set; }
         public bool ShowVersion { get; set; }
         public bool ShowHelp { get; set; }
         public string? Query { get; set; }
