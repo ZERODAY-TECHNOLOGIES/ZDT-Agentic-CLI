@@ -74,11 +74,18 @@ internal static class Program
             ask: settings.Permissions.Ask,
             deny: settings.Permissions.Deny);
 
+        using var fetchHttp = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+
         var registry = new ToolRegistry();
         registry.Register(new ReadTool());
         registry.Register(new WriteTool());
         registry.Register(new EditTool());
         registry.Register(new BashTool(cwd));
+        registry.Register(new GlobTool());
+        registry.Register(new GrepTool());
+        registry.Register(new TodoWriteTool());
+        registry.Register(new WebFetchTool(fetchHttp));
+        registry.Register(new WebSearchTool());
 
         var sessionsDir = Path.Combine(cwd, ".zdtllm", "sessions");
         var recent = RecentTracker.ForUserHome();
