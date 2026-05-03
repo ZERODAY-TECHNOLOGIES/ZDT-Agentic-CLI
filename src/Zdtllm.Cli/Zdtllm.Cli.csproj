@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Zdtllm.Cli</RootNamespace>
+    <AssemblyName>zdt</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Zdtllm.Core\Zdtllm.Core.csproj" />
+    <ProjectReference Include="..\Zdtllm.Tools\Zdtllm.Tools.csproj" />
+    <ProjectReference Include="..\Zdtllm.Permissions\Zdtllm.Permissions.csproj" />
+    <ProjectReference Include="..\Zdtllm.Skills\Zdtllm.Skills.csproj" />
+    <ProjectReference Include="..\Zdtllm.Config\Zdtllm.Config.csproj" />
+    <ProjectReference Include="..\Zdtllm.LiteLLM\Zdtllm.LiteLLM.csproj" />
+  </ItemGroup>
+
+</Project>
