@@ -4,4 +4,8 @@
     <RootNamespace>Zdtllm.Config</RootNamespace>
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Zdtllm.Config.Tests" />
+  </ItemGroup>
+
 </Project>
