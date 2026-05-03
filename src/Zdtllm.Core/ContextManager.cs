@@ -44,6 +44,33 @@ public sealed class ContextManager
     public bool IsBeyondSoftThreshold => UsageFraction >= SoftThreshold;
     public bool IsBeyondHardThreshold => UsageFraction >= HardThreshold;
 
+    /// <summary>
+    /// Approximate per-role token usage for the current session, estimated at
+    /// 4 chars / token. Used by /context for the breakdown view; the totals
+    /// across roles will not match LastPromptTokens exactly because the API's
+    /// real tokeniser produces different counts, but the proportions are close
+    /// enough to show users which role is eating the budget.
+    /// </summary>
+    public static IReadOnlyDictionary<string, int> EstimateTokensByRole(Session session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        var result = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var msg in session.Messages)
+        {
+            var chars = msg.Content?.Length ?? 0;
+            if (!msg.ToolCalls.IsDefaultOrEmpty)
+            {
+                foreach (var tc in msg.ToolCalls)
+                    chars += tc.FunctionName.Length + tc.Arguments.Length + 16;
+            }
+            if (!string.IsNullOrEmpty(msg.ToolCallId)) chars += msg.ToolCallId.Length;
+
+            var tokens = (chars + 3) / 4;
+            result[msg.Role] = (result.TryGetValue(msg.Role, out var existing) ? existing : 0) + tokens;
+        }
+        return result;
+    }
+
     /// <summary>Called by AgentLoop after each turn's Usage chunk arrives.</summary>
     public void RegisterTurn(int promptTokens, int completionTokens)
     {

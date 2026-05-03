@@ -161,6 +161,10 @@ public sealed class Repl
                 await HandleCompactCommandAsync(ct).ConfigureAwait(false);
                 return SlashOutcome.Continue;
 
+            case "/context":
+                await HandleContextCommandAsync().ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
             default:
                 await _output.WriteLineAsync(
                         $"Unknown command: {cmd}. Type /help for the available commands.")
@@ -183,10 +187,11 @@ public sealed class Repl
         await _output.WriteLineAsync("  /exit, /quit     leave the REPL").ConfigureAwait(false);
         await _output.WriteLineAsync("  /clear           drop conversation history (system prompt kept)").ConfigureAwait(false);
         await _output.WriteLineAsync("  /status          show session id, model, mode, message count").ConfigureAwait(false);
+        await _output.WriteLineAsync("  /context         show current context-window usage and per-role breakdown").ConfigureAwait(false);
         await _output.WriteLineAsync("  /model <name>    switch model used by the next turn").ConfigureAwait(false);
         await _output.WriteLineAsync("  /permissions     show the current permission rule set").ConfigureAwait(false);
         await _output.WriteLineAsync("  /init            create ZDTLLM.md (project memory file) in the cwd").ConfigureAwait(false);
-        await _output.WriteLineAsync("  /compact         (Phase 3) summarize old turns to free context").ConfigureAwait(false);
+        await _output.WriteLineAsync("  /compact         summarize older turns to free context").ConfigureAwait(false);
     }
 
     private async Task PrintStatusAsync()
@@ -288,6 +293,72 @@ public sealed class Repl
         await _output.WriteLineAsync(
                 "  Defaults: tools requiring permission (Bash, Edit, Write, WebFetch, WebSearch, Skill) Ask without an explicit allow.")
             .ConfigureAwait(false);
+    }
+
+    private async Task HandleContextCommandAsync()
+    {
+        var ctx = _agent.Context;
+        if (ctx is null)
+        {
+            await _output.WriteLineAsync(
+                "/context requires a configured context window. Either expose model_info on " +
+                "your LiteLLM proxy (max_input_tokens) or set litellm.contextWindows.<tier> " +
+                "in settings.json.")
+                .ConfigureAwait(false);
+            return;
+        }
+
+        await _output.WriteLineAsync("Context usage:").ConfigureAwait(false);
+        await _output.WriteLineAsync().ConfigureAwait(false);
+
+        var bar = RenderBar(ctx.LastPromptTokens, ctx.ContextWindow, width: 30);
+        var totalLine = ctx.LastPromptTokens == 0
+            ? $"  {bar}  0%   (no turn has run yet — usage populates after the first response)"
+            : $"  {bar}  {ctx.UsagePercent}%   {ctx.LastPromptTokens:N0} / {ctx.ContextWindow:N0} tokens";
+        await _output.WriteLineAsync(totalLine).ConfigureAwait(false);
+
+        var byRole = ContextManager.EstimateTokensByRole(_session);
+        if (byRole.Count > 0)
+        {
+            await _output.WriteLineAsync().ConfigureAwait(false);
+            await _output.WriteLineAsync("  by role (estimated, 4 chars/token):").ConfigureAwait(false);
+
+            foreach (var role in new[] { "system", "user", "assistant", "tool" })
+            {
+                if (!byRole.TryGetValue(role, out var roleTokens) || roleTokens == 0) continue;
+                var roleBar = RenderBar(roleTokens, ctx.ContextWindow, width: 20);
+                var pct = (double)roleTokens / ctx.ContextWindow * 100;
+                await _output.WriteLineAsync(
+                        $"    {role,-10} {roleBar}  {FormatTokens(roleTokens),8}  ({pct,5:F1}%)")
+                    .ConfigureAwait(false);
+            }
+        }
+
+        await _output.WriteLineAsync().ConfigureAwait(false);
+        var soft = (int)(ctx.SoftThreshold * ctx.ContextWindow);
+        var hard = (int)(ctx.HardThreshold * ctx.ContextWindow);
+        await _output.WriteLineAsync($"  model: {_session.Model}").ConfigureAwait(false);
+        await _output.WriteLineAsync(
+                $"  /compact recommended at {ctx.SoftThreshold * 100:F0}% ({soft:N0} tokens)")
+            .ConfigureAwait(false);
+        await _output.WriteLineAsync(
+                $"  auto-compact at {ctx.HardThreshold * 100:F0}% ({hard:N0} tokens)")
+            .ConfigureAwait(false);
+    }
+
+    private static string RenderBar(int filled, int total, int width)
+    {
+        if (total <= 0 || width <= 0) return string.Empty;
+        var ratio = Math.Clamp((double)filled / total, 0, 1);
+        var on = (int)Math.Round(ratio * width);
+        return new string('▰', on) + new string('▱', width - on);
+    }
+
+    private static string FormatTokens(int n)
+    {
+        if (n < 1000) return n.ToString();
+        if (n < 1_000_000) return $"{n / 1000.0:F1}k";
+        return $"{n / 1_000_000.0:F1}M";
     }
 
     private string SessionDisplay() => _session.IsPersistent ? _session.Id : $"{_session.Id} (ephemeral)";

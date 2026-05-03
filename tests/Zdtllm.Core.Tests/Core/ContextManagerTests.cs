@@ -215,6 +215,37 @@ public sealed class ContextManagerTests : IDisposable
     }
 
     [Fact]
+    public void EstimateTokensByRole_groups_by_role_via_4_chars_per_token()
+    {
+        using var session = Session.NewEphemeral("m");
+        session.AddSystem("aaaa");                   // 4 chars → 1 token
+        session.AddUser("bbbbbbbb");                  // 8 chars → 2 tokens
+        session.AddAssistant("cccccccccccc");         // 12 chars → 3 tokens
+        session.AddTool("call_1", "dddd");            // 4 + 6 (id) = 10 chars → 3 tokens
+
+        var byRole = ContextManager.EstimateTokensByRole(session);
+
+        byRole["system"].Should().Be(1);
+        byRole["user"].Should().Be(2);
+        byRole["assistant"].Should().Be(3);
+        byRole["tool"].Should().BeGreaterThanOrEqualTo(3);
+    }
+
+    [Fact]
+    public void EstimateTokensByRole_counts_assistant_tool_call_arguments_too()
+    {
+        using var session = Session.NewEphemeral("m");
+        session.AddAssistant(
+            content: null,
+            toolCalls: ImmutableArray.Create(
+                new ToolCall("c1", "Read", "{\"path\":\"./README.md\"}")));
+
+        var byRole = ContextManager.EstimateTokensByRole(session);
+
+        byRole["assistant"].Should().BeGreaterThan(0);
+    }
+
+    [Fact]
     public async Task CompactAsync_resets_LastPromptTokens_so_warnings_stop()
     {
         var store = SessionStore.Create(_tempDir);

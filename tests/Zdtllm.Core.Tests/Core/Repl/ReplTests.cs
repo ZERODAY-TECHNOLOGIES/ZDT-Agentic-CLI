@@ -29,6 +29,10 @@ public sealed class ReplTests : IDisposable
 
     private (Zdtllm.Core.Repl.Repl repl, Session session, StringWriter output, StringWriter error)
         BuildRepl(string scriptedInput, params HttpResponseMessage[] llmResponses)
+        => BuildRepl(scriptedInput, contextManager: null, llmResponses);
+
+    private (Zdtllm.Core.Repl.Repl repl, Session session, StringWriter output, StringWriter error)
+        BuildRepl(string scriptedInput, ContextManager? contextManager, params HttpResponseMessage[] llmResponses)
     {
         var session = Session.NewEphemeral("test-model");
 
@@ -43,7 +47,8 @@ public sealed class ReplTests : IDisposable
             client,
             new ToolRegistry(),
             PermissionRuleSet.Empty,
-            new AgentLoopOptions { Model = "test-model" });
+            new AgentLoopOptions { Model = "test-model" },
+            context: contextManager);
 
         var input = new StringReader(scriptedInput);
         var output = new StringWriter();
@@ -201,6 +206,46 @@ public sealed class ReplTests : IDisposable
 
         output.ToString().Should().Contain("rules:");
         output.ToString().Should().Contain("deny=0 ask=0 allow=0");
+    }
+
+    [Fact]
+    public async Task Slash_context_without_context_manager_explains_how_to_configure()
+    {
+        // BuildRepl creates an AgentLoop without a ContextManager (Cli wires that up).
+        var (repl, _, output, _) = BuildRepl("/context\n/exit\n");
+
+        await repl.RunAsync();
+
+        var text = output.ToString();
+        text.Should().Contain("/context requires");
+        text.Should().Contain("max_input_tokens");
+        text.Should().Contain("contextWindows");
+    }
+
+    [Fact]
+    public async Task Slash_context_with_populated_usage_renders_bar_and_per_role_breakdown()
+    {
+        var ctx = new ContextManager(contextWindow: 100_000, mediumModel: "med");
+        ctx.RegisterTurn(promptTokens: 25_000, completionTokens: 500);
+
+        var (repl, session, output, _) = BuildRepl("/context\n/exit\n", ctx);
+        // Pre-seed session so per-role breakdown has something to estimate.
+        session.AddSystem("you are zdt");
+        session.AddUser("first question");
+        session.AddAssistant("first answer with some longer content to estimate from");
+
+        await repl.RunAsync();
+
+        var text = output.ToString();
+        text.Should().Contain("Context usage:");
+        text.Should().Contain("25%");           // 25,000 / 100,000
+        text.Should().Contain("25,000");
+        text.Should().Contain("100,000");
+        text.Should().Contain("by role");
+        text.Should().Contain("system");
+        text.Should().Contain("assistant");
+        text.Should().Contain("/compact recommended at 80%");
+        text.Should().Contain("auto-compact at 90%");
     }
 
     [Fact]

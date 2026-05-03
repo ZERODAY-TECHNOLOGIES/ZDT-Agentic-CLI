@@ -42,6 +42,61 @@ public sealed class LiteLLMClient
     }
 
     /// <summary>
+    /// Calls the LiteLLM proxy's /model/info admin route and parses the response into
+    /// ModelInfo records. Returns an empty list (rather than throwing) on any failure
+    /// — callers fall back to settings.contextWindows. Honors a 10s timeout independent
+    /// of the configured RequestTimeout because /model/info shouldn't gate startup.
+    /// </summary>
+    public async Task<IReadOnlyList<ModelInfo>> GetModelInfoAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            var url = $"{_options.BaseUrl.TrimEnd('/')}/model/info";
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _options.ApiKey);
+
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromSeconds(10));
+
+            using var response = await _http.SendAsync(request, cts.Token).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode) return Array.Empty<ModelInfo>();
+
+            var json = await response.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false);
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
+                return Array.Empty<ModelInfo>();
+
+            var result = new List<ModelInfo>();
+            foreach (var item in data.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object) continue;
+                var modelName = item.TryGetProperty("model_name", out var mn) && mn.ValueKind == JsonValueKind.String
+                    ? mn.GetString() : null;
+                if (string.IsNullOrEmpty(modelName)) continue;
+
+                var info = item.TryGetProperty("model_info", out var mi) && mi.ValueKind == JsonValueKind.Object ? mi : default;
+                result.Add(new ModelInfo(
+                    modelName,
+                    MaxInputTokens: ReadNullableInt(info, "max_input_tokens"),
+                    MaxOutputTokens: ReadNullableInt(info, "max_output_tokens"),
+                    MaxTokens: ReadNullableInt(info, "max_tokens")));
+            }
+            return result;
+        }
+        catch
+        {
+            return Array.Empty<ModelInfo>();
+        }
+    }
+
+    private static int? ReadNullableInt(JsonElement parent, string name)
+    {
+        if (parent.ValueKind != JsonValueKind.Object) return null;
+        if (!parent.TryGetProperty(name, out var v)) return null;
+        return v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var n) ? n : null;
+    }
+
+    /// <summary>
     /// Single non-streaming completion. Internally drains StreamChatAsync and concatenates
     /// every TextDelta into one string. Tools are not sent (this is meant for one-shot
     /// summarisation / classification calls). Returns the full text after the model emits

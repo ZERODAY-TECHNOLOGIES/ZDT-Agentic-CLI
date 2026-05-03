@@ -105,7 +105,8 @@ internal static class Program
 
         using var session = ResolveSession(parsed, settings, sessionsDir, recent, cwd, defaultPersistent: !parsed.PrintMode);
 
-        var contextManager = BuildContextManager(parsed, settings);
+        var contextManager = await BuildContextManagerAsync(parsed, settings, client, session.Model)
+            .ConfigureAwait(false);
 
         var baseText = ResolveBaseSystemPrompt(parsed);
         var appendText = ResolveAppendSystemPrompt(parsed);
@@ -206,22 +207,44 @@ internal static class Program
     }
 
     /// <summary>
-    /// Build the ContextManager if we know the active model's tier and its context window.
-    /// Returns null when the user passed a raw model name (not a tier alias) or when the
-    /// settings file doesn't carry a contextWindows entry for that tier — in that case we
-    /// silently skip context tracking rather than guessing a window size.
+    /// Resolve a context window for the active model, in priority order:
+    ///   1. settings.litellm.contextWindows[<alias>] — explicit user config wins.
+    ///   2. LiteLLM /model/info → model_info.max_input_tokens (or max_tokens) for
+    ///      the resolved model name.
+    ///   3. null → no context tracking, /context tells the user how to fix it.
     /// </summary>
-    private static ContextManager? BuildContextManager(ParsedArgs parsed, EffectiveSettings settings)
+    private static async Task<ContextManager?> BuildContextManagerAsync(
+        ParsedArgs parsed,
+        EffectiveSettings settings,
+        LiteLLMClient client,
+        string resolvedModel)
     {
+        int? window = null;
+
         var alias = parsed.Model ?? settings.Model;
-        if (string.IsNullOrEmpty(alias)) return null;
-        if (!settings.LiteLLM.ContextWindows.TryGetValue(alias, out var window) || window <= 0) return null;
+        if (!string.IsNullOrEmpty(alias)
+            && settings.LiteLLM.ContextWindows.TryGetValue(alias, out var fromSettings)
+            && fromSettings > 0)
+        {
+            window = fromSettings;
+        }
+
+        if (window is null)
+        {
+            var modelInfos = await client.GetModelInfoAsync().ConfigureAwait(false);
+            var match = modelInfos.FirstOrDefault(m =>
+                string.Equals(m.ModelName, resolvedModel, StringComparison.Ordinal));
+            if (match?.EffectiveContextWindow is int apiWindow && apiWindow > 0)
+                window = apiWindow;
+        }
+
+        if (window is null) return null;
 
         var mediumName = settings.LiteLLM.Models.TryGetValue("medium", out var m) && !string.IsNullOrEmpty(m)
             ? m
-            : (settings.LiteLLM.Models.TryGetValue(alias, out var fallback) ? fallback : alias);
+            : resolvedModel;
 
-        return new ContextManager(window, mediumName);
+        return new ContextManager(window.Value, mediumName);
     }
 
     private static async Task<EffectiveSettings?> MaybeRunWizardAsync(
