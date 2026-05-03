@@ -52,7 +52,7 @@ public sealed class Repl
 
         while (!ct.IsCancellationRequested)
         {
-            await _output.WriteAsync("> ").ConfigureAwait(false);
+            await _output.WriteAsync(Palette.Cyan("> ")).ConfigureAwait(false);
             await _output.FlushAsync(ct).ConfigureAwait(false);
 
             string? line;
@@ -87,7 +87,8 @@ public sealed class Repl
         if (ctx is not null && ctx.IsBeyondHardThreshold)
         {
             await _error.WriteLineAsync(
-                $"[auto-compact at {ctx.UsagePercent}% — summarizing older turns to free context]")
+                Palette.Red($"[auto-compact at {ctx.UsagePercent}%]") + " " +
+                Palette.Mute("summarizing older turns to free context"))
                 .ConfigureAwait(false);
             try
             {
@@ -95,7 +96,7 @@ public sealed class Repl
             }
             catch (Exception ex)
             {
-                await _error.WriteLineAsync($"zdt: auto-compact failed: {ex.Message}")
+                await _error.WriteLineAsync(Palette.Red($"zdt: auto-compact failed: {ex.Message}"))
                     .ConfigureAwait(false);
             }
         }
@@ -106,17 +107,18 @@ public sealed class Repl
         }
         catch (OperationCanceledException)
         {
-            await _error.WriteLineAsync("(turn cancelled)").ConfigureAwait(false);
+            await _error.WriteLineAsync(Palette.Mute("(turn cancelled)")).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            await _error.WriteLineAsync($"zdt: {ex.Message}").ConfigureAwait(false);
+            await _error.WriteLineAsync(Palette.Red($"zdt: {ex.Message}")).ConfigureAwait(false);
         }
 
         if (ctx is not null && ctx.IsBeyondSoftThreshold && !ctx.IsBeyondHardThreshold)
         {
             await _error.WriteLineAsync(
-                $"[context at {ctx.UsagePercent}% — /compact recommended]")
+                Palette.Gold($"[context at {ctx.UsagePercent}%]") + " " +
+                Palette.Mute("/compact recommended"))
                 .ConfigureAwait(false);
         }
     }
@@ -137,7 +139,8 @@ public sealed class Repl
 
             case "/clear":
                 _session.ClearKeepingSystem();
-                await _output.WriteLineAsync("Conversation history cleared (system prompt kept).")
+                await _output.WriteLineAsync(
+                    Palette.Cyan("✓") + " " + Palette.Mute("Conversation history cleared (system prompt kept)."))
                     .ConfigureAwait(false);
                 return SlashOutcome.Continue;
 
@@ -167,7 +170,8 @@ public sealed class Repl
 
             default:
                 await _output.WriteLineAsync(
-                        $"Unknown command: {cmd}. Type /help for the available commands.")
+                        Palette.Red($"Unknown command: {cmd}.") + " " +
+                        Palette.Mute("Type ") + Palette.Body("/help") + Palette.Mute(" for the available commands."))
                     .ConfigureAwait(false);
                 return SlashOutcome.Continue;
         }
@@ -182,31 +186,35 @@ public sealed class Repl
 
     private async Task PrintHelpAsync()
     {
-        await _output.WriteLineAsync("Available commands:").ConfigureAwait(false);
-        await _output.WriteLineAsync("  /help            show this list").ConfigureAwait(false);
-        await _output.WriteLineAsync("  /exit, /quit     leave the REPL").ConfigureAwait(false);
-        await _output.WriteLineAsync("  /clear           drop conversation history (system prompt kept)").ConfigureAwait(false);
-        await _output.WriteLineAsync("  /status          show session id, model, mode, message count").ConfigureAwait(false);
-        await _output.WriteLineAsync("  /context         show current context-window usage and per-role breakdown").ConfigureAwait(false);
-        await _output.WriteLineAsync("  /model <name>    switch model used by the next turn").ConfigureAwait(false);
-        await _output.WriteLineAsync("  /permissions     show the current permission rule set").ConfigureAwait(false);
-        await _output.WriteLineAsync("  /init            create ZDTLLM.md (project memory file) in the cwd").ConfigureAwait(false);
-        await _output.WriteLineAsync("  /compact         summarize older turns to free context").ConfigureAwait(false);
+        await _output.WriteLineAsync(Palette.BodyBold("Available commands:")).ConfigureAwait(false);
+        await WriteCommandRowAsync("/help", "show this list").ConfigureAwait(false);
+        await WriteCommandRowAsync("/exit, /quit", "leave the REPL").ConfigureAwait(false);
+        await WriteCommandRowAsync("/clear", "drop conversation history (system prompt kept)").ConfigureAwait(false);
+        await WriteCommandRowAsync("/status", "show session id, model, mode, message count").ConfigureAwait(false);
+        await WriteCommandRowAsync("/context", "show current context-window usage and per-role breakdown").ConfigureAwait(false);
+        await WriteCommandRowAsync("/model <name>", "switch model used by the next turn").ConfigureAwait(false);
+        await WriteCommandRowAsync("/permissions", "show the current permission rule set").ConfigureAwait(false);
+        await WriteCommandRowAsync("/init", "create ZDTLLM.md (project memory file) in the cwd").ConfigureAwait(false);
+        await WriteCommandRowAsync("/compact", "summarize older turns to free context").ConfigureAwait(false);
     }
+
+    private Task WriteCommandRowAsync(string command, string description) =>
+        _output.WriteLineAsync($"  {Palette.Cyan(command),-26} {Palette.Mute(description)}");
 
     private async Task PrintStatusAsync()
     {
-        await _output.WriteLineAsync($"  session: {SessionDisplay()}").ConfigureAwait(false);
-        await _output.WriteLineAsync($"  model: {_session.Model}").ConfigureAwait(false);
-        await _output.WriteLineAsync($"  mode: {_session.Mode.ToString().ToLowerInvariant()}").ConfigureAwait(false);
-        await _output.WriteLineAsync($"  messages: {_session.Messages.Count}").ConfigureAwait(false);
-        await _output.WriteLineAsync($"  cwd: {_cwd}").ConfigureAwait(false);
+        await _output.WriteLineAsync($"  {Palette.Mute("session:")} {Palette.Body(SessionDisplay())}").ConfigureAwait(false);
+        await _output.WriteLineAsync($"  {Palette.Mute("model:")} {Palette.GoldBold(_session.Model)}").ConfigureAwait(false);
+        await _output.WriteLineAsync($"  {Palette.Mute("mode:")} {Palette.Body(_session.Mode.ToString().ToLowerInvariant())}").ConfigureAwait(false);
+        await _output.WriteLineAsync($"  {Palette.Mute("messages:")} {Palette.Body(_session.Messages.Count.ToString())}").ConfigureAwait(false);
+        await _output.WriteLineAsync($"  {Palette.Mute("cwd:")} {Palette.Body(_cwd)}").ConfigureAwait(false);
 
         var ctx = _agent.Context;
         if (ctx is not null)
         {
             await _output.WriteLineAsync(
-                $"  context: {ctx.LastPromptTokens} / {ctx.ContextWindow} tokens ({ctx.UsagePercent}%)")
+                $"  {Palette.Mute("context:")} {Palette.Body($"{ctx.LastPromptTokens:N0} / {ctx.ContextWindow:N0}")} " +
+                Palette.Mute($"tokens ({ctx.UsagePercent}%)"))
                 .ConfigureAwait(false);
         }
     }
@@ -217,7 +225,7 @@ public sealed class Repl
         if (ctx is null)
         {
             await _output.WriteLineAsync(
-                "/compact requires a configured context window. Set litellm.contextWindows.<tier> in settings.")
+                Palette.Mute("/compact requires a configured context window. Set litellm.contextWindows.<tier> in settings."))
                 .ConfigureAwait(false);
             return;
         }
@@ -225,14 +233,24 @@ public sealed class Repl
         try
         {
             var collapsed = await ctx.CompactAsync(_session, _agent.Client, ct).ConfigureAwait(false);
-            await _output.WriteLineAsync(collapsed == 0
-                ? "Nothing to compact — fewer than 5 user turns in history."
-                : $"Compacted {collapsed} message(s) into a summary; the last 4 user turns are preserved.")
-                .ConfigureAwait(false);
+            if (collapsed == 0)
+            {
+                await _output.WriteLineAsync(
+                    Palette.Mute("Nothing to compact — fewer than 5 user turns in history."))
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                await _output.WriteLineAsync(
+                    Palette.Cyan("✓") + " " +
+                    Palette.Body($"Compacted {collapsed} message(s) into a summary; ") +
+                    Palette.Mute("the last 4 user turns are preserved."))
+                    .ConfigureAwait(false);
+            }
         }
         catch (Exception ex)
         {
-            await _error.WriteLineAsync($"zdt: /compact failed: {ex.Message}").ConfigureAwait(false);
+            await _error.WriteLineAsync(Palette.Red($"zdt: /compact failed: {ex.Message}")).ConfigureAwait(false);
         }
     }
 
@@ -241,7 +259,9 @@ public sealed class Repl
         var path = Path.Combine(_cwd, "ZDTLLM.md");
         if (File.Exists(path))
         {
-            await _output.WriteLineAsync($"ZDTLLM.md already exists at {path} — leaving it alone.")
+            await _output.WriteLineAsync(
+                Palette.Mute($"ZDTLLM.md already exists at ") + Palette.Body(path) +
+                Palette.Mute(" — leaving it alone."))
                 .ConfigureAwait(false);
             return;
         }
@@ -266,20 +286,24 @@ public sealed class Repl
             """;
 
         await File.WriteAllTextAsync(path, Template, ct).ConfigureAwait(false);
-        await _output.WriteLineAsync($"Created {path}").ConfigureAwait(false);
+        await _output.WriteLineAsync(Palette.Cyan("✓") + " " + Palette.Body($"Created {path}"))
+            .ConfigureAwait(false);
     }
 
     private async Task HandleModelCommandAsync(string args)
     {
         if (string.IsNullOrWhiteSpace(args))
         {
-            await _output.WriteLineAsync($"Current model: {_session.Model}").ConfigureAwait(false);
-            await _output.WriteLineAsync("Usage: /model <name>").ConfigureAwait(false);
+            await _output.WriteLineAsync($"{Palette.Mute("Current model:")} {Palette.GoldBold(_session.Model)}")
+                .ConfigureAwait(false);
+            await _output.WriteLineAsync(Palette.Mute("Usage: /model <name>")).ConfigureAwait(false);
             return;
         }
 
         _session.SetModel(args.Trim());
-        await _output.WriteLineAsync($"Model set to {_session.Model} (takes effect on next turn).")
+        await _output.WriteLineAsync(
+            Palette.Cyan("✓") + " " + Palette.Body($"Model set to {_session.Model}") +
+            Palette.Mute(" (takes effect on next turn)."))
             .ConfigureAwait(false);
     }
 
@@ -288,10 +312,13 @@ public sealed class Repl
         var rs = _agent.Permissions;
         var counts = rs.RuleCounts;
         await _output.WriteLineAsync(
-                $"  rules: deny={counts.deny} ask={counts.ask} allow={counts.allow}")
+                $"  {Palette.Mute("rules:")} " +
+                $"{Palette.Red($"deny={counts.deny}")} " +
+                $"{Palette.Gold($"ask={counts.ask}")} " +
+                $"{Palette.Cyan($"allow={counts.allow}")}")
             .ConfigureAwait(false);
         await _output.WriteLineAsync(
-                "  Defaults: tools requiring permission (Bash, Edit, Write, WebFetch, WebSearch, Skill) Ask without an explicit allow.")
+                Palette.Mute("  Defaults: tools requiring permission (Bash, Edit, Write, WebFetch, WebSearch, Skill) Ask without an explicit allow."))
             .ConfigureAwait(false);
     }
 
@@ -301,35 +328,40 @@ public sealed class Repl
         if (ctx is null)
         {
             await _output.WriteLineAsync(
-                "/context requires a configured context window. Either expose model_info on " +
-                "your LiteLLM proxy (max_input_tokens) or set litellm.contextWindows.<tier> " +
-                "in settings.json.")
+                Palette.Mute(
+                    "/context requires a configured context window. Either expose model_info on " +
+                    "your LiteLLM proxy (max_input_tokens) or set litellm.contextWindows.<tier> " +
+                    "in settings.json."))
                 .ConfigureAwait(false);
             return;
         }
 
-        await _output.WriteLineAsync("Context usage:").ConfigureAwait(false);
+        await _output.WriteLineAsync(Palette.BodyBold("Context usage:")).ConfigureAwait(false);
         await _output.WriteLineAsync().ConfigureAwait(false);
 
-        var bar = RenderBar(ctx.LastPromptTokens, ctx.ContextWindow, width: 30);
+        var bar = Palette.Bar(ctx.LastPromptTokens, ctx.ContextWindow, width: 30);
         var totalLine = ctx.LastPromptTokens == 0
-            ? $"  {bar}  0%   (no turn has run yet — usage populates after the first response)"
-            : $"  {bar}  {ctx.UsagePercent}%   {ctx.LastPromptTokens:N0} / {ctx.ContextWindow:N0} tokens";
+            ? $"  {bar}  {Palette.Mute("0%")}   {Palette.Mute("(no turn has run yet — usage populates after the first response)")}"
+            : $"  {bar}  {ColorPercent(ctx.UsagePercent, ctx)}   " +
+              $"{Palette.Body($"{ctx.LastPromptTokens:N0}")} {Palette.Mute("/")} " +
+              $"{Palette.Body($"{ctx.ContextWindow:N0}")} {Palette.Mute("tokens")}";
         await _output.WriteLineAsync(totalLine).ConfigureAwait(false);
 
         var byRole = ContextManager.EstimateTokensByRole(_session);
         if (byRole.Count > 0)
         {
             await _output.WriteLineAsync().ConfigureAwait(false);
-            await _output.WriteLineAsync("  by role (estimated, 4 chars/token):").ConfigureAwait(false);
+            await _output.WriteLineAsync(Palette.Mute("  by role (estimated, 4 chars/token):")).ConfigureAwait(false);
 
             foreach (var role in new[] { "system", "user", "assistant", "tool" })
             {
                 if (!byRole.TryGetValue(role, out var roleTokens) || roleTokens == 0) continue;
-                var roleBar = RenderBar(roleTokens, ctx.ContextWindow, width: 20);
+                var roleBar = Palette.Bar(roleTokens, ctx.ContextWindow, width: 20);
                 var pct = (double)roleTokens / ctx.ContextWindow * 100;
                 await _output.WriteLineAsync(
-                        $"    {role,-10} {roleBar}  {FormatTokens(roleTokens),8}  ({pct,5:F1}%)")
+                        $"    {Palette.Mute(role.PadRight(10))} {roleBar}  " +
+                        $"{Palette.Body(FormatTokens(roleTokens).PadLeft(8))}  " +
+                        $"{Palette.Mute($"({pct,5:F1}%)")}")
                     .ConfigureAwait(false);
             }
         }
@@ -337,21 +369,23 @@ public sealed class Repl
         await _output.WriteLineAsync().ConfigureAwait(false);
         var soft = (int)(ctx.SoftThreshold * ctx.ContextWindow);
         var hard = (int)(ctx.HardThreshold * ctx.ContextWindow);
-        await _output.WriteLineAsync($"  model: {_session.Model}").ConfigureAwait(false);
+        await _output.WriteLineAsync($"  {Palette.Mute("model:")} {Palette.GoldBold(_session.Model)}").ConfigureAwait(false);
         await _output.WriteLineAsync(
-                $"  /compact recommended at {ctx.SoftThreshold * 100:F0}% ({soft:N0} tokens)")
+                $"  {Palette.Gold("/compact recommended at")} {Palette.Body($"{ctx.SoftThreshold * 100:F0}%")} " +
+                Palette.Mute($"({soft:N0} tokens)"))
             .ConfigureAwait(false);
         await _output.WriteLineAsync(
-                $"  auto-compact at {ctx.HardThreshold * 100:F0}% ({hard:N0} tokens)")
+                $"  {Palette.Red("auto-compact at")} {Palette.Body($"{ctx.HardThreshold * 100:F0}%")} " +
+                Palette.Mute($"({hard:N0} tokens)"))
             .ConfigureAwait(false);
     }
 
-    private static string RenderBar(int filled, int total, int width)
+    private static string ColorPercent(int pct, ContextManager ctx)
     {
-        if (total <= 0 || width <= 0) return string.Empty;
-        var ratio = Math.Clamp((double)filled / total, 0, 1);
-        var on = (int)Math.Round(ratio * width);
-        return new string('▰', on) + new string('▱', width - on);
+        var colored = ctx.IsBeyondHardThreshold ? Palette.Red($"{pct}%")
+                    : ctx.IsBeyondSoftThreshold ? Palette.Gold($"{pct}%")
+                    : Palette.Body($"{pct}%");
+        return colored;
     }
 
     private static string FormatTokens(int n)

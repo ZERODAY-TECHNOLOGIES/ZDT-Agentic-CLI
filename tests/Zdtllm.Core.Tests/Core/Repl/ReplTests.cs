@@ -142,9 +142,14 @@ public sealed class ReplTests : IDisposable
         await repl.RunAsync();
 
         var text = output.ToString();
-        text.Should().Contain($"session: {session.Id}");
-        text.Should().Contain("model: test-model");
-        text.Should().Contain("messages: 0");
+        // Brand-palette coloring inserts ANSI escape sequences between key and value, so
+        // we assert each token individually rather than as a contiguous substring.
+        text.Should().Contain("session:");
+        text.Should().Contain(session.Id);
+        text.Should().Contain("model:");
+        text.Should().Contain("test-model");
+        text.Should().Contain("messages:");
+        text.Should().Contain("0");
     }
 
     [Fact]
@@ -194,7 +199,9 @@ public sealed class ReplTests : IDisposable
 
         await repl.RunAsync();
 
-        output.ToString().Should().Contain("Current model: test-model");
+        var text = output.ToString();
+        text.Should().Contain("Current model:");
+        text.Should().Contain("test-model");
     }
 
     [Fact]
@@ -204,8 +211,12 @@ public sealed class ReplTests : IDisposable
 
         await repl.RunAsync();
 
-        output.ToString().Should().Contain("rules:");
-        output.ToString().Should().Contain("deny=0 ask=0 allow=0");
+        var text = output.ToString();
+        text.Should().Contain("rules:");
+        // Each rule-count token gets its own colour, so assert per-token.
+        text.Should().Contain("deny=0");
+        text.Should().Contain("ask=0");
+        text.Should().Contain("allow=0");
     }
 
     [Fact]
@@ -244,8 +255,11 @@ public sealed class ReplTests : IDisposable
         text.Should().Contain("by role");
         text.Should().Contain("system");
         text.Should().Contain("assistant");
-        text.Should().Contain("/compact recommended at 80%");
-        text.Should().Contain("auto-compact at 90%");
+        // Brand palette wraps the threshold values so we assert tokens individually.
+        text.Should().Contain("/compact recommended at");
+        text.Should().Contain("80%");
+        text.Should().Contain("auto-compact at");
+        text.Should().Contain("90%");
     }
 
     [Fact]

@@ -309,7 +309,7 @@ public sealed class AgentLoop
     }
 
     private static string FormatStatusLine(string toolName, string arguments) =>
-        $"[{toolName}] {Truncate(arguments, 80)}";
+        $"{Palette.Cyan($"[{toolName}]")} {Palette.Mute(Truncate(arguments, 80))}";
 
     private static string Truncate(string s, int max) =>
         s.Length <= max ? s : string.Concat(s.AsSpan(0, max), "…");
