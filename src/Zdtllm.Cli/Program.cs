@@ -3,6 +3,7 @@ using Zdtllm.Config;
 using Zdtllm.Core;
 using Zdtllm.Core.Repl;
 using Zdtllm.Core.Sessions;
+using Zdtllm.Core.Setup;
 using Zdtllm.LiteLLM;
 using Zdtllm.Permissions;
 using Zdtllm.Tools;
@@ -51,13 +52,15 @@ internal static class Program
         var settings = SettingsLoader.LoadEffectiveSettings(cwd);
 
         if (string.IsNullOrEmpty(settings.LiteLLM.BaseUrl))
-            throw new InvalidOperationException(
-                "litellm.baseUrl is not configured. Set it in .zdtllm/settings.json.");
+        {
+            settings = await MaybeRunWizardAsync(parsed, settings, cwd).ConfigureAwait(false);
+            if (settings is null) return 0; // user aborted the wizard
+        }
 
-        if (string.IsNullOrEmpty(settings.LiteLLM.ApiKey))
+        if (string.IsNullOrEmpty(settings.LiteLLM.BaseUrl))
             throw new InvalidOperationException(
-                "litellm.apiKey is not configured. Set it in .zdtllm/settings.json " +
-                "(use \"${ZDTLLM_API_KEY}\" to read from the environment).");
+                "litellm.baseUrl is still not configured. Run `zdt` interactively (no -p) to launch " +
+                "the setup wizard, or edit ~/.zdtllm/settings.json by hand.");
 
         using var http = new HttpClient
         {
@@ -127,6 +130,28 @@ internal static class Program
     /// (resume by id), otherwise builds an ephemeral non-persistent session.
     /// Persistent sessions update the recent-tracker so a future -c finds them.
     /// </summary>
+    private static async Task<EffectiveSettings?> MaybeRunWizardAsync(
+        ParsedArgs parsed,
+        EffectiveSettings settings,
+        string cwd)
+    {
+        if (parsed.NoWizard || parsed.PrintMode)
+        {
+            throw new InvalidOperationException(
+                "litellm.baseUrl is not configured. Run `zdt` interactively (no -p) to launch the " +
+                "setup wizard, or write ~/.zdtllm/settings.json by hand. Pass --no-wizard to keep " +
+                "this error in scripts.");
+        }
+
+        using var wizardHttp = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+        var wizard = new SetupWizard(Console.In, Console.Out, wizardHttp);
+        var result = await wizard.RunAsync(SetupWizard.DefaultUserSettingsPath()).ConfigureAwait(false);
+        if (!result.UserConfirmed) return null;
+
+        // Re-load with the freshly-written file in place.
+        return SettingsLoader.LoadEffectiveSettings(cwd);
+    }
+
     private static Session ResolveSession(
         ParsedArgs parsed,
         EffectiveSettings settings,
@@ -225,6 +250,9 @@ internal static class Program
                 case "--dangerously-skip-permissions":
                     result.DangerouslySkipPermissions = true;
                     break;
+                case "--no-wizard":
+                    result.NoWizard = true;
+                    break;
                 case "--tool-calling":
                     result.ToolCallingMode = NextValue(args, ref i, "--tool-calling");
                     break;
@@ -285,6 +313,7 @@ internal static class Program
         Console.WriteLine("  --model <alias|name>           model alias (light/medium/heavy) or full name");
         Console.WriteLine("  --max-turns <n>                cap agent loop iterations (default 30)");
         Console.WriteLine("  --dangerously-skip-permissions auto-allow tools that would otherwise prompt");
+        Console.WriteLine("  --no-wizard                    skip the first-run setup wizard");
         Console.WriteLine("  --tool-calling <native|xml>    transport for tool calls (default: native)");
         Console.WriteLine("  --session-id <uuid>            create or resume a persistent session at this id");
         Console.WriteLine("  -c, --continue                 resume the most recent session for this directory");
@@ -301,6 +330,7 @@ internal static class Program
         public string? Model { get; set; }
         public int? MaxTurns { get; set; }
         public bool DangerouslySkipPermissions { get; set; }
+        public bool NoWizard { get; set; }
         public string? ToolCallingMode { get; set; }
         public string? SessionId { get; set; }
         public bool Continue { get; set; }

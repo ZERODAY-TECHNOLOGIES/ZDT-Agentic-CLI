@@ -12,4 +12,8 @@
     <ProjectReference Include="..\Zdtllm.Config\Zdtllm.Config.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Zdtllm.Core.Tests" />
+  </ItemGroup>
+
 </Project>
