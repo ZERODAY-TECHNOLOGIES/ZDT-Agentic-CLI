@@ -107,6 +107,10 @@ internal static class Program
 
         var contextManager = BuildContextManager(parsed, settings);
 
+        var baseText = ResolveBaseSystemPrompt(parsed);
+        var appendText = ResolveAppendSystemPrompt(parsed);
+        var additionalDirs = MergeAdditionalDirectories(parsed.AddDirs, settings.Permissions.AdditionalDirectories);
+
         var agent = new AgentLoop(
             client,
             registry,
@@ -117,7 +121,12 @@ internal static class Program
                 MaxTurns = parsed.MaxTurns ?? 30,
                 SkipPermissions = parsed.DangerouslySkipPermissions,
                 ToolCallingMode = session.Mode,
-                SystemPrompt = ComposeSystemPrompt(skills, memoryFile),
+                SystemPrompt = SystemPromptComposer.Compose(
+                    baseText: baseText,
+                    appendText: appendText,
+                    memoryFile: memoryFile,
+                    additionalDirectories: additionalDirs,
+                    skills: skills),
             },
             context: contextManager);
 
@@ -148,41 +157,48 @@ internal static class Program
     /// (resume by id), otherwise builds an ephemeral non-persistent session.
     /// Persistent sessions update the recent-tracker so a future -c finds them.
     /// </summary>
-    private static string ComposeSystemPrompt(IReadOnlyList<SkillDefinition> skills, string? memoryFile)
-    {
-        var sb = new StringBuilder(AgentLoopOptions.DefaultSystemPrompt);
-
-        if (!string.IsNullOrEmpty(memoryFile))
-        {
-            sb.AppendLine();
-            sb.AppendLine();
-            sb.AppendLine("# Project memory (ZDTLLM.md)");
-            sb.AppendLine();
-            sb.Append(memoryFile.TrimEnd());
-        }
-
-        if (skills.Count > 0)
-        {
-            sb.AppendLine();
-            sb.AppendLine();
-            sb.AppendLine("<available_skills>");
-            foreach (var skill in skills)
-            {
-                sb.AppendLine($"- {skill.Name}: {skill.Description}");
-            }
-            sb.AppendLine("To load a skill's instructions, call the Skill tool with command=<skill-name>.");
-            sb.Append("</available_skills>");
-        }
-
-        return sb.ToString();
-    }
-
     private static string? TryReadMemoryFile(string cwd)
     {
         var path = Path.Combine(cwd, "ZDTLLM.md");
         if (!File.Exists(path)) return null;
         try { return File.ReadAllText(path); }
         catch { return null; }
+    }
+
+    /// <summary>
+    /// Resolve the BASE system prompt according to flags. --system-prompt-file takes
+    /// precedence over --system-prompt; either replaces the default. With neither, the
+    /// AgentLoopOptions default is used.
+    /// </summary>
+    private static string ResolveBaseSystemPrompt(ParsedArgs parsed)
+    {
+        if (!string.IsNullOrEmpty(parsed.SystemPromptFile))
+            return File.ReadAllText(parsed.SystemPromptFile);
+        if (!string.IsNullOrEmpty(parsed.SystemPrompt))
+            return parsed.SystemPrompt;
+        return AgentLoopOptions.DefaultSystemPrompt;
+    }
+
+    private static string? ResolveAppendSystemPrompt(ParsedArgs parsed)
+    {
+        if (!string.IsNullOrEmpty(parsed.AppendSystemPromptFile))
+            return File.ReadAllText(parsed.AppendSystemPromptFile);
+        return parsed.AppendSystemPrompt;
+    }
+
+    private static IReadOnlyList<string> MergeAdditionalDirectories(
+        IReadOnlyList<string> fromCli,
+        IReadOnlyList<string> fromSettings)
+    {
+        if (fromCli.Count == 0 && fromSettings.Count == 0) return Array.Empty<string>();
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var result = new List<string>(fromCli.Count + fromSettings.Count);
+        foreach (var d in fromSettings)
+            if (!string.IsNullOrWhiteSpace(d) && seen.Add(d)) result.Add(d);
+        foreach (var d in fromCli)
+            if (!string.IsNullOrWhiteSpace(d) && seen.Add(d)) result.Add(d);
+        return result;
     }
 
     /// <summary>
@@ -333,6 +349,21 @@ internal static class Program
                 case "--tool-calling":
                     result.ToolCallingMode = NextValue(args, ref i, "--tool-calling");
                     break;
+                case "--system-prompt":
+                    result.SystemPrompt = NextValue(args, ref i, "--system-prompt");
+                    break;
+                case "--system-prompt-file":
+                    result.SystemPromptFile = NextValue(args, ref i, "--system-prompt-file");
+                    break;
+                case "--append-system-prompt":
+                    result.AppendSystemPrompt = NextValue(args, ref i, "--append-system-prompt");
+                    break;
+                case "--append-system-prompt-file":
+                    result.AppendSystemPromptFile = NextValue(args, ref i, "--append-system-prompt-file");
+                    break;
+                case "--add-dir":
+                    result.AddDirs.Add(NextValue(args, ref i, "--add-dir"));
+                    break;
                 case "--session-id":
                     result.SessionId = NextValue(args, ref i, "--session-id");
                     break;
@@ -393,6 +424,11 @@ internal static class Program
         Console.WriteLine("  --no-wizard                    skip the first-run setup wizard");
         Console.WriteLine("  --bare                         skip auto-discovery of skills");
         Console.WriteLine("  --tool-calling <native|xml>    transport for tool calls (default: native)");
+        Console.WriteLine("  --system-prompt <text>         replace the default system prompt with <text>");
+        Console.WriteLine("  --system-prompt-file <path>    replace the default system prompt with file contents");
+        Console.WriteLine("  --append-system-prompt <text>  append <text> after the default/replaced prompt");
+        Console.WriteLine("  --append-system-prompt-file <p>  append file contents after the default/replaced prompt");
+        Console.WriteLine("  --add-dir <path>               add an extra accessible directory (repeatable)");
         Console.WriteLine("  --session-id <uuid>            create or resume a persistent session at this id");
         Console.WriteLine("  -c, --continue                 resume the most recent session for this directory");
         Console.WriteLine("  -r, --resume <uuid>            resume the specified session");
@@ -414,6 +450,11 @@ internal static class Program
         public string? SessionId { get; set; }
         public bool Continue { get; set; }
         public string? Resume { get; set; }
+        public string? SystemPrompt { get; set; }
+        public string? SystemPromptFile { get; set; }
+        public string? AppendSystemPrompt { get; set; }
+        public string? AppendSystemPromptFile { get; set; }
+        public List<string> AddDirs { get; } = new();
         public bool ShowVersion { get; set; }
         public bool ShowHelp { get; set; }
         public string? Query { get; set; }
