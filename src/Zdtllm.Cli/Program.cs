@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text;
 using Zdtllm.Config;
 using Zdtllm.Core;
 using Zdtllm.Core.Repl;
@@ -6,6 +7,7 @@ using Zdtllm.Core.Sessions;
 using Zdtllm.Core.Setup;
 using Zdtllm.LiteLLM;
 using Zdtllm.Permissions;
+using Zdtllm.Skills;
 using Zdtllm.Tools;
 
 namespace Zdtllm.Cli;
@@ -79,6 +81,10 @@ internal static class Program
 
         using var fetchHttp = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
 
+        var skills = parsed.Bare
+            ? Array.Empty<SkillDefinition>()
+            : new SkillsLoader().Discover(cwd);
+
         var registry = new ToolRegistry();
         registry.Register(new ReadTool());
         registry.Register(new WriteTool());
@@ -89,6 +95,8 @@ internal static class Program
         registry.Register(new TodoWriteTool());
         registry.Register(new WebFetchTool(fetchHttp));
         registry.Register(new WebSearchTool());
+        if (skills.Count > 0)
+            registry.Register(new SkillTool(skills));
 
         var sessionsDir = Path.Combine(cwd, ".zdtllm", "sessions");
         var recent = RecentTracker.ForUserHome();
@@ -101,6 +109,7 @@ internal static class Program
             MaxTurns = parsed.MaxTurns ?? 30,
             SkipPermissions = parsed.DangerouslySkipPermissions,
             ToolCallingMode = session.Mode,
+            SystemPrompt = ComposeSystemPrompt(skills),
         });
 
         if (parsed.PrintMode)
@@ -130,6 +139,23 @@ internal static class Program
     /// (resume by id), otherwise builds an ephemeral non-persistent session.
     /// Persistent sessions update the recent-tracker so a future -c finds them.
     /// </summary>
+    private static string ComposeSystemPrompt(IReadOnlyList<SkillDefinition> skills)
+    {
+        if (skills.Count == 0) return AgentLoopOptions.DefaultSystemPrompt;
+
+        var sb = new StringBuilder(AgentLoopOptions.DefaultSystemPrompt);
+        sb.AppendLine();
+        sb.AppendLine();
+        sb.AppendLine("<available_skills>");
+        foreach (var skill in skills)
+        {
+            sb.AppendLine($"- {skill.Name}: {skill.Description}");
+        }
+        sb.AppendLine("To load a skill's instructions, call the Skill tool with command=<skill-name>.");
+        sb.Append("</available_skills>");
+        return sb.ToString();
+    }
+
     private static async Task<EffectiveSettings?> MaybeRunWizardAsync(
         ParsedArgs parsed,
         EffectiveSettings settings,
@@ -253,6 +279,9 @@ internal static class Program
                 case "--no-wizard":
                     result.NoWizard = true;
                     break;
+                case "--bare":
+                    result.Bare = true;
+                    break;
                 case "--tool-calling":
                     result.ToolCallingMode = NextValue(args, ref i, "--tool-calling");
                     break;
@@ -314,6 +343,7 @@ internal static class Program
         Console.WriteLine("  --max-turns <n>                cap agent loop iterations (default 30)");
         Console.WriteLine("  --dangerously-skip-permissions auto-allow tools that would otherwise prompt");
         Console.WriteLine("  --no-wizard                    skip the first-run setup wizard");
+        Console.WriteLine("  --bare                         skip auto-discovery of skills");
         Console.WriteLine("  --tool-calling <native|xml>    transport for tool calls (default: native)");
         Console.WriteLine("  --session-id <uuid>            create or resume a persistent session at this id");
         Console.WriteLine("  -c, --continue                 resume the most recent session for this directory");
@@ -331,6 +361,7 @@ internal static class Program
         public int? MaxTurns { get; set; }
         public bool DangerouslySkipPermissions { get; set; }
         public bool NoWizard { get; set; }
+        public bool Bare { get; set; }
         public string? ToolCallingMode { get; set; }
         public string? SessionId { get; set; }
         public bool Continue { get; set; }

@@ -10,14 +10,16 @@ namespace Zdtllm.Core;
 
 public sealed record AgentLoopOptions
 {
+    public const string DefaultSystemPrompt =
+        "You are zdtllmcli, an autonomous CLI assistant from zer0day.ro. " +
+        "Use the provided tools to read files and run shell commands when needed. " +
+        "Be concise and prefer concrete answers over speculation.";
+
     public required string Model { get; init; }
     public int MaxTurns { get; init; } = 30;
     public bool SkipPermissions { get; init; }
     public ToolCallingMode ToolCallingMode { get; init; } = ToolCallingMode.Native;
-    public string SystemPrompt { get; init; } =
-        "You are zdtllmcli, an autonomous CLI assistant from zer0day.ro. " +
-        "Use the provided tools to read files and run shell commands when needed. " +
-        "Be concise and prefer concrete answers over speculation.";
+    public string SystemPrompt { get; init; } = DefaultSystemPrompt;
 }
 
 public sealed record AgentResult(
