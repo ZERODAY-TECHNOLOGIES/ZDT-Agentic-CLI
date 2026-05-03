@@ -21,6 +21,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Zdtllm.Core\Zdtllm.Core.csproj" />
+    <ProjectReference Include="..\..\src\Zdtllm.LiteLLM\Zdtllm.LiteLLM.csproj" />
   </ItemGroup>
 
 </Project>
