@@ -18,6 +18,7 @@ public sealed class Session : IDisposable
     public string? Name { get; private set; }
     public ToolCallingMode Mode { get; private set; }
     public IReadOnlyList<ChatMessage> Messages => _messages;
+    public bool IsPersistent => _store is not null;
 
     private Session(string id, string model, string? name, ToolCallingMode mode, SessionStore? store)
     {
@@ -75,6 +76,16 @@ public sealed class Session : IDisposable
                     break;
                 case ToolEvent t:
                     msgs.Add(ChatMessage.Tool(t.ToolCallId, t.Content));
+                    break;
+                case ClearEvent clear:
+                    var systemMessage = clear.KeepSystem
+                        ? msgs.FirstOrDefault(m => m.Role == "system")
+                        : null;
+                    msgs.Clear();
+                    if (systemMessage is not null) msgs.Add(systemMessage);
+                    break;
+                case ModelChangedEvent mc:
+                    model = mc.Model;
                     break;
                 case UsageEvent:
                     // not a chat message — ignore for replay
@@ -137,6 +148,21 @@ public sealed class Session : IDisposable
         Name = newName;
         // Note: not appending a new MetaEvent here — Resume() takes the FIRST meta event
         // it sees as authoritative. Renames during a session are a Phase 3 concern.
+    }
+
+    public void ClearKeepingSystem()
+    {
+        var systemMessage = _messages.FirstOrDefault(m => m.Role == "system");
+        _messages.Clear();
+        if (systemMessage is not null) _messages.Add(systemMessage);
+        _store?.Append(new ClearEvent(KeepSystem: systemMessage is not null));
+    }
+
+    public void SetModel(string newModel)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(newModel);
+        Model = newModel;
+        _store?.Append(new ModelChangedEvent(newModel));
     }
 
     public void Dispose() => _store?.Dispose();

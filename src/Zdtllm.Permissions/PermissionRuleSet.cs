@@ -35,6 +35,10 @@ public sealed class PermissionRuleSet
         ImmutableArray<ParsedRule>.Empty,
         ImmutableArray<ParsedRule>.Empty);
 
+    /// <summary>Number of rules in each precedence bucket. Useful for /permissions UI.</summary>
+    public (int deny, int ask, int allow) RuleCounts =>
+        (_deny.Length, _ask.Length, _allow.Length);
+
     public static PermissionRuleSet Build(
         IReadOnlyList<string> allow,
         IReadOnlyList<string> ask,

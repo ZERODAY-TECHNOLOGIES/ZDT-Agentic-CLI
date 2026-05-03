@@ -49,6 +49,9 @@ public sealed class AgentLoop
         _options = options;
     }
 
+    public PermissionRuleSet Permissions => _perms;
+    public ToolRegistry Tools => _tools;
+
     /// <summary>
     /// Backwards-compatible one-shot entry point: spins up an ephemeral
     /// (non-persistent) session, runs a single user→assistant exchange, and

@@ -1,6 +1,7 @@
 using System.Reflection;
 using Zdtllm.Config;
 using Zdtllm.Core;
+using Zdtllm.Core.Repl;
 using Zdtllm.Core.Sessions;
 using Zdtllm.LiteLLM;
 using Zdtllm.Permissions;
@@ -16,6 +17,9 @@ internal static class Program
     {
         try
         {
+            // Windows defaults the console to a non-UTF-8 codepage, which mangles the
+            // banner block characters and any non-ASCII content the model emits.
+            Console.OutputEncoding = System.Text.Encoding.UTF8;
             return await RunAsync(args).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -37,14 +41,7 @@ internal static class Program
         if (parsed.ShowVersion) { PrintVersion(); return 0; }
         if (parsed.ShowHelp) { PrintHelp(); return 0; }
 
-        if (!parsed.PrintMode)
-        {
-            await Console.Error.WriteLineAsync(
-                "Phase 2A still only supports print mode. Run: zdt -p \"<query>\"").ConfigureAwait(false);
-            return 2;
-        }
-
-        if (string.IsNullOrWhiteSpace(parsed.Query))
+        if (parsed.PrintMode && string.IsNullOrWhiteSpace(parsed.Query))
         {
             await Console.Error.WriteLineAsync("zdt -p requires a query.").ConfigureAwait(false);
             return 2;
@@ -84,7 +81,7 @@ internal static class Program
         var sessionsDir = Path.Combine(cwd, ".zdtllm", "sessions");
         var recent = RecentTracker.ForUserHome();
 
-        using var session = ResolveSession(parsed, settings, sessionsDir, recent, cwd);
+        using var session = ResolveSession(parsed, settings, sessionsDir, recent, cwd, defaultPersistent: !parsed.PrintMode);
 
         var agent = new AgentLoop(client, registry, perms, new AgentLoopOptions
         {
@@ -94,14 +91,25 @@ internal static class Program
             ToolCallingMode = session.Mode,
         });
 
-        await agent.RunTurnAsync(
-            session,
-            parsed.Query!,
-            output: Console.Out,
-            status: Console.Error,
-            ct: CancellationToken.None).ConfigureAwait(false);
+        if (parsed.PrintMode)
+        {
+            await agent.RunTurnAsync(
+                session,
+                parsed.Query!,
+                output: Console.Out,
+                status: Console.Error,
+                ct: CancellationToken.None).ConfigureAwait(false);
+            return 0;
+        }
 
-        return 0;
+        var repl = new Repl(
+            session,
+            agent,
+            Console.In,
+            Console.Out,
+            Console.Error,
+            cwd);
+        return await repl.RunAsync(parsed.Query, CancellationToken.None).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -115,7 +123,8 @@ internal static class Program
         EffectiveSettings settings,
         string sessionsDir,
         RecentTracker recent,
-        string cwd)
+        string cwd,
+        bool defaultPersistent)
     {
         if (parsed.SessionId is not null)
         {
@@ -152,8 +161,16 @@ internal static class Program
             return session;
         }
 
-        // Ephemeral
+        // Default path — interactive defaults to persistent (so `-c` next time finds it),
+        // print mode defaults to ephemeral (no on-disk side effect for one-shot queries).
         var (m, mo) = ResolveModelAndMode(parsed, settings);
+        if (defaultPersistent)
+        {
+            var store = SessionStore.Create(sessionsDir);
+            var newSession = Session.NewPersistent(store, m, name: null, mo);
+            recent.Mark(cwd, newSession.Id);
+            return newSession;
+        }
         return Session.NewEphemeral(m, mo);
     }
 
@@ -248,7 +265,11 @@ internal static class Program
         Console.WriteLine($"zdtllmcli — CLI LLM Agent, backed by LiteLLM. ({Url})");
         Console.WriteLine();
         Console.WriteLine("USAGE:");
-        Console.WriteLine("  zdt -p \"<query>\"              run a one-shot query and exit");
+        Console.WriteLine("  zdt                            interactive REPL (new persistent session)");
+        Console.WriteLine("  zdt \"<query>\"                interactive REPL, kicked off with <query>");
+        Console.WriteLine("  zdt -p \"<query>\"              one-shot print mode (ephemeral by default)");
+        Console.WriteLine("  zdt -c                         interactive, resume most recent session");
+        Console.WriteLine("  zdt -r <uuid>                  interactive, resume the given session");
         Console.WriteLine();
         Console.WriteLine("FLAGS:");
         Console.WriteLine("  -p, --print                    print mode (one-shot, exit)");

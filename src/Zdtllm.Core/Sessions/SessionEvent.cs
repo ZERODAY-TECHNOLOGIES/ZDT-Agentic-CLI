@@ -12,6 +12,8 @@ namespace Zdtllm.Core.Sessions;
 [JsonDerivedType(typeof(AssistantEvent), "assistant")]
 [JsonDerivedType(typeof(ToolEvent), "tool")]
 [JsonDerivedType(typeof(UsageEvent), "usage")]
+[JsonDerivedType(typeof(ClearEvent), "clear")]
+[JsonDerivedType(typeof(ModelChangedEvent), "modelChanged")]
 public abstract record SessionEvent
 {
     public DateTimeOffset Timestamp { get; init; } = DateTimeOffset.UtcNow;
@@ -34,5 +36,16 @@ public sealed record AssistantEvent(
 public sealed record ToolEvent(string ToolCallId, string Content) : SessionEvent;
 
 public sealed record UsageEvent(int PromptTokens, int CompletionTokens) : SessionEvent;
+
+/// <summary>
+/// Marks a /clear in interactive mode. On Resume(), every message before this
+/// event is dropped (the system prompt is kept if KeepSystem is true).
+/// </summary>
+public sealed record ClearEvent(bool KeepSystem) : SessionEvent;
+
+/// <summary>
+/// Records a /model command. On Resume(), updates the session's Model field.
+/// </summary>
+public sealed record ModelChangedEvent(string Model) : SessionEvent;
 
 public sealed record ToolCallEvent(string Id, string Name, string Arguments);

@@ -1,0 +1,262 @@
+using System.Reflection;
+using Zdtllm.Core.Sessions;
+
+namespace Zdtllm.Core.Repl;
+
+/// <summary>
+/// Interactive REPL loop. Reads single-line input from the given TextReader,
+/// dispatches slash commands or runs a session turn, repeats until /exit or EOF.
+/// All I/O goes through the supplied readers/writers so this class is unit-testable
+/// without touching System.Console.
+/// </summary>
+public sealed class Repl
+{
+    private readonly Session _session;
+    private readonly AgentLoop _agent;
+    private readonly TextReader _input;
+    private readonly TextWriter _output;
+    private readonly TextWriter _error;
+    private readonly string _cwd;
+    private readonly ReplOptions _options;
+
+    public Repl(
+        Session session,
+        AgentLoop agent,
+        TextReader input,
+        TextWriter output,
+        TextWriter error,
+        string cwd,
+        ReplOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(agent);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(output);
+        ArgumentNullException.ThrowIfNull(error);
+        ArgumentException.ThrowIfNullOrEmpty(cwd);
+
+        _session = session;
+        _agent = agent;
+        _input = input;
+        _output = output;
+        _error = error;
+        _cwd = cwd;
+        _options = options ?? new ReplOptions();
+    }
+
+    public async Task<int> RunAsync(string? initialPrompt = null, CancellationToken ct = default)
+    {
+        if (_options.ShowBanner)
+            await PrintBannerAsync().ConfigureAwait(false);
+
+        if (!string.IsNullOrWhiteSpace(initialPrompt))
+        {
+            await ProcessUserTurnAsync(initialPrompt, ct).ConfigureAwait(false);
+        }
+
+        while (!ct.IsCancellationRequested)
+        {
+            await _output.WriteAsync("> ").ConfigureAwait(false);
+            await _output.FlushAsync(ct).ConfigureAwait(false);
+
+            string? line;
+            try { line = await _input.ReadLineAsync(ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return 0; }
+
+            if (line is null) // EOF
+            {
+                await _output.WriteLineAsync().ConfigureAwait(false);
+                return 0;
+            }
+
+            var trimmed = line.Trim();
+            if (trimmed.Length == 0) continue;
+
+            if (trimmed.StartsWith('/'))
+            {
+                var slashResult = await HandleSlashAsync(trimmed, ct).ConfigureAwait(false);
+                if (slashResult == SlashOutcome.Exit) return 0;
+                continue;
+            }
+
+            await ProcessUserTurnAsync(trimmed, ct).ConfigureAwait(false);
+        }
+
+        return 0;
+    }
+
+    private async Task ProcessUserTurnAsync(string prompt, CancellationToken ct)
+    {
+        try
+        {
+            await _agent.RunTurnAsync(_session, prompt, _output, _error, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            await _error.WriteLineAsync("(turn cancelled)").ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await _error.WriteLineAsync($"zdt: {ex.Message}").ConfigureAwait(false);
+        }
+    }
+
+    private async Task<SlashOutcome> HandleSlashAsync(string line, CancellationToken ct)
+    {
+        var (cmd, args) = SplitCommand(line);
+
+        switch (cmd)
+        {
+            case "/exit":
+            case "/quit":
+                return SlashOutcome.Exit;
+
+            case "/help":
+                await PrintHelpAsync().ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
+            case "/clear":
+                _session.ClearKeepingSystem();
+                await _output.WriteLineAsync("Conversation history cleared (system prompt kept).")
+                    .ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
+            case "/status":
+                await PrintStatusAsync().ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
+            case "/init":
+                await InitMemoryFileAsync(ct).ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
+            case "/model":
+                await HandleModelCommandAsync(args).ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
+            case "/permissions":
+                await PrintPermissionsAsync().ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
+            case "/compact":
+                await _output.WriteLineAsync(
+                        "/compact is not implemented yet (Phase 3 — context management).")
+                    .ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
+            default:
+                await _output.WriteLineAsync(
+                        $"Unknown command: {cmd}. Type /help for the available commands.")
+                    .ConfigureAwait(false);
+                return SlashOutcome.Continue;
+        }
+    }
+
+    private static (string Cmd, string Args) SplitCommand(string line)
+    {
+        var space = line.IndexOf(' ');
+        if (space < 0) return (line.ToLowerInvariant(), string.Empty);
+        return (line[..space].ToLowerInvariant(), line[(space + 1)..].Trim());
+    }
+
+    private async Task PrintBannerAsync()
+    {
+        var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0";
+        await _output.WriteLineAsync($"░▒▓ zdtllmcli {version} ▓▒░  https://zer0day.ro").ConfigureAwait(false);
+        await _output.WriteLineAsync(
+                $"  model: {_session.Model}    mode: {_session.Mode.ToString().ToLowerInvariant()}    session: {SessionDisplay()}")
+            .ConfigureAwait(false);
+        await _output.WriteLineAsync("  Type /help for commands, /exit to quit. Ctrl+D / EOF also exits.")
+            .ConfigureAwait(false);
+        await _output.WriteLineAsync().ConfigureAwait(false);
+    }
+
+    private async Task PrintHelpAsync()
+    {
+        await _output.WriteLineAsync("Available commands:").ConfigureAwait(false);
+        await _output.WriteLineAsync("  /help            show this list").ConfigureAwait(false);
+        await _output.WriteLineAsync("  /exit, /quit     leave the REPL").ConfigureAwait(false);
+        await _output.WriteLineAsync("  /clear           drop conversation history (system prompt kept)").ConfigureAwait(false);
+        await _output.WriteLineAsync("  /status          show session id, model, mode, message count").ConfigureAwait(false);
+        await _output.WriteLineAsync("  /model <name>    switch model used by the next turn").ConfigureAwait(false);
+        await _output.WriteLineAsync("  /permissions     show the current permission rule set").ConfigureAwait(false);
+        await _output.WriteLineAsync("  /init            create ZDTLLM.md (project memory file) in the cwd").ConfigureAwait(false);
+        await _output.WriteLineAsync("  /compact         (Phase 3) summarize old turns to free context").ConfigureAwait(false);
+    }
+
+    private async Task PrintStatusAsync()
+    {
+        await _output.WriteLineAsync($"  session: {SessionDisplay()}").ConfigureAwait(false);
+        await _output.WriteLineAsync($"  model: {_session.Model}").ConfigureAwait(false);
+        await _output.WriteLineAsync($"  mode: {_session.Mode.ToString().ToLowerInvariant()}").ConfigureAwait(false);
+        await _output.WriteLineAsync($"  messages: {_session.Messages.Count}").ConfigureAwait(false);
+        await _output.WriteLineAsync($"  cwd: {_cwd}").ConfigureAwait(false);
+    }
+
+    private async Task InitMemoryFileAsync(CancellationToken ct)
+    {
+        var path = Path.Combine(_cwd, "ZDTLLM.md");
+        if (File.Exists(path))
+        {
+            await _output.WriteLineAsync($"ZDTLLM.md already exists at {path} — leaving it alone.")
+                .ConfigureAwait(false);
+            return;
+        }
+
+        const string Template = """
+            # ZDTLLM.md
+
+            Project memory for the [zer0day.ro](https://zer0day.ro) `zdtllmcli` agent.
+            Notes here are loaded into the system prompt on every session for this project.
+
+            ## What is this project?
+
+            <!-- Brief description of the project. -->
+
+            ## Conventions
+
+            <!-- Coding style, naming, anything an agent should know before editing. -->
+
+            ## Useful commands
+
+            <!-- Build / test / lint / deploy commands the agent can call via Bash. -->
+            """;
+
+        await File.WriteAllTextAsync(path, Template, ct).ConfigureAwait(false);
+        await _output.WriteLineAsync($"Created {path}").ConfigureAwait(false);
+    }
+
+    private async Task HandleModelCommandAsync(string args)
+    {
+        if (string.IsNullOrWhiteSpace(args))
+        {
+            await _output.WriteLineAsync($"Current model: {_session.Model}").ConfigureAwait(false);
+            await _output.WriteLineAsync("Usage: /model <name>").ConfigureAwait(false);
+            return;
+        }
+
+        _session.SetModel(args.Trim());
+        await _output.WriteLineAsync($"Model set to {_session.Model} (takes effect on next turn).")
+            .ConfigureAwait(false);
+    }
+
+    private async Task PrintPermissionsAsync()
+    {
+        var rs = _agent.Permissions;
+        var counts = rs.RuleCounts;
+        await _output.WriteLineAsync(
+                $"  rules: deny={counts.deny} ask={counts.ask} allow={counts.allow}")
+            .ConfigureAwait(false);
+        await _output.WriteLineAsync(
+                "  Defaults: tools requiring permission (Bash, Edit, Write, WebFetch, WebSearch, Skill) Ask without an explicit allow.")
+            .ConfigureAwait(false);
+    }
+
+    private string SessionDisplay() => _session.IsPersistent ? _session.Id : $"{_session.Id} (ephemeral)";
+
+    private enum SlashOutcome { Continue, Exit }
+}
+
+public sealed record ReplOptions
+{
+    public bool ShowBanner { get; init; } = true;
+}
