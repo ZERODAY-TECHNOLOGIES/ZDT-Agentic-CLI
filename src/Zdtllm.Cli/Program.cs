@@ -1,5 +1,5 @@
 using System.Reflection;
-using System.Text;
+using Spectre.Console;
 using Zdtllm.Config;
 using Zdtllm.Core;
 using Zdtllm.Core.Repl;
@@ -140,6 +140,10 @@ internal static class Program
                 ct: CancellationToken.None).ConfigureAwait(false);
             return 0;
         }
+
+        var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0";
+        var sessionDisplay = session.IsPersistent ? session.Id : $"{session.Id} (ephemeral)";
+        Branding.PrintStartupBanner(AnsiConsole.Console, version, session.Model, session.Mode, sessionDisplay);
 
         var repl = new Repl(
             session,
@@ -402,7 +406,7 @@ internal static class Program
     private static void PrintVersion()
     {
         var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0";
-        Console.WriteLine($"zdtllmcli {version}  ({Url})");
+        Branding.PrintVersion(AnsiConsole.Console, version);
     }
 
     private static void PrintHelp()

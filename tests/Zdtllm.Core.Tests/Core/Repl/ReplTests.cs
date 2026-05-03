@@ -49,8 +49,7 @@ public sealed class ReplTests : IDisposable
         var output = new StringWriter();
         var error = new StringWriter();
         var repl = new Zdtllm.Core.Repl.Repl(
-            session, agent, input, output, error, _tempDir,
-            new ReplOptions { ShowBanner = false });
+            session, agent, input, output, error, _tempDir);
         return (repl, session, output, error);
     }
 

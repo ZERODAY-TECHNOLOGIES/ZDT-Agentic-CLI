@@ -1,4 +1,3 @@
-using System.Reflection;
 using Zdtllm.Core.Sessions;
 
 namespace Zdtllm.Core.Repl;
@@ -46,9 +45,6 @@ public sealed class Repl
 
     public async Task<int> RunAsync(string? initialPrompt = null, CancellationToken ct = default)
     {
-        if (_options.ShowBanner)
-            await PrintBannerAsync().ConfigureAwait(false);
-
         if (!string.IsNullOrWhiteSpace(initialPrompt))
         {
             await ProcessUserTurnAsync(initialPrompt, ct).ConfigureAwait(false);
@@ -180,18 +176,6 @@ public sealed class Repl
         return (line[..space].ToLowerInvariant(), line[(space + 1)..].Trim());
     }
 
-    private async Task PrintBannerAsync()
-    {
-        var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0";
-        await _output.WriteLineAsync($"░▒▓ zdtllmcli {version} ▓▒░  https://zer0day.ro").ConfigureAwait(false);
-        await _output.WriteLineAsync(
-                $"  model: {_session.Model}    mode: {_session.Mode.ToString().ToLowerInvariant()}    session: {SessionDisplay()}")
-            .ConfigureAwait(false);
-        await _output.WriteLineAsync("  Type /help for commands, /exit to quit. Ctrl+D / EOF also exits.")
-            .ConfigureAwait(false);
-        await _output.WriteLineAsync().ConfigureAwait(false);
-    }
-
     private async Task PrintHelpAsync()
     {
         await _output.WriteLineAsync("Available commands:").ConfigureAwait(false);
@@ -311,7 +295,4 @@ public sealed class Repl
     private enum SlashOutcome { Continue, Exit }
 }
 
-public sealed record ReplOptions
-{
-    public bool ShowBanner { get; init; } = true;
-}
+public sealed record ReplOptions;
