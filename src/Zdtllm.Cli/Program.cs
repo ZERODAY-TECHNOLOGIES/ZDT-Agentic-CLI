@@ -1,6 +1,7 @@
 using System.Reflection;
 using Zdtllm.Config;
 using Zdtllm.Core;
+using Zdtllm.Core.Sessions;
 using Zdtllm.LiteLLM;
 using Zdtllm.Permissions;
 using Zdtllm.Tools;
@@ -33,21 +34,13 @@ internal static class Program
     {
         var parsed = ParseArgs(args);
 
-        if (parsed.ShowVersion)
-        {
-            PrintVersion();
-            return 0;
-        }
-        if (parsed.ShowHelp)
-        {
-            PrintHelp();
-            return 0;
-        }
+        if (parsed.ShowVersion) { PrintVersion(); return 0; }
+        if (parsed.ShowHelp) { PrintHelp(); return 0; }
 
         if (!parsed.PrintMode)
         {
             await Console.Error.WriteLineAsync(
-                "Phase 1 only supports print mode. Run: zdt -p \"<query>\"").ConfigureAwait(false);
+                "Phase 2A still only supports print mode. Run: zdt -p \"<query>\"").ConfigureAwait(false);
             return 2;
         }
 
@@ -59,15 +52,6 @@ internal static class Program
 
         var cwd = Directory.GetCurrentDirectory();
         var settings = SettingsLoader.LoadEffectiveSettings(cwd);
-
-        var modelAlias = parsed.Model ?? settings.Model;
-        if (string.IsNullOrEmpty(modelAlias))
-            throw new InvalidOperationException(
-                "No model specified. Pass --model or set 'model' in .zdtllm/settings.json.");
-
-        var modelName = settings.LiteLLM.Models.TryGetValue(modelAlias, out var resolved)
-            ? resolved
-            : modelAlias;
 
         if (string.IsNullOrEmpty(settings.LiteLLM.BaseUrl))
             throw new InvalidOperationException(
@@ -97,25 +81,100 @@ internal static class Program
         registry.Register(new ReadTool());
         registry.Register(new BashTool(cwd));
 
-        var toolCallingMode = ToolCallingModeParse.FromString(
-            parsed.ToolCallingMode ?? settings.LiteLLM.ToolCallingMode,
-            fallback: ToolCallingMode.Native);
+        var sessionsDir = Path.Combine(cwd, ".zdtllm", "sessions");
+        var recent = RecentTracker.ForUserHome();
+
+        using var session = ResolveSession(parsed, settings, sessionsDir, recent, cwd);
 
         var agent = new AgentLoop(client, registry, perms, new AgentLoopOptions
         {
-            Model = modelName,
+            Model = session.Model,
             MaxTurns = parsed.MaxTurns ?? 30,
             SkipPermissions = parsed.DangerouslySkipPermissions,
-            ToolCallingMode = toolCallingMode,
+            ToolCallingMode = session.Mode,
         });
 
-        await agent.RunOneShotAsync(
+        await agent.RunTurnAsync(
+            session,
             parsed.Query!,
             output: Console.Out,
             status: Console.Error,
             ct: CancellationToken.None).ConfigureAwait(false);
 
         return 0;
+    }
+
+    /// <summary>
+    /// Resolves which Session to run against, given the parsed flags. Honours
+    /// --session-id (create-or-resume), -c (resume most recent for cwd), -r
+    /// (resume by id), otherwise builds an ephemeral non-persistent session.
+    /// Persistent sessions update the recent-tracker so a future -c finds them.
+    /// </summary>
+    private static Session ResolveSession(
+        ParsedArgs parsed,
+        EffectiveSettings settings,
+        string sessionsDir,
+        RecentTracker recent,
+        string cwd)
+    {
+        if (parsed.SessionId is not null)
+        {
+            var path = Path.Combine(sessionsDir, $"{parsed.SessionId}.jsonl");
+            if (File.Exists(path))
+            {
+                var session = Session.Resume(SessionStore.OpenForResume(sessionsDir, parsed.SessionId));
+                recent.Mark(cwd, session.Id);
+                return session;
+            }
+            else
+            {
+                var (model, mode) = ResolveModelAndMode(parsed, settings);
+                var store = SessionStore.Create(sessionsDir, parsed.SessionId);
+                var session = Session.NewPersistent(store, model, name: null, mode);
+                recent.Mark(cwd, session.Id);
+                return session;
+            }
+        }
+
+        if (parsed.Continue)
+        {
+            var recentId = recent.GetMostRecentForCwd(cwd)
+                ?? throw new InvalidOperationException(
+                    "No recent session for this directory. Start a new session first or pass --session-id.");
+            var session = Session.Resume(SessionStore.OpenForResume(sessionsDir, recentId));
+            return session;
+        }
+
+        if (parsed.Resume is not null)
+        {
+            var session = Session.Resume(SessionStore.OpenForResume(sessionsDir, parsed.Resume));
+            recent.Mark(cwd, session.Id);
+            return session;
+        }
+
+        // Ephemeral
+        var (m, mo) = ResolveModelAndMode(parsed, settings);
+        return Session.NewEphemeral(m, mo);
+    }
+
+    private static (string Model, ToolCallingMode Mode) ResolveModelAndMode(
+        ParsedArgs parsed,
+        EffectiveSettings settings)
+    {
+        var modelAlias = parsed.Model ?? settings.Model;
+        if (string.IsNullOrEmpty(modelAlias))
+            throw new InvalidOperationException(
+                "No model specified. Pass --model or set 'model' in .zdtllm/settings.json.");
+
+        var modelName = settings.LiteLLM.Models.TryGetValue(modelAlias, out var resolved)
+            ? resolved
+            : modelAlias;
+
+        var mode = ToolCallingModeParse.FromString(
+            parsed.ToolCallingMode ?? settings.LiteLLM.ToolCallingMode,
+            fallback: ToolCallingMode.Native);
+
+        return (modelName, mode);
     }
 
     private static ParsedArgs ParseArgs(string[] args)
@@ -142,6 +201,17 @@ internal static class Program
                     break;
                 case "--tool-calling":
                     result.ToolCallingMode = NextValue(args, ref i, "--tool-calling");
+                    break;
+                case "--session-id":
+                    result.SessionId = NextValue(args, ref i, "--session-id");
+                    break;
+                case "-c":
+                case "--continue":
+                    result.Continue = true;
+                    break;
+                case "-r":
+                case "--resume":
+                    result.Resume = NextValue(args, ref i, "--resume");
                     break;
                 case "--version":
                     result.ShowVersion = true;
@@ -180,12 +250,15 @@ internal static class Program
         Console.WriteLine("USAGE:");
         Console.WriteLine("  zdt -p \"<query>\"              run a one-shot query and exit");
         Console.WriteLine();
-        Console.WriteLine("FLAGS (Phase 1):");
+        Console.WriteLine("FLAGS:");
         Console.WriteLine("  -p, --print                    print mode (one-shot, exit)");
         Console.WriteLine("  --model <alias|name>           model alias (light/medium/heavy) or full name");
         Console.WriteLine("  --max-turns <n>                cap agent loop iterations (default 30)");
         Console.WriteLine("  --dangerously-skip-permissions auto-allow tools that would otherwise prompt");
         Console.WriteLine("  --tool-calling <native|xml>    transport for tool calls (default: native)");
+        Console.WriteLine("  --session-id <uuid>            create or resume a persistent session at this id");
+        Console.WriteLine("  -c, --continue                 resume the most recent session for this directory");
+        Console.WriteLine("  -r, --resume <uuid>            resume the specified session");
         Console.WriteLine("  --version                      print version and exit");
         Console.WriteLine("  -h, --help                     show this help");
         Console.WriteLine();
@@ -199,6 +272,9 @@ internal static class Program
         public int? MaxTurns { get; set; }
         public bool DangerouslySkipPermissions { get; set; }
         public string? ToolCallingMode { get; set; }
+        public string? SessionId { get; set; }
+        public bool Continue { get; set; }
+        public string? Resume { get; set; }
         public bool ShowVersion { get; set; }
         public bool ShowHelp { get; set; }
         public string? Query { get; set; }

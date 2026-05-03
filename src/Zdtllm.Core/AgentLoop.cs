@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Text;
 using System.Text.Json;
+using Zdtllm.Core.Sessions;
 using Zdtllm.LiteLLM;
 using Zdtllm.Permissions;
 using Zdtllm.Tools;
@@ -48,26 +49,54 @@ public sealed class AgentLoop
         _options = options;
     }
 
-    public async Task<AgentResult> RunOneShotAsync(
+    /// <summary>
+    /// Backwards-compatible one-shot entry point: spins up an ephemeral
+    /// (non-persistent) session, runs a single user→assistant exchange, and
+    /// returns the final answer. Equivalent to creating Session.NewEphemeral
+    /// and calling RunTurnAsync.
+    /// </summary>
+    public Task<AgentResult> RunOneShotAsync(
         string userPrompt,
         TextWriter output,
         TextWriter status,
         CancellationToken ct = default)
     {
+        var session = Session.NewEphemeral(_options.Model, _options.ToolCallingMode);
+        return RunTurnAsync(session, userPrompt, output, status, ct);
+    }
+
+    /// <summary>
+    /// Runs a single user turn against the given session. Mutates the session
+    /// (adds the user message, the assistant response, and any tool calls /
+    /// results that occurred). On a fresh session this also bootstraps the
+    /// system prompt — subsequent turns reuse the existing one. The session's
+    /// Model and Mode are authoritative; AgentLoopOptions are only consulted
+    /// for ephemeral session bootstrap and for system-prompt content.
+    /// </summary>
+    public async Task<AgentResult> RunTurnAsync(
+        Session session,
+        string userPrompt,
+        TextWriter output,
+        TextWriter status,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(session);
         ArgumentException.ThrowIfNullOrEmpty(userPrompt);
         ArgumentNullException.ThrowIfNull(output);
         ArgumentNullException.ThrowIfNull(status);
 
-        var xmlMode = _options.ToolCallingMode == ToolCallingMode.Xml;
-        var systemPrompt = xmlMode
-            ? BuildXmlSystemPrompt(_options.SystemPrompt, _tools.Schemas)
-            : _options.SystemPrompt;
+        var xmlMode = session.Mode == ToolCallingMode.Xml;
 
-        var messages = new List<ChatMessage>
+        // Bootstrap system prompt the first time the session is touched.
+        if (session.Messages.Count == 0)
         {
-            ChatMessage.System(systemPrompt),
-            ChatMessage.User(userPrompt),
-        };
+            var systemPrompt = xmlMode
+                ? BuildXmlSystemPrompt(_options.SystemPrompt, _tools.Schemas)
+                : _options.SystemPrompt;
+            session.AddSystem(systemPrompt);
+        }
+
+        session.AddUser(userPrompt);
 
         IReadOnlyList<ToolDef>? toolDefList = null;
         if (!xmlMode)
@@ -86,16 +115,15 @@ public sealed class AgentLoop
         {
             var assistantText = new StringBuilder();
             var pending = new SortedDictionary<int, ToolCallAccumulator>();
+            int? turnPromptTokens = null;
+            int? turnCompletionTokens = null;
 
-            await foreach (var chunk in _client.StreamChatAsync(messages, toolDefList, _options.Model, ct).ConfigureAwait(false))
+            await foreach (var chunk in _client.StreamChatAsync(session.Messages, toolDefList, session.Model, ct).ConfigureAwait(false))
             {
                 switch (chunk)
                 {
                     case ChatChunk.TextDelta td:
                         assistantText.Append(td.Text);
-                        // In XML mode we buffer text rather than streaming live — the
-                        // assistant emits <function_calls> blocks inline that we don't want
-                        // surfacing in the user-facing output until we strip them.
                         if (!xmlMode)
                         {
                             await output.WriteAsync(td.Text.AsMemory(), ct).ConfigureAwait(false);
@@ -112,6 +140,8 @@ public sealed class AgentLoop
                         break;
 
                     case ChatChunk.Usage u:
+                        turnPromptTokens = u.PromptTokens;
+                        turnCompletionTokens = u.CompletionTokens;
                         lastPromptTokens = u.PromptTokens;
                         lastCompletionTokens = u.CompletionTokens;
                         break;
@@ -121,20 +151,20 @@ public sealed class AgentLoop
                 }
             }
 
+            if (turnPromptTokens is int p && turnCompletionTokens is int c)
+                session.AddUsage(p, c);
+
             var nativeCalls = pending.Values
                 .Where(v => v.Id is not null && v.FunctionName is not null)
                 .Select(v => new ToolCall(v.Id!, v.FunctionName!, v.Arguments.ToString()))
                 .ToImmutableArray();
 
-            // XML calls are only considered when Xml mode is on AND no native calls came back.
-            // (If the server somehow emitted both, native wins — they're the canonical signal.)
             IReadOnlyList<ParsedXmlToolCall> xmlCalls = nativeCalls.Length == 0 && xmlMode
                 ? XmlToolCallParser.ExtractCalls(assistantText.ToString())
                 : [];
 
             if (nativeCalls.Length == 0 && xmlCalls.Count == 0)
             {
-                // No tool calls of any kind → agent has produced its final answer.
                 var displayText = xmlMode
                     ? XmlToolCallParser.Strip(assistantText.ToString()).TrimEnd()
                     : assistantText.ToString();
@@ -145,17 +175,21 @@ public sealed class AgentLoop
                 if (assistantText.Length > 0)
                     await output.WriteLineAsync().ConfigureAwait(false);
 
+                session.AddAssistant(
+                    content: displayText.Length > 0 ? displayText : null,
+                    toolCalls: ImmutableArray<ToolCall>.Empty);
+
                 return new AgentResult(displayText, turn, lastPromptTokens, lastCompletionTokens);
             }
 
             if (nativeCalls.Length > 0)
             {
-                await ExecuteNativeRoundAsync(messages, assistantText, nativeCalls, ctx, output, status, ct)
+                await ExecuteNativeRoundAsync(session, assistantText, nativeCalls, ctx, output, status, ct)
                     .ConfigureAwait(false);
             }
             else
             {
-                await ExecuteXmlRoundAsync(messages, assistantText, xmlCalls, turn, ctx, output, status, ct)
+                await ExecuteXmlRoundAsync(session, assistantText, xmlCalls, turn, ctx, output, status, ct)
                     .ConfigureAwait(false);
             }
         }
@@ -165,7 +199,7 @@ public sealed class AgentLoop
     }
 
     private async Task ExecuteNativeRoundAsync(
-        List<ChatMessage> messages,
+        Session session,
         StringBuilder assistantText,
         ImmutableArray<ToolCall> calls,
         ToolContext ctx,
@@ -173,11 +207,9 @@ public sealed class AgentLoop
         TextWriter status,
         CancellationToken ct)
     {
-        messages.Add(new ChatMessage(
-            Role: "assistant",
-            Content: assistantText.Length > 0 ? assistantText.ToString() : null,
-            ToolCalls: calls,
-            ToolCallId: null));
+        session.AddAssistant(
+            content: assistantText.Length > 0 ? assistantText.ToString() : null,
+            toolCalls: calls);
 
         if (assistantText.Length > 0)
             await output.WriteLineAsync().ConfigureAwait(false);
@@ -188,12 +220,12 @@ public sealed class AgentLoop
                 .ConfigureAwait(false);
 
             var resultContent = await ExecuteToolAsync(call, ctx, ct).ConfigureAwait(false);
-            messages.Add(ChatMessage.Tool(call.Id, resultContent));
+            session.AddTool(call.Id, resultContent);
         }
     }
 
     private async Task ExecuteXmlRoundAsync(
-        List<ChatMessage> messages,
+        Session session,
         StringBuilder assistantText,
         IReadOnlyList<ParsedXmlToolCall> xmlCalls,
         int turn,
@@ -202,7 +234,6 @@ public sealed class AgentLoop
         TextWriter status,
         CancellationToken ct)
     {
-        // Show the assistant's prose preamble (with XML stripped) before executing the call.
         var cleaned = XmlToolCallParser.Strip(assistantText.ToString()).Trim();
         if (cleaned.Length > 0)
         {
@@ -210,10 +241,9 @@ public sealed class AgentLoop
             await output.WriteLineAsync().ConfigureAwait(false);
         }
 
-        // Keep the original (XML-bearing) text in conversation history so the model's
-        // own action is preserved in its context — many models rely on seeing their
-        // last <function_calls> block to remember what they invoked.
-        messages.Add(ChatMessage.AssistantText(assistantText.ToString()));
+        // Persist the original XML-bearing text so the model's own action survives
+        // session resumes and feeds back into its context next turn.
+        session.AddAssistant(content: assistantText.ToString(), toolCalls: ImmutableArray<ToolCall>.Empty);
 
         for (var i = 0; i < xmlCalls.Count; i++)
         {
@@ -225,8 +255,7 @@ public sealed class AgentLoop
                 .ConfigureAwait(false);
 
             var resultContent = await ExecuteToolAsync(call, ctx, ct).ConfigureAwait(false);
-            messages.Add(ChatMessage.User(
-                $"EXECUTION RESULT of [{call.FunctionName}]:\n{resultContent}"));
+            session.AddUser($"EXECUTION RESULT of [{call.FunctionName}]:\n{resultContent}");
         }
     }
 
