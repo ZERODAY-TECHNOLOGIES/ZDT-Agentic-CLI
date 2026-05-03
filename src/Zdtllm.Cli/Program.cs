@@ -85,6 +85,8 @@ internal static class Program
             ? Array.Empty<SkillDefinition>()
             : new SkillsLoader().Discover(cwd);
 
+        var memoryFile = TryReadMemoryFile(cwd);
+
         var registry = new ToolRegistry();
         registry.Register(new ReadTool());
         registry.Register(new WriteTool());
@@ -103,14 +105,21 @@ internal static class Program
 
         using var session = ResolveSession(parsed, settings, sessionsDir, recent, cwd, defaultPersistent: !parsed.PrintMode);
 
-        var agent = new AgentLoop(client, registry, perms, new AgentLoopOptions
-        {
-            Model = session.Model,
-            MaxTurns = parsed.MaxTurns ?? 30,
-            SkipPermissions = parsed.DangerouslySkipPermissions,
-            ToolCallingMode = session.Mode,
-            SystemPrompt = ComposeSystemPrompt(skills),
-        });
+        var contextManager = BuildContextManager(parsed, settings);
+
+        var agent = new AgentLoop(
+            client,
+            registry,
+            perms,
+            new AgentLoopOptions
+            {
+                Model = session.Model,
+                MaxTurns = parsed.MaxTurns ?? 30,
+                SkipPermissions = parsed.DangerouslySkipPermissions,
+                ToolCallingMode = session.Mode,
+                SystemPrompt = ComposeSystemPrompt(skills, memoryFile),
+            },
+            context: contextManager);
 
         if (parsed.PrintMode)
         {
@@ -139,21 +148,60 @@ internal static class Program
     /// (resume by id), otherwise builds an ephemeral non-persistent session.
     /// Persistent sessions update the recent-tracker so a future -c finds them.
     /// </summary>
-    private static string ComposeSystemPrompt(IReadOnlyList<SkillDefinition> skills)
+    private static string ComposeSystemPrompt(IReadOnlyList<SkillDefinition> skills, string? memoryFile)
     {
-        if (skills.Count == 0) return AgentLoopOptions.DefaultSystemPrompt;
-
         var sb = new StringBuilder(AgentLoopOptions.DefaultSystemPrompt);
-        sb.AppendLine();
-        sb.AppendLine();
-        sb.AppendLine("<available_skills>");
-        foreach (var skill in skills)
+
+        if (!string.IsNullOrEmpty(memoryFile))
         {
-            sb.AppendLine($"- {skill.Name}: {skill.Description}");
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("# Project memory (ZDTLLM.md)");
+            sb.AppendLine();
+            sb.Append(memoryFile.TrimEnd());
         }
-        sb.AppendLine("To load a skill's instructions, call the Skill tool with command=<skill-name>.");
-        sb.Append("</available_skills>");
+
+        if (skills.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("<available_skills>");
+            foreach (var skill in skills)
+            {
+                sb.AppendLine($"- {skill.Name}: {skill.Description}");
+            }
+            sb.AppendLine("To load a skill's instructions, call the Skill tool with command=<skill-name>.");
+            sb.Append("</available_skills>");
+        }
+
         return sb.ToString();
+    }
+
+    private static string? TryReadMemoryFile(string cwd)
+    {
+        var path = Path.Combine(cwd, "ZDTLLM.md");
+        if (!File.Exists(path)) return null;
+        try { return File.ReadAllText(path); }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Build the ContextManager if we know the active model's tier and its context window.
+    /// Returns null when the user passed a raw model name (not a tier alias) or when the
+    /// settings file doesn't carry a contextWindows entry for that tier — in that case we
+    /// silently skip context tracking rather than guessing a window size.
+    /// </summary>
+    private static ContextManager? BuildContextManager(ParsedArgs parsed, EffectiveSettings settings)
+    {
+        var alias = parsed.Model ?? settings.Model;
+        if (string.IsNullOrEmpty(alias)) return null;
+        if (!settings.LiteLLM.ContextWindows.TryGetValue(alias, out var window) || window <= 0) return null;
+
+        var mediumName = settings.LiteLLM.Models.TryGetValue("medium", out var m) && !string.IsNullOrEmpty(m)
+            ? m
+            : (settings.LiteLLM.Models.TryGetValue(alias, out var fallback) ? fallback : alias);
+
+        return new ContextManager(window, mediumName);
     }
 
     private static async Task<EffectiveSettings?> MaybeRunWizardAsync(

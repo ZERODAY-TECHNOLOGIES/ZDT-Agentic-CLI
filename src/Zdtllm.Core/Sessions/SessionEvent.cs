@@ -14,6 +14,7 @@ namespace Zdtllm.Core.Sessions;
 [JsonDerivedType(typeof(UsageEvent), "usage")]
 [JsonDerivedType(typeof(ClearEvent), "clear")]
 [JsonDerivedType(typeof(ModelChangedEvent), "modelChanged")]
+[JsonDerivedType(typeof(CompactionEvent), "compaction")]
 public abstract record SessionEvent
 {
     public DateTimeOffset Timestamp { get; init; } = DateTimeOffset.UtcNow;
@@ -47,5 +48,19 @@ public sealed record ClearEvent(bool KeepSystem) : SessionEvent;
 /// Records a /model command. On Resume(), updates the session's Model field.
 /// </summary>
 public sealed record ModelChangedEvent(string Model) : SessionEvent;
+
+/// <summary>
+/// Records a /compact (or auto-compact) operation. The KeptMessages list is the
+/// authoritative replacement for the in-memory message list — Resume() drops
+/// every prior message and rebuilds from this snapshot.
+/// </summary>
+public sealed record CompactionEvent(IReadOnlyList<MessageSnapshot> KeptMessages) : SessionEvent;
+
+/// <summary>Serializable equivalent of ChatMessage for use inside CompactionEvent.</summary>
+public sealed record MessageSnapshot(
+    string Role,
+    string? Content,
+    IReadOnlyList<ToolCallEvent>? ToolCalls = null,
+    string? ToolCallId = null);
 
 public sealed record ToolCallEvent(string Id, string Name, string Arguments);

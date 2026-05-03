@@ -87,6 +87,23 @@ public sealed class Repl
 
     private async Task ProcessUserTurnAsync(string prompt, CancellationToken ct)
     {
+        var ctx = _agent.Context;
+        if (ctx is not null && ctx.IsBeyondHardThreshold)
+        {
+            await _error.WriteLineAsync(
+                $"[auto-compact at {ctx.UsagePercent}% — summarizing older turns to free context]")
+                .ConfigureAwait(false);
+            try
+            {
+                await ctx.CompactAsync(_session, _agent.Client, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                await _error.WriteLineAsync($"zdt: auto-compact failed: {ex.Message}")
+                    .ConfigureAwait(false);
+            }
+        }
+
         try
         {
             await _agent.RunTurnAsync(_session, prompt, _output, _error, ct).ConfigureAwait(false);
@@ -98,6 +115,13 @@ public sealed class Repl
         catch (Exception ex)
         {
             await _error.WriteLineAsync($"zdt: {ex.Message}").ConfigureAwait(false);
+        }
+
+        if (ctx is not null && ctx.IsBeyondSoftThreshold && !ctx.IsBeyondHardThreshold)
+        {
+            await _error.WriteLineAsync(
+                $"[context at {ctx.UsagePercent}% — /compact recommended]")
+                .ConfigureAwait(false);
         }
     }
 
@@ -138,9 +162,7 @@ public sealed class Repl
                 return SlashOutcome.Continue;
 
             case "/compact":
-                await _output.WriteLineAsync(
-                        "/compact is not implemented yet (Phase 3 — context management).")
-                    .ConfigureAwait(false);
+                await HandleCompactCommandAsync(ct).ConfigureAwait(false);
                 return SlashOutcome.Continue;
 
             default:
@@ -190,6 +212,39 @@ public sealed class Repl
         await _output.WriteLineAsync($"  mode: {_session.Mode.ToString().ToLowerInvariant()}").ConfigureAwait(false);
         await _output.WriteLineAsync($"  messages: {_session.Messages.Count}").ConfigureAwait(false);
         await _output.WriteLineAsync($"  cwd: {_cwd}").ConfigureAwait(false);
+
+        var ctx = _agent.Context;
+        if (ctx is not null)
+        {
+            await _output.WriteLineAsync(
+                $"  context: {ctx.LastPromptTokens} / {ctx.ContextWindow} tokens ({ctx.UsagePercent}%)")
+                .ConfigureAwait(false);
+        }
+    }
+
+    private async Task HandleCompactCommandAsync(CancellationToken ct)
+    {
+        var ctx = _agent.Context;
+        if (ctx is null)
+        {
+            await _output.WriteLineAsync(
+                "/compact requires a configured context window. Set litellm.contextWindows.<tier> in settings.")
+                .ConfigureAwait(false);
+            return;
+        }
+
+        try
+        {
+            var collapsed = await ctx.CompactAsync(_session, _agent.Client, ct).ConfigureAwait(false);
+            await _output.WriteLineAsync(collapsed == 0
+                ? "Nothing to compact — fewer than 5 user turns in history."
+                : $"Compacted {collapsed} message(s) into a summary; the last 4 user turns are preserved.")
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await _error.WriteLineAsync($"zdt: /compact failed: {ex.Message}").ConfigureAwait(false);
+        }
     }
 
     private async Task InitMemoryFileAsync(CancellationToken ct)

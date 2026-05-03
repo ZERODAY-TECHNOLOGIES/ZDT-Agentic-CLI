@@ -41,6 +41,25 @@ public sealed class LiteLLMClient
         _options = options;
     }
 
+    /// <summary>
+    /// Single non-streaming completion. Internally drains StreamChatAsync and concatenates
+    /// every TextDelta into one string. Tools are not sent (this is meant for one-shot
+    /// summarisation / classification calls). Returns the full text after the model emits
+    /// its Done chunk.
+    /// </summary>
+    public async Task<string> GetCompletionAsync(
+        IReadOnlyList<ChatMessage> messages,
+        string model,
+        CancellationToken ct = default)
+    {
+        var sb = new StringBuilder();
+        await foreach (var chunk in StreamChatAsync(messages, tools: null, model, ct).ConfigureAwait(false))
+        {
+            if (chunk is ChatChunk.TextDelta td) sb.Append(td.Text);
+        }
+        return sb.ToString();
+    }
+
     public async IAsyncEnumerable<ChatChunk> StreamChatAsync(
         IReadOnlyList<ChatMessage> messages,
         IReadOnlyList<ToolDef>? tools,

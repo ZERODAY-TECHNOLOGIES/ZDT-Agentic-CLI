@@ -34,12 +34,14 @@ public sealed class AgentLoop
     private readonly ToolRegistry _tools;
     private readonly PermissionRuleSet _perms;
     private readonly AgentLoopOptions _options;
+    private readonly ContextManager? _context;
 
     public AgentLoop(
         LiteLLMClient client,
         ToolRegistry tools,
         PermissionRuleSet perms,
-        AgentLoopOptions options)
+        AgentLoopOptions options,
+        ContextManager? context = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(tools);
@@ -49,10 +51,13 @@ public sealed class AgentLoop
         _tools = tools;
         _perms = perms;
         _options = options;
+        _context = context;
     }
 
     public PermissionRuleSet Permissions => _perms;
     public ToolRegistry Tools => _tools;
+    public LiteLLMClient Client => _client;
+    public ContextManager? Context => _context;
 
     /// <summary>
     /// Backwards-compatible one-shot entry point: spins up an ephemeral
@@ -157,7 +162,10 @@ public sealed class AgentLoop
             }
 
             if (turnPromptTokens is int p && turnCompletionTokens is int c)
+            {
                 session.AddUsage(p, c);
+                _context?.RegisterTurn(p, c);
+            }
 
             var nativeCalls = pending.Values
                 .Where(v => v.Id is not null && v.FunctionName is not null)
