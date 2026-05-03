@@ -1,0 +1,157 @@
+using Zdtllm.Core.Sessions;
+using Zdtllm.Tools;
+
+namespace Zdtllm.Core;
+
+/// <summary>
+/// Real subagents. Each call spins up a brand-new AgentLoop with:
+///   - the parent's LiteLLM client, model, mode, permission rules
+///   - a constrained tool registry per subagent_type (so a code-reviewer
+///     literally cannot Write or Bash)
+///   - a focused system prompt that replaces the parent's bloated one
+///   - an ephemeral session (no JSONL persistence — subagents are
+///     transient by design)
+/// The subagent's intermediate tool calls and reasoning never reach the
+/// parent — only its final assistant text. That's the point: the
+/// parent's context stays clean; the subagent gets a fresh perspective.
+/// </summary>
+public sealed class SubagentRunner : ISubagentRunner
+{
+    private static readonly Dictionary<string, IReadOnlySet<string>> ToolPolicyByType =
+        new(StringComparer.Ordinal)
+        {
+            ["code-reviewer"] = new HashSet<string>(StringComparer.Ordinal)
+            {
+                "Read", "Glob", "Grep", "TodoWrite",
+            },
+            ["explore"] = new HashSet<string>(StringComparer.Ordinal)
+            {
+                "Read", "Glob", "Grep", "WebFetch", "TodoWrite",
+            },
+            // "general-purpose" → null → all parent tools EXCEPT Task itself
+        };
+
+    private static readonly string[] AvailableTypeNames =
+    {
+        "general-purpose",
+        "code-reviewer",
+        "explore",
+    };
+
+    private readonly AgentLoop _parent;
+
+    public SubagentRunner(AgentLoop parent)
+    {
+        ArgumentNullException.ThrowIfNull(parent);
+        _parent = parent;
+    }
+
+    public IReadOnlyList<string> AvailableTypes => AvailableTypeNames;
+
+    public bool SupportsType(string type) =>
+        AvailableTypeNames.Contains(type, StringComparer.Ordinal);
+
+    public async Task<SubagentResult> RunAsync(SubagentRequest request, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var subRegistry = BuildRegistryForType(request.Type, _parent.Tools);
+        var subOptions = _parent.Options with
+        {
+            SystemPrompt = SystemPromptForType(request.Type),
+            MaxTurns = request.MaxTurns,
+        };
+
+        var subAgent = new AgentLoop(
+            _parent.Client,
+            subRegistry,
+            _parent.Permissions,
+            subOptions,
+            context: null); // subagent runs short — no own context manager
+
+        using var session = Session.NewEphemeral(subOptions.Model, subOptions.ToolCallingMode);
+
+        // Buffer the subagent's streamed text + status so the parent's stdout/stderr stays
+        // clean. Only the AgentResult.FinalText is bubbled up.
+        using var capturedOutput = new StringWriter();
+        using var capturedStatus = new StringWriter();
+
+        var result = await subAgent.RunTurnAsync(
+            session,
+            request.Prompt,
+            output: capturedOutput,
+            status: capturedStatus,
+            ct: ct).ConfigureAwait(false);
+
+        return new SubagentResult(
+            FinalText: result.FinalText,
+            Turns: result.Turns,
+            PromptTokens: result.PromptTokens,
+            CompletionTokens: result.CompletionTokens);
+    }
+
+    /// <summary>
+    /// Builds a registry for the requested type. The Task tool is always excluded
+    /// to prevent recursive sub-spawning — if a subagent could call Task, you'd get
+    /// fork-bombs at best and exploding bills at worst.
+    /// </summary>
+    internal static ToolRegistry BuildRegistryForType(string type, ToolRegistry parent)
+    {
+        var result = new ToolRegistry();
+
+        if (ToolPolicyByType.TryGetValue(type, out var allowed))
+        {
+            foreach (var tool in parent.All)
+            {
+                if (allowed.Contains(tool.Schema.Name))
+                    result.Register(tool);
+            }
+        }
+        else
+        {
+            // general-purpose — every tool the parent has, minus Task
+            foreach (var tool in parent.All)
+            {
+                if (tool.Schema.Name != "Task")
+                    result.Register(tool);
+            }
+        }
+
+        return result;
+    }
+
+    internal static string SystemPromptForType(string type) => type switch
+    {
+        "code-reviewer" => CodeReviewerSystemPrompt,
+        "explore" => ExploreSystemPrompt,
+        _ => GeneralPurposeSystemPrompt,
+    };
+
+    private const string GeneralPurposeSystemPrompt =
+        "You are a focused subagent dispatched by a parent agent. You have your own fresh " +
+        "context — you do not see the parent's conversation history. Complete the task " +
+        "autonomously using the tools available to you and return a concise summary of what " +
+        "you did and the result. Be specific and cite file paths / line numbers when relevant.";
+
+    private const string CodeReviewerSystemPrompt =
+        "You are a code-review subagent. Your only job is to analyze code rigorously.\n\n" +
+        "Rules:\n" +
+        "- READ EVERY file mentioned in the task, in full. Do not reason from titles or guesses.\n" +
+        "- For each file, walk through line-by-line. Use Grep to confirm patterns across files.\n" +
+        "- Look for: SQL injection, XSS (especially user input echoed without escaping in HTML " +
+        "context — including <title>, <h1>, attributes, JavaScript, URLs), IDOR, missing CSRF, " +
+        "missing authentication or authorization, path traversal, command injection, race " +
+        "conditions, type juggling, weak crypto, leaked secrets, insecure deserialization.\n" +
+        "- Cite EXACT file:line for every finding. Quote the offending code.\n" +
+        "- You CANNOT modify files (you have only Read, Glob, Grep, TodoWrite).\n" +
+        "- Trace EVERY untrusted input source ($_GET, $_POST, $_COOKIE, $_REQUEST, headers, " +
+        "session) through to every output sink. Do not declare a vulnerability \"mitigated\" " +
+        "after seeing one good escape — verify every echo / interpolation independently.\n\n" +
+        "Return a structured list of findings ordered by severity (Critical → High → Medium → Low), " +
+        "then a final one-sentence summary of the worst issue.";
+
+    private const string ExploreSystemPrompt =
+        "You are a research subagent. Investigate using Read, Glob, Grep on the local " +
+        "filesystem and WebFetch for URLs. Synthesize what you find into a clear, sourced " +
+        "answer. Do not modify any files (no write tools available).";
+}

@@ -131,6 +131,11 @@ internal static class Program
             },
             context: contextManager);
 
+        // Task tool needs the parent agent to spawn subagents from. Register it AFTER the
+        // agent is built — the registry holds a live reference, so the parent agent will see
+        // Task on subsequent turns.
+        registry.Register(new TaskTool(new SubagentRunner(agent)));
+
         if (parsed.PrintMode)
         {
             await agent.RunTurnAsync(

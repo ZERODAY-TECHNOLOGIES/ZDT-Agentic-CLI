@@ -58,6 +58,7 @@ public sealed class AgentLoop
     public ToolRegistry Tools => _tools;
     public LiteLLMClient Client => _client;
     public ContextManager? Context => _context;
+    public AgentLoopOptions Options => _options;
 
     /// <summary>
     /// Backwards-compatible one-shot entry point: spins up an ephemeral
