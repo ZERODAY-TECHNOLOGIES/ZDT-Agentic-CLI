@@ -12,6 +12,26 @@ public sealed class LiteLLMException : Exception
     public LiteLLMException(string message, Exception? inner = null) : base(message, inner) { }
 }
 
+/// <summary>
+/// Thrown when the upstream proxy returns HTTP 429 and we've exhausted retries — or when
+/// the proxy explicitly told us the bucket won't reset in time. Carries the Unix
+/// timestamp at which the rate-limit window resets so observers (stream-json) and the
+/// REPL can surface a useful "try again at HH:MM" message instead of just "request failed".
+/// </summary>
+public sealed class RateLimitException : Exception
+{
+    /// <summary>Unix-seconds timestamp when the rate-limit window is expected to reset.
+    /// May be null when the upstream provided no Retry-After or x-ratelimit-reset hint;
+    /// callers should default to a sensible fallback (e.g. now + 1h).</summary>
+    public long? ResetsAtUnix { get; }
+
+    public RateLimitException(string message, long? resetsAtUnix, Exception? inner = null)
+        : base(message, inner)
+    {
+        ResetsAtUnix = resetsAtUnix;
+    }
+}
+
 public sealed record LiteLLMClientOptions
 {
     public required string BaseUrl { get; init; }
@@ -142,6 +162,10 @@ public sealed class LiteLLMClient
     private async Task<HttpResponseMessage> SendWithRetryAsync(string bodyJson, CancellationToken ct)
     {
         Exception? lastException = null;
+        // Track the most recent 429 reset hint across retries — if every attempt 429s, we
+        // surface a structured RateLimitException at the end instead of a generic wrap.
+        long? lastRateLimitResetsAt = null;
+        bool lastWasRateLimit = false;
 
         for (var attempt = 0; attempt <= _options.MaxRetries; attempt++)
         {
@@ -168,6 +192,20 @@ public sealed class LiteLLMClient
 
                 if (IsRetryableStatus(response.StatusCode))
                 {
+                    if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                    {
+                        // Pull the reset hint from the headers BEFORE disposing the response.
+                        // Retry-After is the standard claude/Anthropic-style hint; some
+                        // proxies (LiteLLM with Anthropic upstream) also forward
+                        // x-ratelimit-reset as a Unix-seconds value — check both.
+                        lastRateLimitResetsAt = ParseRateLimitResetUnix(response);
+                        lastWasRateLimit = true;
+                    }
+                    else
+                    {
+                        lastWasRateLimit = false;
+                    }
+
                     var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
                     response.Dispose();
                     lastException = new LiteLLMException(
@@ -183,10 +221,12 @@ public sealed class LiteLLMClient
             catch (HttpRequestException ex) when (attempt < _options.MaxRetries)
             {
                 lastException = ex;
+                lastWasRateLimit = false;
             }
             catch (TaskCanceledException ex) when (!ct.IsCancellationRequested && attempt < _options.MaxRetries)
             {
                 lastException = ex;
+                lastWasRateLimit = false;
             }
             catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
             {
@@ -196,13 +236,56 @@ public sealed class LiteLLMClient
                 // and print "(turn cancelled)" with no signal of what really happened. Capture
                 // it so the loop falls through to the LiteLLMException wrap below.
                 lastException = ex;
+                lastWasRateLimit = false;
                 break;
             }
+        }
+
+        if (lastWasRateLimit)
+        {
+            var resetIso = lastRateLimitResetsAt is long unix
+                ? DateTimeOffset.FromUnixTimeSeconds(unix).ToString("u")
+                : "unknown";
+            throw new RateLimitException(
+                $"LiteLLM rate limit exceeded after {_options.MaxRetries + 1} attempts (resets at {resetIso}).",
+                lastRateLimitResetsAt,
+                lastException);
         }
 
         throw new LiteLLMException(
             $"LiteLLM request failed after {_options.MaxRetries + 1} attempts: {lastException?.Message}",
             lastException);
+    }
+
+    /// <summary>
+    /// Pull a Unix-seconds reset timestamp out of HTTP 429 response headers. Tries — in
+    /// order — Retry-After (delta-seconds OR HTTP-date), then x-ratelimit-reset (epoch
+    /// seconds, the Anthropic / OpenAI form). Returns null when no usable hint is present;
+    /// the caller falls back to a sensible default (e.g. +1h) on the consumer side.
+    /// </summary>
+    private static long? ParseRateLimitResetUnix(HttpResponseMessage response)
+    {
+        // Retry-After: delta-seconds form → +N seconds from now.
+        if (response.Headers.RetryAfter is { } ra)
+        {
+            if (ra.Delta is TimeSpan delta && delta > TimeSpan.Zero)
+                return DateTimeOffset.UtcNow.Add(delta).ToUnixTimeSeconds();
+            if (ra.Date is DateTimeOffset abs && abs > DateTimeOffset.UtcNow)
+                return abs.ToUnixTimeSeconds();
+        }
+
+        // x-ratelimit-reset: Unix-seconds (Anthropic/OpenAI convention). Some proxies emit it
+        // as a string; HttpClient surfaces it via TryGetValues since it's not strongly typed.
+        if (response.Headers.TryGetValues("x-ratelimit-reset", out var values))
+        {
+            foreach (var v in values)
+            {
+                if (long.TryParse(v, out var unix) && unix > DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+                    return unix;
+            }
+        }
+
+        return null;
     }
 
     private HttpRequestMessage BuildRequest(string bodyJson)

@@ -5,13 +5,24 @@ using Spectre.Console;
 namespace Zdtllm.Tools;
 
 /// <summary>
-/// The Task tool. Lets the parent agent spin up a subagent with its own
-/// fresh context, focused system prompt, and constrained tool set. Returns
-/// only the subagent's final answer to the parent — intermediate tool
-/// calls stay inside the subagent so the parent's context stays clean.
+/// The Agent tool — exposes a subagent-spawn primitive to the model under the same
+/// name claude CLI uses (so AppSec-Automator's <c>--tools Read Glob Grep Agent</c>
+/// reaches us 1:1). Lets the parent agent spin up a subagent with its own fresh
+/// context, focused system prompt, and constrained tool set. Returns only the
+/// subagent's final answer to the parent — intermediate tool calls stay inside the
+/// subagent so the parent's context stays clean.
+///
+/// The implementation class is still <c>TaskTool</c> for historical reasons; only
+/// the user-visible Name advertised to the model changed from "Task" → "Agent" in
+/// v0.2.0 for claude-cli parity.
 /// </summary>
 public sealed class TaskTool : ITool
 {
+    /// <summary>The user-visible tool name advertised to the model. Kept as a const so
+    /// the SubagentRunner's recursion guard and the REPL's /agents banner share one
+    /// source of truth — renaming again only requires touching this one literal.</summary>
+    public const string ToolName = "Agent";
+
     private readonly ISubagentRunner _runner;
 
     public TaskTool(ISubagentRunner runner)
@@ -21,7 +32,7 @@ public sealed class TaskTool : ITool
     }
 
     public ToolSchema Schema { get; } = new(
-        Name: "Task",
+        Name: ToolName,
         Description:
             "Spawn a subagent with its OWN fresh context to handle a focused sub-task. " +
             "Use when:\n" +

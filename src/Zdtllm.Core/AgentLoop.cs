@@ -141,7 +141,13 @@ public sealed class AgentLoop
         var ctx = new ToolContext(Cwd: Directory.GetCurrentDirectory());
         int? lastPromptTokens = null;
         int? lastCompletionTokens = null;
+        // Running totals across all iterations of THIS turn — fed to OnResultAsync so the
+        // claude-shaped result event can publish summed billed tokens for the whole exchange.
+        int totalInputTokens = 0;
+        int totalOutputTokens = 0;
 
+        try
+        {
         for (var turn = 1; turn <= _options.MaxTurns; turn++)
         {
             var assistantText = new StringBuilder();
@@ -263,6 +269,8 @@ public sealed class AgentLoop
             {
                 session.AddUsage(p, c);
                 _context?.RegisterTurn(p, c);
+                totalInputTokens += p;
+                totalOutputTokens += c;
             }
 
             var nativeCalls = pending.Values
@@ -273,6 +281,17 @@ public sealed class AgentLoop
             IReadOnlyList<ParsedXmlToolCall> xmlCalls = nativeCalls.Length == 0 && xmlMode
                 ? XmlToolCallParser.ExtractCalls(assistantText.ToString())
                 : [];
+
+            // Notify observers about the assistant message that just streamed (text + tool
+            // calls + per-turn usage). For stream-json mode this is the per-iteration
+            // {"type":"assistant",...} event AppSec-Automator scans for billed-token totals.
+            await SafeNotifyAsync(_observer?.OnAssistantTurnAsync(
+                assistantText.ToString(),
+                nativeCalls,
+                session.Model,
+                turnPromptTokens,
+                turnCompletionTokens,
+                ct)).ConfigureAwait(false);
 
             if (nativeCalls.Length == 0 && xmlCalls.Count == 0)
             {
@@ -301,6 +320,15 @@ public sealed class AgentLoop
 
                 await SafeNotifyAsync(_observer?.OnFinalAsync(
                     displayText, turn, lastPromptTokens, lastCompletionTokens, ct)).ConfigureAwait(false);
+                await SafeNotifyAsync(_observer?.OnResultAsync(
+                    subtype: "success",
+                    isError: false,
+                    numTurns: turn,
+                    stopReason: "end_turn",
+                    resultText: displayText,
+                    totalInputTokens: totalInputTokens,
+                    totalOutputTokens: totalOutputTokens,
+                    ct: ct)).ConfigureAwait(false);
                 return new AgentResult(displayText, turn, lastPromptTokens, lastCompletionTokens);
             }
 
@@ -344,8 +372,76 @@ public sealed class AgentLoop
             }
         }
 
+        // Loop fell through without an explicit return — the model kept asking for tools
+        // for too many iterations. Notify observers of the error_max_turns terminus
+        // (claude-cli equivalent) and surface it to the caller as an exception so REPL/print
+        // mode can decide what to do (print + exit non-zero, or continue the REPL).
+        await SafeNotifyAsync(_observer?.OnResultAsync(
+            subtype: "error_max_turns",
+            isError: true,
+            numTurns: _options.MaxTurns,
+            stopReason: "max_turns",
+            resultText: null,
+            totalInputTokens: totalInputTokens,
+            totalOutputTokens: totalOutputTokens,
+            ct: CancellationToken.None)).ConfigureAwait(false);
+
         throw new InvalidOperationException(
             $"Agent exceeded max turns ({_options.MaxTurns}) without completing.");
+        }
+        catch (RateLimitException rl)
+        {
+            // Surface the structured rate-limit signal BEFORE the terminal result event so a
+            // stream-json consumer can parse the resetsAt hint and schedule a retry. Then
+            // emit the result-event terminus (is_error=true, stop_reason=rate_limited) so
+            // the consumer always sees exactly one terminal event regardless of the cause.
+            await SafeNotifyAsync(_observer?.OnRateLimitedAsync(
+                status: "rejected",
+                resetsAtUnix: rl.ResetsAtUnix,
+                ct: CancellationToken.None)).ConfigureAwait(false);
+            await SafeNotifyAsync(_observer?.OnResultAsync(
+                subtype: "error_during_execution",
+                isError: true,
+                numTurns: 0,
+                stopReason: "rate_limited",
+                resultText: rl.Message,
+                totalInputTokens: totalInputTokens,
+                totalOutputTokens: totalOutputTokens,
+                ct: CancellationToken.None)).ConfigureAwait(false);
+            throw;
+        }
+        catch (OperationCanceledException)
+        {
+            // User-cancellation (Ctrl+C / programCts) — the existing flows in Repl/Program
+            // print "(turn cancelled)" themselves, but a stream-json consumer still wants
+            // a terminal result event so its parser doesn't hang waiting for one.
+            await SafeNotifyAsync(_observer?.OnResultAsync(
+                subtype: "error_during_execution",
+                isError: true,
+                numTurns: 0,
+                stopReason: "cancelled",
+                resultText: null,
+                totalInputTokens: totalInputTokens,
+                totalOutputTokens: totalOutputTokens,
+                ct: CancellationToken.None)).ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception)
+        {
+            // Any other failure path — HTTP error, parse error, tool dispatch crash. Emit
+            // error_during_execution so the consumer always gets a terminal event before
+            // the exception escapes the loop.
+            await SafeNotifyAsync(_observer?.OnResultAsync(
+                subtype: "error_during_execution",
+                isError: true,
+                numTurns: 0,
+                stopReason: null,
+                resultText: null,
+                totalInputTokens: totalInputTokens,
+                totalOutputTokens: totalOutputTokens,
+                ct: CancellationToken.None)).ConfigureAwait(false);
+            throw;
+        }
     }
 
     private async Task ExecuteNativeRoundAsync(

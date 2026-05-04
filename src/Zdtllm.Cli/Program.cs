@@ -43,6 +43,19 @@ internal static class Program
             await Console.Error.WriteLineAsync("zdt: cancelled.").ConfigureAwait(false);
             return 130;
         }
+        catch (Zdtllm.LiteLLM.RateLimitException ex)
+        {
+            // Distinct exit code so callers can branch on rate-limit vs generic failure
+            // without grepping the message. The stream-json path already emitted a structured
+            // rate_limit_event + result event before the exception bubbled here, so this
+            // print is just for the human (text-mode) path.
+            var resetIso = ex.ResetsAtUnix is long unix
+                ? DateTimeOffset.FromUnixTimeSeconds(unix).ToString("u")
+                : "unknown";
+            await Console.Error.WriteLineAsync(
+                $"zdt: rate limit exceeded. Try again at {resetIso}.").ConfigureAwait(false);
+            return 75; // POSIX EX_TEMPFAIL — convention for transient/retryable failure
+        }
         catch (Exception ex)
         {
             await Console.Error.WriteLineAsync($"zdt: {ex.Message}").ConfigureAwait(false);
@@ -61,7 +74,7 @@ internal static class Program
 
     private static async Task<int> RunAsync(string[] args)
     {
-        var parsed = ParseArgs(args);
+        var parsed = ArgumentParser.Parse(args);
 
         if (parsed.ShowVersion) { PrintVersion(); return 0; }
         if (parsed.ShowHelp) { PrintHelp(); return 0; }
@@ -71,9 +84,19 @@ internal static class Program
         if (parsed.CheckUpdates) return await SelfUpdate.RunCheckUpdatesAsync().ConfigureAwait(false);
         if (parsed.SelfUpdate)   return await SelfUpdate.RunSelfUpdateAsync().ConfigureAwait(false);
 
+        // Anthropic-compat: in -p mode, if no positional query was given but stdin is piped,
+        // read the prompt from stdin to EOF. Lets callers like AppSec-Automator do
+        // `Process::setInput($prompt)` instead of building a giant argv string.
+        if (parsed.PrintMode && string.IsNullOrWhiteSpace(parsed.Query) && Console.IsInputRedirected)
+        {
+            var piped = await Console.In.ReadToEndAsync().ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(piped)) parsed.Query = piped.Trim();
+        }
+
         if (parsed.PrintMode && string.IsNullOrWhiteSpace(parsed.Query))
         {
-            await Console.Error.WriteLineAsync("zdt -p requires a query.").ConfigureAwait(false);
+            await Console.Error.WriteLineAsync(
+                "zdt -p requires a query (positional arg or piped stdin).").ConfigureAwait(false);
             return 2;
         }
 
@@ -376,6 +399,17 @@ internal static class Program
         { foreach (var o in _inner) await o.OnToolResultAsync(toolName, content, isError, duration, ct).ConfigureAwait(false); }
         public async Task OnFinalAsync(string finalText, int turns, int? promptTokens, int? completionTokens, CancellationToken ct)
         { foreach (var o in _inner) await o.OnFinalAsync(finalText, turns, promptTokens, completionTokens, ct).ConfigureAwait(false); }
+        public async Task OnAssistantTurnAsync(
+            string text,
+            System.Collections.Immutable.ImmutableArray<Zdtllm.LiteLLM.ToolCall> toolCalls,
+            string model, int? inputTokens, int? outputTokens, CancellationToken ct)
+        { foreach (var o in _inner) await o.OnAssistantTurnAsync(text, toolCalls, model, inputTokens, outputTokens, ct).ConfigureAwait(false); }
+        public async Task OnResultAsync(
+            string subtype, bool isError, int numTurns, string? stopReason, string? resultText,
+            int totalInputTokens, int totalOutputTokens, CancellationToken ct)
+        { foreach (var o in _inner) await o.OnResultAsync(subtype, isError, numTurns, stopReason, resultText, totalInputTokens, totalOutputTokens, ct).ConfigureAwait(false); }
+        public async Task OnRateLimitedAsync(string status, long? resetsAtUnix, CancellationToken ct)
+        { foreach (var o in _inner) await o.OnRateLimitedAsync(status, resetsAtUnix, ct).ConfigureAwait(false); }
     }
 
     /// <summary>
@@ -622,109 +656,6 @@ internal static class Program
         return (modelName, mode);
     }
 
-    private static ParsedArgs ParseArgs(string[] args)
-    {
-        var result = new ParsedArgs();
-        var positional = new List<string>();
-
-        for (var i = 0; i < args.Length; i++)
-        {
-            switch (args[i])
-            {
-                case "-p":
-                case "--print":
-                    result.PrintMode = true;
-                    break;
-                case "--model":
-                    result.Model = NextValue(args, ref i, "--model");
-                    break;
-                case "--max-turns":
-                    result.MaxTurns = int.Parse(NextValue(args, ref i, "--max-turns"));
-                    break;
-                case "--max-parallel":
-                    result.MaxParallel = int.Parse(NextValue(args, ref i, "--max-parallel"));
-                    break;
-                case "--dangerously-skip-permissions":
-                    result.DangerouslySkipPermissions = true;
-                    break;
-                case "--no-wizard":
-                    result.NoWizard = true;
-                    break;
-                case "--bare":
-                    result.Bare = true;
-                    break;
-                case "--tool-calling":
-                    result.ToolCallingMode = NextValue(args, ref i, "--tool-calling");
-                    break;
-                case "--system-prompt":
-                    result.SystemPrompt = NextValue(args, ref i, "--system-prompt");
-                    break;
-                case "--system-prompt-file":
-                    result.SystemPromptFile = NextValue(args, ref i, "--system-prompt-file");
-                    break;
-                case "--append-system-prompt":
-                    result.AppendSystemPrompt = NextValue(args, ref i, "--append-system-prompt");
-                    break;
-                case "--append-system-prompt-file":
-                    result.AppendSystemPromptFile = NextValue(args, ref i, "--append-system-prompt-file");
-                    break;
-                case "--add-dir":
-                    result.AddDirs.Add(NextValue(args, ref i, "--add-dir"));
-                    break;
-                case "--mcp-config":
-                    result.McpConfigs.Add(NextValue(args, ref i, "--mcp-config"));
-                    break;
-                case "--verbose":
-                    result.Verbose = true;
-                    break;
-                case "--output-format":
-                    result.OutputFormat = NextValue(args, ref i, "--output-format");
-                    break;
-                case "--tools":
-                    foreach (var t in NextValue(args, ref i, "--tools").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-                        result.AllowedTools.Add(t);
-                    break;
-                case "--session-id":
-                    result.SessionId = NextValue(args, ref i, "--session-id");
-                    break;
-                case "-c":
-                case "--continue":
-                    result.Continue = true;
-                    break;
-                case "-r":
-                case "--resume":
-                    result.Resume = NextValue(args, ref i, "--resume");
-                    break;
-                case "--version":
-                    result.ShowVersion = true;
-                    break;
-                case "--check-updates":
-                    result.CheckUpdates = true;
-                    break;
-                case "--self-update":
-                    result.SelfUpdate = true;
-                    break;
-                case "-h":
-                case "--help":
-                    result.ShowHelp = true;
-                    break;
-                default:
-                    positional.Add(args[i]);
-                    break;
-            }
-        }
-
-        result.Query = positional.Count > 0 ? string.Join(' ', positional) : null;
-        return result;
-    }
-
-    private static string NextValue(string[] args, ref int i, string flag)
-    {
-        if (i + 1 >= args.Length)
-            throw new ArgumentException($"{flag} requires a value.");
-        return args[++i];
-    }
-
     private static void PrintVersion()
     {
         var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0";
@@ -759,7 +690,8 @@ internal static class Program
         Console.WriteLine("  --mcp-config <path>            load MCP server config from a JSON file (repeatable, last wins per server)");
         Console.WriteLine("  --verbose                      trace tool calls + results to stderr (durations, args/preview)");
         Console.WriteLine("  --output-format <fmt>          text (default) | json | stream-json — only honoured with -p");
-        Console.WriteLine("  --tools <a,b,c>                allowlist of tool names — registry is filtered after MCP/Task register");
+        Console.WriteLine("  --tools <names...>             allowlist of tool names (space- or comma-separated, e.g. Read Glob Grep)");
+        Console.WriteLine("  --allowed-tools <names...>     alias for --tools (claude-cli compat)");
         Console.WriteLine("  --session-id <uuid>            create or resume a persistent session at this id");
         Console.WriteLine("  -c, --continue                 resume the most recent session for this directory");
         Console.WriteLine("  -r, --resume <uuid>            resume the specified session");
@@ -771,32 +703,4 @@ internal static class Program
         Console.WriteLine($"More at {Url}");
     }
 
-    private sealed class ParsedArgs
-    {
-        public bool PrintMode { get; set; }
-        public string? Model { get; set; }
-        public int? MaxTurns { get; set; }
-        public int? MaxParallel { get; set; }
-        public bool DangerouslySkipPermissions { get; set; }
-        public bool NoWizard { get; set; }
-        public bool Bare { get; set; }
-        public string? ToolCallingMode { get; set; }
-        public string? SessionId { get; set; }
-        public bool Continue { get; set; }
-        public string? Resume { get; set; }
-        public string? SystemPrompt { get; set; }
-        public string? SystemPromptFile { get; set; }
-        public string? AppendSystemPrompt { get; set; }
-        public string? AppendSystemPromptFile { get; set; }
-        public List<string> AddDirs { get; } = new();
-        public List<string> McpConfigs { get; } = new();
-        public bool Verbose { get; set; }
-        public string? OutputFormat { get; set; }
-        public List<string> AllowedTools { get; } = new();
-        public bool ShowVersion { get; set; }
-        public bool ShowHelp { get; set; }
-        public bool CheckUpdates { get; set; }
-        public bool SelfUpdate { get; set; }
-        public string? Query { get; set; }
-    }
 }

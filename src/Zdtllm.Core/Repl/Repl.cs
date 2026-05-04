@@ -252,7 +252,7 @@ public sealed class Repl
         if (_subagentRunner is null)
         {
             await _output.WriteLineAsync(
-                Palette.Mute("/agents requires the Task tool to be wired up. ") +
+                Palette.Mute("/agents requires the Agent tool to be wired up. ") +
                 Palette.Mute("(Re-launch zdt; subagents are configured automatically in interactive mode.)"))
                 .ConfigureAwait(false);
             return;
@@ -305,7 +305,7 @@ public sealed class Repl
         }
 
         await _output.WriteLineAsync(
-                Palette.Mute("  Spawned via the Task tool. Failed runs auto-retry once and may fall back to general-purpose."))
+                Palette.Mute("  Spawned via the Agent tool. Failed runs auto-retry once and may fall back to general-purpose."))
             .ConfigureAwait(false);
     }
 

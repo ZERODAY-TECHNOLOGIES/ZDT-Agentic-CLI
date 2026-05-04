@@ -1,12 +1,30 @@
+using System.Collections.Immutable;
 using System.Text.Json;
+using Zdtllm.LiteLLM;
 
 namespace Zdtllm.Core.Observers;
 
 /// <summary>
-/// Streams the agent's events as newline-delimited JSON (NDJSON) to a TextWriter.
-/// One line per event so consumers can parse incrementally — useful when piping zdt
-/// output into other CLI tools, or wiring a UI on top of <c>zdt -p --output-format
-/// stream-json</c>. Event types: text_delta, tool_call, tool_result, final.
+/// Anthropic-compatible NDJSON sink for <c>--output-format stream-json</c>. Emits one event
+/// per assistant iteration (text + tool_use blocks + per-turn usage) plus exactly one
+/// terminal <c>{"type":"result",...}</c> event with summed totals. The shape matches what
+/// <c>claude --output-format stream-json</c> produces so consumers like AppSec-Automator
+/// (StreamJsonResult.php / DetectsRateLimit.php) parse zdt's output without modification.
+///
+/// Events:
+///   <code>{"type":"assistant","message":{"role":"assistant","model":"...","content":[
+///       {"type":"text","text":"..."},
+///       {"type":"tool_use","id":"...","name":"...","input":{...}}],
+///       "usage":{"input_tokens":N,"output_tokens":N}}}</code>
+///   <code>{"type":"result","subtype":"success|error_max_turns|error_during_execution",
+///       "is_error":bool,"num_turns":N,"stop_reason":"end_turn|max_turns|...",
+///       "total_cost_usd":null,"result":"final text",
+///       "input_tokens":N,"output_tokens":N}</code>
+///
+/// Per-delta <c>text_delta</c> / <c>tool_call</c> / <c>tool_result</c> events from earlier zdt
+/// builds are intentionally gone — claude doesn't emit them either, and consumers built
+/// against claude expect the per-turn <c>assistant</c> shape. Use <c>--verbose</c> if you
+/// want a human-readable trace of tool calls on stderr.
 /// </summary>
 public sealed class StreamJsonObserver : IAgentObserver
 {
@@ -19,38 +37,82 @@ public sealed class StreamJsonObserver : IAgentObserver
         _sink = sink;
     }
 
-    public async Task OnTextDeltaAsync(string text, CancellationToken ct)
+    public async Task OnAssistantTurnAsync(
+        string text,
+        ImmutableArray<ToolCall> toolCalls,
+        string model,
+        int? inputTokens,
+        int? outputTokens,
+        CancellationToken ct)
     {
-        if (string.IsNullOrEmpty(text)) return;
-        await EmitAsync(new { type = "text_delta", text }, ct).ConfigureAwait(false);
+        var content = new List<object>();
+        if (!string.IsNullOrEmpty(text))
+            content.Add(new { type = "text", text });
+        if (!toolCalls.IsDefaultOrEmpty)
+        {
+            foreach (var call in toolCalls)
+            {
+                // Embed the args as a parsed JSON object when possible — claude does that and
+                // consumers reading "input" expect a structured value, not a stringified one.
+                object input = TryParseJson(call.Arguments) ?? (object)call.Arguments;
+                content.Add(new
+                {
+                    type = "tool_use",
+                    id = call.Id,
+                    name = call.FunctionName,
+                    input,
+                });
+            }
+        }
+
+        var message = new
+        {
+            role = "assistant",
+            model,
+            content,
+            usage = new
+            {
+                input_tokens = inputTokens ?? 0,
+                output_tokens = outputTokens ?? 0,
+            },
+        };
+
+        await EmitAsync(new { type = "assistant", message }, ct).ConfigureAwait(false);
     }
 
-    public async Task OnToolCallAsync(string toolName, string argumentsJson, CancellationToken ct)
-    {
-        // Try to embed the raw arguments as a JSON object/value rather than a string —
-        // consumers shouldn't have to JSON.parse a string they just received.
-        object args = TryParse(argumentsJson) ?? (object)argumentsJson;
-        await EmitAsync(new { type = "tool_call", name = toolName, arguments = args }, ct).ConfigureAwait(false);
-    }
-
-    public async Task OnToolResultAsync(string toolName, string content, bool isError, TimeSpan duration, CancellationToken ct) =>
+    public async Task OnRateLimitedAsync(string status, long? resetsAtUnix, CancellationToken ct) =>
         await EmitAsync(new
         {
-            type = "tool_result",
-            name = toolName,
-            content,
-            is_error = isError,
-            duration_ms = (long)duration.TotalMilliseconds,
+            type = "rate_limit_event",
+            rate_limit_info = new
+            {
+                status,
+                resetsAt = resetsAtUnix,
+            },
         }, ct).ConfigureAwait(false);
 
-    public async Task OnFinalAsync(string finalText, int turns, int? promptTokens, int? completionTokens, CancellationToken ct) =>
+    public async Task OnResultAsync(
+        string subtype,
+        bool isError,
+        int numTurns,
+        string? stopReason,
+        string? resultText,
+        int totalInputTokens,
+        int totalOutputTokens,
+        CancellationToken ct) =>
         await EmitAsync(new
         {
-            type = "final",
-            text = finalText,
-            turns,
-            prompt_tokens = promptTokens,
-            completion_tokens = completionTokens,
+            type = "result",
+            subtype,
+            is_error = isError,
+            num_turns = numTurns,
+            stop_reason = stopReason,
+            // LiteLLM doesn't surface a deterministic per-call cost — we leave this null and
+            // let the consumer either ignore the field or compute its own from input/output.
+            total_cost_usd = (double?)null,
+            result = resultText,
+            input_tokens = totalInputTokens,
+            output_tokens = totalOutputTokens,
         }, ct).ConfigureAwait(false);
 
     private async Task EmitAsync(object payload, CancellationToken ct)
@@ -68,7 +130,7 @@ public sealed class StreamJsonObserver : IAgentObserver
         }
     }
 
-    private static object? TryParse(string raw)
+    private static object? TryParseJson(string raw)
     {
         if (string.IsNullOrWhiteSpace(raw)) return null;
         try

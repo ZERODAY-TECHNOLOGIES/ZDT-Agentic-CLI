@@ -88,7 +88,7 @@ public sealed class ReplAgentsAndCancelTests : IDisposable
 
         await repl.RunAsync();
 
-        output.ToString().Should().Contain("/agents requires the Task tool");
+        output.ToString().Should().Contain("/agents requires the Agent tool");
     }
 
     [Fact]

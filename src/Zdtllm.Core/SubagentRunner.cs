@@ -170,8 +170,8 @@ public sealed class SubagentRunner : ISubagentRunner
     }
 
     /// <summary>
-    /// Builds a registry for the requested type. The Task tool is always excluded
-    /// to prevent recursive sub-spawning — if a subagent could call Task, you'd get
+    /// Builds a registry for the requested type. The Agent tool itself is always excluded
+    /// to prevent recursive sub-spawning — if a subagent could call Agent, you'd get
     /// fork-bombs at best and exploding bills at worst. Stateful tools (anything whose
     /// CloneForSubagent override returns a fresh instance) are isolated per subagent so
     /// parallel subagents don't race on shared mutable state (Bash's cwd, TodoWrite's list).
@@ -190,10 +190,10 @@ public sealed class SubagentRunner : ISubagentRunner
         }
         else
         {
-            // general-purpose — every tool the parent has, minus Task
+            // general-purpose — every tool the parent has, minus the Agent tool itself
             foreach (var tool in parent.All)
             {
-                if (tool.Schema.Name != "Task")
+                if (tool.Schema.Name != Zdtllm.Tools.TaskTool.ToolName)
                     result.Register(tool.CloneForSubagent());
             }
         }

@@ -12,6 +12,18 @@ public sealed class TaskToolTests
     }
 
     [Fact]
+    public void Schema_advertises_tool_name_as_Agent_for_claude_cli_compat()
+    {
+        // Anchored test: the model's tool catalog must call this tool "Agent" so
+        // AppSec-Automator's `--tools Read Glob Grep Agent` reaches us via the existing
+        // ArgumentParser → ApplyToolsAllowlist path. Renaming back to "Task" would silently
+        // break drop-in compat without anything else flagging it.
+        var tool = new TaskTool(new RecordingRunner(new SubagentResult("ok", 0, null, null)));
+        tool.Schema.Name.Should().Be("Agent");
+        TaskTool.ToolName.Should().Be("Agent");
+    }
+
+    [Fact]
     public async Task Forwards_request_to_runner_and_wraps_metadata_around_output()
     {
         var runner = new RecordingRunner(new SubagentResult("the answer", Turns: 3, PromptTokens: 421, CompletionTokens: 88));

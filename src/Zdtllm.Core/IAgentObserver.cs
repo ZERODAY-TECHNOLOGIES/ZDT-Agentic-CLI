@@ -1,3 +1,6 @@
+using System.Collections.Immutable;
+using Zdtllm.LiteLLM;
+
 namespace Zdtllm.Core;
 
 /// <summary>
@@ -23,4 +26,47 @@ public interface IAgentObserver
     /// <summary>Fired exactly once per <c>RunTurnAsync</c> call when the loop reaches a no-tool-calls turn.</summary>
     Task OnFinalAsync(string finalText, int turns, int? promptTokens, int? completionTokens, CancellationToken ct) =>
         Task.CompletedTask;
+
+    /// <summary>
+    /// Fired once per agent iteration with the full assistant message (text + tool_use blocks)
+    /// and the per-turn token usage. Powers Anthropic-compatible <c>{"type":"assistant",...}</c>
+    /// stream-json events that downstream consumers (e.g. AppSec-Automator's StreamJsonResult)
+    /// scan for billed-tokens and the model that produced the turn.
+    /// </summary>
+    Task OnAssistantTurnAsync(
+        string text,
+        ImmutableArray<ToolCall> toolCalls,
+        string model,
+        int? inputTokens,
+        int? outputTokens,
+        CancellationToken ct) => Task.CompletedTask;
+
+    /// <summary>
+    /// Fired exactly once at the terminal end of the run — success OR error path. Carries the
+    /// totals the claude-cli result event publishes: subtype (success / error_max_turns /
+    /// error_during_execution), num_turns, stop_reason, summed input/output tokens. Total cost
+    /// is reported separately via stream-json (always null because LiteLLM doesn't surface it).
+    /// </summary>
+    Task OnResultAsync(
+        string subtype,
+        bool isError,
+        int numTurns,
+        string? stopReason,
+        string? resultText,
+        int totalInputTokens,
+        int totalOutputTokens,
+        CancellationToken ct) => Task.CompletedTask;
+
+    /// <summary>
+    /// Fired once when the upstream proxy returned HTTP 429 and our retries have been
+    /// exhausted (or we know the rate-limit window won't open in time). Powers Anthropic-
+    /// compatible <c>{"type":"rate_limit_event","rate_limit_info":{...}}</c> events that
+    /// downstream consumers (AppSec-Automator's DetectsRateLimit) parse into a structured
+    /// "try again at X" signal. <paramref name="resetsAtUnix"/> may be null when the upstream
+    /// gave us no Retry-After / x-ratelimit-reset hint.
+    /// </summary>
+    Task OnRateLimitedAsync(
+        string status,
+        long? resetsAtUnix,
+        CancellationToken ct) => Task.CompletedTask;
 }
