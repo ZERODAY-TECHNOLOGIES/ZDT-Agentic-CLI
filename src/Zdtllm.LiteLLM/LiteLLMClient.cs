@@ -148,7 +148,12 @@ public sealed class LiteLLMClient
             if (attempt > 0)
                 await Task.Delay(ComputeBackoff(attempt - 1), ct).ConfigureAwait(false);
 
-            var request = BuildRequest(bodyJson);
+            // Each retry builds a fresh request (HttpRequestMessage isn't re-sendable). Wrap
+            // in a `using` so the message + body StringContent get disposed regardless of
+            // whether SendAsync threw, returned a retryable status, or succeeded — successful
+            // sends transfer ownership of the response to the caller, but the request itself
+            // is always safe to dispose post-send.
+            using var request = BuildRequest(bodyJson);
 
             try
             {

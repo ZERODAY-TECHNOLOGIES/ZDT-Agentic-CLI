@@ -44,10 +44,15 @@ public sealed class McpManager : IAsyncDisposable
             using var perServerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             perServerCts.CancelAfter(handshakeTimeout);
 
+            // Track transport AND client separately. If `new McpClient(...)` throws between
+            // Start and the catch, the transport is live and must be disposed explicitly —
+            // disposing the client wouldn't dispose the transport because the client never
+            // got constructed.
+            StdioMcpTransport? transport = null;
             McpClient? client = null;
             try
             {
-                var transport = StdioMcpTransport.Start(server, _diagnostics);
+                transport = StdioMcpTransport.Start(server, _diagnostics);
                 client = new McpClient(transport, server.Name, _diagnostics);
                 await client.InitializeAsync(perServerCts.Token).ConfigureAwait(false);
                 var tools = await client.ListToolsAsync(perServerCts.Token).ConfigureAwait(false);
@@ -65,7 +70,10 @@ public sealed class McpManager : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                if (client is not null) await client.DisposeAsync().ConfigureAwait(false);
+                if (client is not null)
+                    await client.DisposeAsync().ConfigureAwait(false);
+                else if (transport is not null)
+                    await transport.DisposeAsync().ConfigureAwait(false);
                 _statuses.Add(new McpServerStatus(
                     Name: server.Name,
                     Connected: false,

@@ -128,6 +128,10 @@ public sealed class BashTool : ITool
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
                 TryKill(process);
+                // Observe the cancelled stdout/stderr reads so they don't surface as
+                // UnobservedTaskException finalizer-thread spam in long-running sessions.
+                try { await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false); }
+                catch { /* expected — readers were cancelled */ }
                 return ToolResult.Error($"Bash: command timed out after {timeoutMs}ms.");
             }
 

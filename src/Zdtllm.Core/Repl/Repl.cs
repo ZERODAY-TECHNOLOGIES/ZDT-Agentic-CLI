@@ -64,7 +64,15 @@ public sealed class Repl
     /// (and any subagents it spawned, since they share this token chain) but
     /// keeps the REPL alive for the next prompt.
     /// </summary>
-    public void CancelCurrentTurn() => _currentTurnCts?.Cancel();
+    public void CancelCurrentTurn()
+    {
+        // The CTS is owned by the per-turn `using` in ProcessUserTurnAsync. CancelKeyPress
+        // can fire AFTER the using has disposed but BEFORE _currentTurnCts is cleared on
+        // a different thread — racing into a disposed CTS would throw ObjectDisposedException.
+        // Swallowing is fine: there's nothing to cancel anymore.
+        try { _currentTurnCts?.Cancel(); }
+        catch (ObjectDisposedException) { /* race with turn-end disposal — nothing to do */ }
+    }
 
     public async Task<int> RunAsync(string? initialPrompt = null, CancellationToken ct = default)
     {

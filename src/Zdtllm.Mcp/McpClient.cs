@@ -221,7 +221,19 @@ public sealed class McpClient : IAsyncDisposable
             method,
             @params,
         }, JsonOpts);
-        await _transport.SendAsync(json, ct).ConfigureAwait(false);
+
+        // If SendAsync throws (transport faulted, peer hung up), the pending entry is now
+        // orphaned — nothing will ever wake the tcs. Remove it on any send failure so the
+        // dictionary doesn't accumulate forever during 12-hour runs with intermittent faults.
+        try
+        {
+            await _transport.SendAsync(json, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            _pending.TryRemove(id, out _);
+            throw;
+        }
 
         using (ct.Register(() =>
         {

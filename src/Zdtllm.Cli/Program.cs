@@ -168,6 +168,17 @@ internal static class Program
         // linked to this one). Print mode short-circuits to "first Ctrl+C exits".
         using var programCts = new CancellationTokenSource();
 
+        // ProcessExit is the last hook the runtime fires before the process is torn down.
+        // It runs synchronously even on hard shutdown paths the try/finally below might not
+        // see (e.g. an unhandled exception in a background task). We wait up to 2 s for the
+        // manager to kill its children — long enough for stdin-close-then-exit, short enough
+        // not to block a user's terminal. We do NOT subscribe Console.CancelKeyPress to this
+        // because Ctrl+C also flows through the REPL/print handlers below.
+        AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+        {
+            try { mcpManager.DisposeAsync().AsTask().Wait(2000); } catch { /* swallow */ }
+        };
+
         // Ensure MCP server subprocesses are cleaned up no matter how we exit (normal,
         // exception, Ctrl+C). Wrapping the rest of RunAsync in try/finally is the simplest
         // way to guarantee disposal across both print and interactive paths.
@@ -207,6 +218,11 @@ internal static class Program
             subagentRunner: subagentRunner);
 
         var ctrlCCount = 0;
+        // Single reusable timer instead of allocating a new Task.Delay+ContinueWith on every
+        // Ctrl+C. A user mashing Ctrl+C couldn't accumulate orphaned tasks anymore — the
+        // timer just resets its "due time" each press.
+        using var ctrlCResetTimer = new System.Threading.Timer(
+            _ => Interlocked.Exchange(ref ctrlCCount, 0), null, Timeout.Infinite, Timeout.Infinite);
         Console.CancelKeyPress += (_, e) =>
         {
             // First Ctrl+C: cancel the active turn (kills agent + every subagent it spawned via
@@ -219,9 +235,9 @@ internal static class Program
             }
             e.Cancel = true;
             repl.CancelCurrentTurn();
-            // Reset the counter once the current turn finishes — we install a one-shot timer
-            // via Task.Delay so a slow second Ctrl+C doesn't accidentally exit.
-            _ = Task.Delay(1500).ContinueWith(_ => Interlocked.Exchange(ref ctrlCCount, 0));
+            // (Re)arm the reset timer for 1.5 s out so a slow second Ctrl+C doesn't accidentally
+            // exit. Re-Change just shifts the due time — no new allocation.
+            ctrlCResetTimer.Change(1500, Timeout.Infinite);
         };
 
         return await repl.RunAsync(parsed.Query, programCts.Token).ConfigureAwait(false);

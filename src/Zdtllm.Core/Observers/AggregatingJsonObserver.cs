@@ -13,6 +13,10 @@ public sealed class AggregatingJsonObserver : IAgentObserver
 {
     private readonly StringBuilder _accumulatedText = new();
     private readonly List<ToolEvent> _toolEvents = new();
+    // Per-tool-name FIFO of un-paired call entries — lets OnToolResultAsync match in O(1)
+    // instead of doing a linear LastOrDefault scan over every accumulated event. Matters
+    // for long sessions where _toolEvents grows past a few hundred entries.
+    private readonly Dictionary<string, Queue<ToolEvent>> _pendingByName = new(StringComparer.Ordinal);
     private string? _finalText;
     private int _turns;
     private int? _promptTokens;
@@ -31,13 +35,17 @@ public sealed class AggregatingJsonObserver : IAgentObserver
 
     public Task OnToolCallAsync(string toolName, string argumentsJson, CancellationToken ct)
     {
+        var entry = new ToolEvent
+        {
+            Name = toolName,
+            ArgumentsRaw = argumentsJson,
+        };
         lock (_gate)
         {
-            _toolEvents.Add(new ToolEvent
-            {
-                Name = toolName,
-                ArgumentsRaw = argumentsJson,
-            });
+            _toolEvents.Add(entry);
+            if (!_pendingByName.TryGetValue(toolName, out var queue))
+                _pendingByName[toolName] = queue = new Queue<ToolEvent>();
+            queue.Enqueue(entry);
         }
         return Task.CompletedTask;
     }
@@ -46,13 +54,10 @@ public sealed class AggregatingJsonObserver : IAgentObserver
     {
         lock (_gate)
         {
-            // Match the most recent un-completed call for this tool name. Simple FIFO match
-            // works for both serial and parallel batches because entries are appended in
-            // OnToolCallAsync order — within a parallel batch the result indices may interleave
-            // but each (call,result) pair shares a tool name and we treat the first unmatched as ours.
-            var pending = _toolEvents.LastOrDefault(e =>
-                string.Equals(e.Name, toolName, StringComparison.Ordinal) && e.Completed is null);
-            if (pending is not null)
+            // O(1) FIFO match — pop the oldest un-completed call for this tool name. Within a
+            // parallel batch, results may arrive in a different order than calls, but pairing
+            // by FIFO-per-name still gives every call exactly one result and vice versa.
+            if (_pendingByName.TryGetValue(toolName, out var queue) && queue.TryDequeue(out var pending))
             {
                 pending.Content = content;
                 pending.IsError = isError;

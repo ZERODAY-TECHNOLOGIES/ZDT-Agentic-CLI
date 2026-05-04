@@ -19,6 +19,7 @@ public sealed class StdioMcpTransport : IMcpTransport
     private readonly StreamWriter _stdin;
     private readonly StreamReader _stdout;
     private readonly TextWriter _stderrSink;
+    private readonly CancellationTokenSource _pumpCts = new();
     private readonly Task _stderrPump;
     private readonly object _writeLock = new();
     private bool _disposed;
@@ -31,22 +32,26 @@ public sealed class StdioMcpTransport : IMcpTransport
         _stderrSink = stderrSink;
 
         // Drain stderr on a background pump so a chatty server can't fill the pipe and
-        // deadlock. We forward to the caller's sink for diagnosability.
+        // deadlock. We forward to the caller's sink for diagnosability. Pump is cancellable
+        // so DisposeAsync can stop it cleanly when the child holds stderr open after stdin
+        // is closed (otherwise the pump would linger as a fire-and-forget task).
+        var pumpToken = _pumpCts.Token;
         _stderrPump = Task.Run(async () =>
         {
             try
             {
                 string? line;
-                while ((line = await _process.StandardError.ReadLineAsync().ConfigureAwait(false)) is not null)
+                while (!pumpToken.IsCancellationRequested
+                    && (line = await _process.StandardError.ReadLineAsync(pumpToken).ConfigureAwait(false)) is not null)
                 {
                     await _stderrSink.WriteLineAsync(line).ConfigureAwait(false);
                 }
             }
             catch
             {
-                // Best-effort — if the server closes stderr we just stop pumping.
+                // Best-effort — if the server closes stderr or we're cancelled, just stop pumping.
             }
-        });
+        }, pumpToken);
     }
 
     public static StdioMcpTransport Start(McpServerConfig config, TextWriter? stderrSink = null)
@@ -73,11 +78,22 @@ public sealed class StdioMcpTransport : IMcpTransport
             ?? throw new InvalidOperationException(
                 $"MCP server '{config.Name}': failed to spawn '{config.Command}'.");
 
-        return new StdioMcpTransport(
-            process,
-            process.StandardInput,
-            process.StandardOutput,
-            stderrSink ?? TextWriter.Null);
+        // If the constructor body throws (e.g. OOM allocating the pump task) we must NOT
+        // leak the live subprocess. Wrap construction so we can kill+dispose on failure.
+        try
+        {
+            return new StdioMcpTransport(
+                process,
+                process.StandardInput,
+                process.StandardOutput,
+                stderrSink ?? TextWriter.Null);
+        }
+        catch
+        {
+            try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { /* swallow */ }
+            try { process.Dispose(); } catch { /* swallow */ }
+            throw;
+        }
     }
 
     public async Task SendAsync(string json, CancellationToken ct)
@@ -119,9 +135,13 @@ public sealed class StdioMcpTransport : IMcpTransport
         }
         catch { /* swallow */ }
 
+        // Signal the stderr pump to exit so it doesn't linger as an orphan task on a child
+        // that closes stdout but holds stderr open.
+        try { _pumpCts.Cancel(); } catch { /* swallow */ }
         try { await _stderrPump.WaitAsync(TimeSpan.FromMilliseconds(200)).ConfigureAwait(false); }
         catch { /* swallow */ }
 
+        _pumpCts.Dispose();
         _process.Dispose();
     }
 }
