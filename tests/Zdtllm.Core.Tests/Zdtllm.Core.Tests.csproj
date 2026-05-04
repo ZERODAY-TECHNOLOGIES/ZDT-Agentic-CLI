@@ -22,6 +22,12 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Zdtllm.Core\Zdtllm.Core.csproj" />
     <ProjectReference Include="..\..\src\Zdtllm.LiteLLM\Zdtllm.LiteLLM.csproj" />
+    <ProjectReference Include="..\..\src\Zdtllm.Mcp\Zdtllm.Mcp.csproj" />
+    <!-- Mock server is an EXE used by integration tests. ReferenceOutputAssembly=false
+         keeps the assembly off the test project's compile path; we only want its bin dir
+         to exist so tests can launch it as a subprocess. -->
+    <ProjectReference Include="..\Zdtllm.MockMcpServer\Zdtllm.MockMcpServer.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

@@ -17,6 +17,7 @@
     <ProjectReference Include="..\Zdtllm.Skills\Zdtllm.Skills.csproj" />
     <ProjectReference Include="..\Zdtllm.Config\Zdtllm.Config.csproj" />
     <ProjectReference Include="..\Zdtllm.LiteLLM\Zdtllm.LiteLLM.csproj" />
+    <ProjectReference Include="..\Zdtllm.Mcp\Zdtllm.Mcp.csproj" />
   </ItemGroup>
 
 </Project>

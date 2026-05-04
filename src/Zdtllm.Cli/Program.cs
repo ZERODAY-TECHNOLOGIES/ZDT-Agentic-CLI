@@ -6,6 +6,7 @@ using Zdtllm.Core.Repl;
 using Zdtllm.Core.Sessions;
 using Zdtllm.Core.Setup;
 using Zdtllm.LiteLLM;
+using Zdtllm.Mcp;
 using Zdtllm.Permissions;
 using Zdtllm.Skills;
 using Zdtllm.Tools;
@@ -100,6 +101,12 @@ internal static class Program
         if (skills.Count > 0)
             registry.Register(new SkillTool(skills));
 
+        // MCP servers — parse every --mcp-config in order (later entries override earlier ones
+        // for the same server name), spawn each as a stdio subprocess, register its tools as
+        // mcp__<server>__<tool>, and keep the manager around so we can DisposeAsync on shutdown.
+        var mcpManager = new McpManager(diagnostics: Console.Error);
+        await BootMcpServersAsync(parsed.McpConfigs, registry, mcpManager).ConfigureAwait(false);
+
         var sessionsDir = Path.Combine(cwd, ".zdtllm", "sessions");
         var recent = RecentTracker.ForUserHome();
 
@@ -148,6 +155,12 @@ internal static class Program
         // linked to this one). Print mode short-circuits to "first Ctrl+C exits".
         using var programCts = new CancellationTokenSource();
 
+        // Ensure MCP server subprocesses are cleaned up no matter how we exit (normal,
+        // exception, Ctrl+C). Wrapping the rest of RunAsync in try/finally is the simplest
+        // way to guarantee disposal across both print and interactive paths.
+        try
+        {
+
         if (parsed.PrintMode)
         {
             Console.CancelKeyPress += (_, e) => { e.Cancel = true; programCts.Cancel(); };
@@ -193,6 +206,60 @@ internal static class Program
         };
 
         return await repl.RunAsync(parsed.Query, programCts.Token).ConfigureAwait(false);
+        }
+        finally
+        {
+            await mcpManager.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Parse every --mcp-config file, merge them in flag order, spawn the servers, and register
+    /// their tools. Errors are reported per-server to stderr but never fatal — a misbehaving
+    /// MCP server should not block the rest of the agent from starting.
+    /// </summary>
+    private static async Task BootMcpServersAsync(
+        IReadOnlyList<string> configPaths,
+        ToolRegistry registry,
+        McpManager manager)
+    {
+        if (configPaths.Count == 0) return;
+
+        var merged = new List<McpServerConfig>();
+        foreach (var path in configPaths)
+        {
+            try
+            {
+                var parsed = McpConfigParser.ParseFile(path);
+                merged = McpConfigParser.Merge(merged, parsed).ToList();
+            }
+            catch (Exception ex)
+            {
+                await Console.Error.WriteLineAsync($"zdt: --mcp-config: {ex.Message}").ConfigureAwait(false);
+            }
+        }
+
+        if (merged.Count == 0) return;
+
+        await manager.StartAndRegisterAsync(
+            merged,
+            registry,
+            handshakeTimeout: TimeSpan.FromSeconds(15),
+            ct: CancellationToken.None).ConfigureAwait(false);
+
+        foreach (var status in manager.Statuses)
+        {
+            if (status.Connected)
+            {
+                Console.Error.WriteLine(
+                    $"zdt: mcp[{status.Name}] connected ({status.ServerInfo}, {status.ToolCount} tool(s))");
+            }
+            else
+            {
+                Console.Error.WriteLine(
+                    $"zdt: mcp[{status.Name}] failed: {status.ErrorMessage}");
+            }
+        }
     }
 
     /// <summary>
@@ -433,6 +500,9 @@ internal static class Program
                 case "--add-dir":
                     result.AddDirs.Add(NextValue(args, ref i, "--add-dir"));
                     break;
+                case "--mcp-config":
+                    result.McpConfigs.Add(NextValue(args, ref i, "--mcp-config"));
+                    break;
                 case "--session-id":
                     result.SessionId = NextValue(args, ref i, "--session-id");
                     break;
@@ -499,6 +569,7 @@ internal static class Program
         Console.WriteLine("  --append-system-prompt <text>  append <text> after the default/replaced prompt");
         Console.WriteLine("  --append-system-prompt-file <p>  append file contents after the default/replaced prompt");
         Console.WriteLine("  --add-dir <path>               add an extra accessible directory (repeatable)");
+        Console.WriteLine("  --mcp-config <path>            load MCP server config from a JSON file (repeatable, last wins per server)");
         Console.WriteLine("  --session-id <uuid>            create or resume a persistent session at this id");
         Console.WriteLine("  -c, --continue                 resume the most recent session for this directory");
         Console.WriteLine("  -r, --resume <uuid>            resume the specified session");
@@ -526,6 +597,7 @@ internal static class Program
         public string? AppendSystemPrompt { get; set; }
         public string? AppendSystemPromptFile { get; set; }
         public List<string> AddDirs { get; } = new();
+        public List<string> McpConfigs { get; } = new();
         public bool ShowVersion { get; set; }
         public bool ShowHelp { get; set; }
         public string? Query { get; set; }
