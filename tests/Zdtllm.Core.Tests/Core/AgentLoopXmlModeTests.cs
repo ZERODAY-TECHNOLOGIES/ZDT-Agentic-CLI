@@ -137,6 +137,49 @@ public sealed class AgentLoopXmlModeTests
     }
 
     [Fact]
+    public async Task Xml_mode_collapses_multiple_tool_results_into_single_user_turn()
+    {
+        // Regression test for the v0.2.x bug where N tool calls in one assistant turn
+        // produced N CONSECUTIVE user messages — Qwen3-Coder's chat template (and vLLM's
+        // OpenAI compat layer) reject that with the misleading error "System message must
+        // be at the beginning". Confirmed live against vLLM running Qwen during a Siembiot
+        // SAST scan: Qwen issued 10 Read calls in a single turn, the next request 400ed.
+        // After the fix all results are framed as a single EXECUTION RESULT-delimited
+        // user turn, preserving strict user/assistant alternation.
+        var round1 =
+            SseTextChunk("Reading both files.\n" +
+                "<function_calls>\n" +
+                "<invoke name=\"Echo\">\n<parameter name=\"text\">first</parameter>\n</invoke>\n" +
+                "<invoke name=\"Echo\">\n<parameter name=\"text\">second</parameter>\n</invoke>\n" +
+                "<invoke name=\"Echo\">\n<parameter name=\"text\">third</parameter>\n</invoke>\n" +
+                "</function_calls>") +
+            SseFinish("stop") + SseDone;
+        var round2 = SseTextChunk("done") + SseFinish("stop") + SseDone;
+
+        var handler = new StubHandler(Sse(round1), Sse(round2));
+        var registry = new ToolRegistry();
+        registry.Register(new EchoTool());
+        var agent = BuildAgent(handler, registry, ToolCallingMode.Xml);
+
+        await agent.RunOneShotAsync("echo three", new StringWriter(), new StringWriter());
+
+        var secondBody = handler.RequestBodies[1];
+
+        // All three results must appear, but inside a SINGLE user message — count the
+        // closing role boundary ("role":"user") instead of the EXECUTION RESULT marker
+        // because we want to assert there's only one synthetic-result message, not three.
+        // Round 2 messages: [system, original-user, assistant, this-one-user] = 2 user
+        // role entries total in the JSON. Anything more = bug back.
+        var userRoleCount = System.Text.RegularExpressions.Regex.Matches(secondBody, "\"role\":\"user\"").Count;
+        userRoleCount.Should().Be(2);
+
+        secondBody.Should().Contain("EXECUTION RESULT of [Echo]");
+        secondBody.Should().Contain("echoed:first");
+        secondBody.Should().Contain("echoed:second");
+        secondBody.Should().Contain("echoed:third");
+    }
+
+    [Fact]
     public async Task Native_mode_still_works_unchanged()
     {
         var round1 =

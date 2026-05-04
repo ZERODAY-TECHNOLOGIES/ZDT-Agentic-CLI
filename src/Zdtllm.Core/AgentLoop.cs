@@ -518,10 +518,22 @@ public sealed class AgentLoop
         var callsArr = calls.ToImmutable();
 
         var results = await DispatchToolCallsAsync(callsArr, ctx, status, ct).ConfigureAwait(false);
+        // Combine every tool result into a SINGLE synthetic user turn. Originally we did one
+        // AddUser per call, but when the model emits N tool calls in one assistant turn the
+        // session ends up with N consecutive user messages — a pattern Qwen3-Coder's chat
+        // template rejects with the misleading vLLM error "System message must be at the
+        // beginning". Strict alternation is the safest assumption for any open-source model
+        // running through OpenAI-compat layers, so we collapse the batch unconditionally.
+        // Native mode doesn't have this issue: tool messages live under their own role and
+        // adjacency is allowed.
+        var sb = new StringBuilder();
         for (var i = 0; i < callsArr.Length; i++)
         {
-            session.AddUser($"EXECUTION RESULT of [{callsArr[i].FunctionName}]:\n{results[i]}");
+            if (sb.Length > 0) sb.AppendLine().AppendLine("---").AppendLine();
+            sb.Append("EXECUTION RESULT of [").Append(callsArr[i].FunctionName).Append("]:\n");
+            sb.Append(results[i]);
         }
+        session.AddUser(sb.ToString());
     }
 
     /// <summary>
