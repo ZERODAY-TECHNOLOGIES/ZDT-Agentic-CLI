@@ -115,10 +115,15 @@ try {
     # SHA256 verification — best-effort, skip with a warning if the release didn't ship checksums.txt.
     try {
         $checksumsRaw = (Invoke-WebRequest -UseBasicParsing -Uri $checksumUrl -ErrorAction Stop).Content
+        # Build the regex by concatenation so PowerShell string interpolation can't mangle the
+        # trailing end-of-line anchor. Earlier we had `\$` inside a "..." string which PowerShell
+        # treated as literal `\$` and the regex matched against a non-existent literal $ in the
+        # checksum lines — silently skipping every release that *did* ship checksums.
+        $pattern = '^([0-9a-f]{64})\s+\*?' + [regex]::Escape($asset) + '$'
         $expected = $null
         foreach ($line in $checksumsRaw -split "`n") {
             $trimmed = $line.Trim()
-            if ($trimmed -match "^([0-9a-f]{64})\s+\*?$([regex]::Escape($asset))\$") {
+            if ($trimmed -match $pattern) {
                 $expected = $matches[1]
                 break
             }
