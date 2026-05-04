@@ -362,6 +362,78 @@ public sealed class AgentLoopObserverIntegrationTests
     }
 
     [Fact]
+    public async Task Reasoning_content_is_excluded_from_assistant_text_and_session_messages()
+    {
+        // DeepSeek-V3.2-style stream: model emits reasoning_content first, then content,
+        // then a tool call (native), then we round 2 = final text. The observer event for
+        // the assistant turn must contain ONLY the content text (not the chain-of-thought),
+        // and the next request body sent to the LLM must NOT echo reasoning back as history.
+        var round1 =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think about this carefully...\"}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" I should call Echo with hi.\"}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"content\":\"calling tool\"}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[" +
+                "{\"index\":0,\"id\":\"c1\",\"type\":\"function\"," +
+                "\"function\":{\"name\":\"Echo\",\"arguments\":\"{\\\"text\\\":\\\"hi\\\"}\"}}]}}]}\n\n" +
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n" +
+            "data: [DONE]\n\n";
+        var round2 =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Got the result. Now to summarise.\"}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"content\":\"all done\"}}]}\n\n" +
+            "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n" +
+            "data: [DONE]\n\n";
+
+        var handler = new StubHandler(Sse(round1), Sse(round2));
+        var http = new HttpClient(handler);
+        var client = new LiteLLMClient(http, new LiteLLMClientOptions
+        {
+            BaseUrl = "http://stub", ApiKey = "k", MaxRetries = 0,
+            InitialBackoff = TimeSpan.FromMilliseconds(1),
+        });
+
+        var registry = new ToolRegistry();
+        registry.Register(new EchoTool());
+
+        var sw = new StringWriter();
+        IAgentObserver observer = new StreamJsonObserver(sw);
+
+        var agent = new AgentLoop(
+            client, registry, PermissionRuleSet.Empty,
+            new AgentLoopOptions { Model = "deepseek-test", MaxTurns = 5 },
+            observer: observer);
+
+        using var session = Session.NewEphemeral("deepseek-test");
+        await agent.RunTurnAsync(session, "go", new StringWriter(), new StringWriter());
+
+        var events = sw.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => JsonDocument.Parse(line).RootElement.Clone())
+            .ToList();
+
+        // Iteration 1: only the visible content is "calling tool", and the tool_use block.
+        var iter1 = events[0].GetProperty("message").GetProperty("content");
+        var iter1Text = iter1.EnumerateArray()
+            .First(c => c.GetProperty("type").GetString() == "text")
+            .GetProperty("text").GetString();
+        iter1Text.Should().Be("calling tool",
+            "reasoning_content must not appear in the assistant text");
+        iter1Text.Should().NotContain("Let me think");
+        iter1Text.Should().NotContain("call Echo");
+
+        // Iteration 2: only "all done", no reasoning leak.
+        var iter2 = events[1].GetProperty("message").GetProperty("content");
+        var iter2Text = iter2.EnumerateArray()
+            .First(c => c.GetProperty("type").GetString() == "text")
+            .GetProperty("text").GetString();
+        iter2Text.Should().Be("all done");
+        iter2Text.Should().NotContain("Got the result");
+
+        // Round 2 request body MUST NOT contain reasoning text (it's ephemeral; sending
+        // it back to the model degrades behavior and burns context).
+        handler.RequestBodies[1].Should().NotContain("Let me think");
+        handler.RequestBodies[1].Should().NotContain("call Echo with hi");
+    }
+
+    [Fact]
     public void Tools_allowlist_drops_non_listed_tools_from_registry()
     {
         var registry = new ToolRegistry();

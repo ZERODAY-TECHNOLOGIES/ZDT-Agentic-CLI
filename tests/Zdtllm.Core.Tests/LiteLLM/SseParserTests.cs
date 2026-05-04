@@ -70,6 +70,46 @@ public sealed class SseParserTests
     }
 
     [Fact]
+    public async Task Yields_reasoning_deltas_separately_from_text_deltas()
+    {
+        // DeepSeek V3.x and other reasoning models stream chain-of-thought via the
+        // `reasoning_content` extension field. A delta can contain reasoning_content,
+        // content, or both; the parser must surface each as its own ChatChunk so the
+        // agent loop can keep reasoning out of session history while still passing
+        // through real assistant text.
+        var sse =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Hmm, let me think...\"}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" the user wants X\"}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"content\":\"final answer\"}}]}\n\n" +
+            "data: [DONE]\n\n";
+
+        var chunks = await ParseAllAsync(sse);
+
+        chunks.OfType<ChatChunk.ReasoningDelta>().Select(c => c.Text)
+            .Should().Equal("Hmm, let me think...", " the user wants X");
+        chunks.OfType<ChatChunk.TextDelta>().Select(c => c.Text)
+            .Should().Equal("final answer");
+    }
+
+    [Fact]
+    public async Task Yields_both_reasoning_and_content_when_a_single_delta_carries_both()
+    {
+        // Some proxies fold reasoning_content and content into the same delta; the
+        // parser must yield both chunks (in any order is fine; we assert by type).
+        var sse =
+            "data: {\"choices\":[{\"delta\":{" +
+                "\"reasoning_content\":\"thinking\",\"content\":\"answer\"}}]}\n\n" +
+            "data: [DONE]\n\n";
+
+        var chunks = await ParseAllAsync(sse);
+
+        chunks.OfType<ChatChunk.ReasoningDelta>().Should().ContainSingle()
+            .Which.Text.Should().Be("thinking");
+        chunks.OfType<ChatChunk.TextDelta>().Should().ContainSingle()
+            .Which.Text.Should().Be("answer");
+    }
+
+    [Fact]
     public async Task Emits_Usage_chunk_when_present()
     {
         var sse =

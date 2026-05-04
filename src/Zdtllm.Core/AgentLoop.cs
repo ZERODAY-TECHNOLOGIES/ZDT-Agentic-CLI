@@ -158,6 +158,10 @@ public sealed class AgentLoop
             var pending = new SortedDictionary<int, ToolCallAccumulator>();
             int? turnPromptTokens = null;
             int? turnCompletionTokens = null;
+            // Char count of reasoning_content seen this turn (DeepSeek V3.x and other
+            // reasoning models). Counted only for verbose telemetry — the actual text
+            // is dropped per spec (reasoning is ephemeral, must not feed back into context).
+            var reasoningCharsThisTurn = 0;
 
             // Live spinner counters: number of characters streamed (for a tokens-approximation
             // since servers don't send incremental usage), and total chunks (debug-style metric).
@@ -214,6 +218,16 @@ public sealed class AgentLoop
                                 await output.WriteAsync(td.Text.AsMemory(), ct).ConfigureAwait(false);
                                 await output.FlushAsync(ct).ConfigureAwait(false);
                             }
+                            UpdateSpinnerThrottled(statusCtx, streamSw, charsStreamed, ref lastSpinnerUpdate);
+                            break;
+
+                        case ChatChunk.ReasoningDelta rd:
+                            // Drop reasoning_content from assistantText, observers, output, and
+                            // session history — it's chain-of-thought, ephemeral by spec. Bump the
+                            // streamed-char counter so the spinner keeps advancing during a long
+                            // think (otherwise reasoning models look frozen for tens of seconds).
+                            reasoningCharsThisTurn += rd.Text.Length;
+                            charsStreamed += rd.Text.Length;
                             UpdateSpinnerThrottled(statusCtx, streamSw, charsStreamed, ref lastSpinnerUpdate);
                             break;
 
@@ -305,6 +319,16 @@ public sealed class AgentLoop
                 ? XmlToolCallParser.Strip(assistantText.ToString()).TrimEnd()
                 : assistantText.ToString();
 
+            // Reasoning telemetry — writes only to the status channel (--verbose path), never
+            // to the model-facing output or session history. Helps debug "model thought 30s
+            // and produced nothing observable" cases on DeepSeek/R1-style models.
+            if (reasoningCharsThisTurn > 0)
+            {
+                await status.WriteLineAsync(
+                    Palette.Mute($"  ↳ reasoning: {reasoningCharsThisTurn} chars (dropped from context)"))
+                    .ConfigureAwait(false);
+            }
+
             // Notify observers about the assistant message that just streamed (text + tool
             // calls + per-turn usage). For stream-json mode this is the per-iteration
             // {"type":"assistant",...} event AppSec-Automator scans for billed-token totals.
@@ -321,6 +345,18 @@ public sealed class AgentLoop
                 var displayText = xmlMode
                     ? XmlToolCallParser.Strip(assistantText.ToString()).TrimEnd()
                     : assistantText.ToString();
+
+                // Reasoning-only completion: model emitted chain-of-thought but no content
+                // and no tool calls. Common with mis-configured DeepSeek-R1 / V3.x deployments
+                // where the proxy forces thinking mode for every turn. Surface this clearly so
+                // users don't think the binary swallowed their answer.
+                if (displayText.Length == 0 && reasoningCharsThisTurn > 0)
+                {
+                    await status.WriteLineAsync(Palette.Mute(
+                        "  ↳ model emitted reasoning_content only — no observable text or tool calls. " +
+                        "Try a non-reasoning variant of this model."))
+                        .ConfigureAwait(false);
+                }
 
                 if (_richConsole is not null && displayText.Length > 0)
                 {

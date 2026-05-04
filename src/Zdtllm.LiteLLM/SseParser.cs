@@ -54,6 +54,9 @@ public static class SseParser
                 if (choice.Delta?.Content is { Length: > 0 } content)
                     yield return new ChatChunk.TextDelta(content);
 
+                if (choice.Delta?.ReasoningContent is { Length: > 0 } reasoning)
+                    yield return new ChatChunk.ReasoningDelta(reasoning);
+
                 if (choice.Delta?.ToolCalls is { Count: > 0 } toolCalls)
                 {
                     foreach (var tc in toolCalls)
@@ -93,6 +96,7 @@ internal sealed class StreamDelta
 {
     public string? Role { get; set; }
     public string? Content { get; set; }
+    public string? ReasoningContent { get; set; }
     public List<StreamToolCall>? ToolCalls { get; set; }
 }
 

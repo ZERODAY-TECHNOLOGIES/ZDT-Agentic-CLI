@@ -54,6 +54,14 @@ public abstract record ChatChunk
 
     public sealed record TextDelta(string Text) : ChatChunk;
 
+    /// <summary>
+    /// Chain-of-thought delta from reasoning models (DeepSeek V3.x, R1-style, etc.) that
+    /// emit <c>delta.reasoning_content</c> alongside or before <c>delta.content</c>. Per
+    /// the OpenAI/DeepSeek spec this stream is ephemeral — consumers must NOT include it
+    /// in tool extraction, observer events, or session history sent back to the model.
+    /// </summary>
+    public sealed record ReasoningDelta(string Text) : ChatChunk;
+
     public sealed record ToolCallDelta(
         int Index,
         string? Id,
