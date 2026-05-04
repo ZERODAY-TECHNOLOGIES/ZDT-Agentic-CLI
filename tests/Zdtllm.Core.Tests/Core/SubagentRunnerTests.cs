@@ -241,6 +241,95 @@ public sealed class SubagentRunnerTests
         body.Should().Contain("focused subagent");
     }
 
+    [Fact]
+    public async Task RunAsync_uses_request_ParentModel_for_the_subagent_HTTP_body()
+    {
+        // The contract: when TaskTool plumbs ctx.Model into request.ParentModel, the runner
+        // must actually use that value as the subagent's model — not the parent AgentLoop's
+        // startup-frozen Options.Model. Without this fix a /model switch in the REPL would
+        // never reach subagents, even though the parent itself picks it up via session.Model.
+        var handler = new StubHandler(Sse(SimpleResponseSse("ok")));
+        var registry = new ToolRegistry();
+        var parent = BuildParentAgent(handler, registry, model: "parent-startup-model");
+        var runner = new SubagentRunner(parent);
+
+        await runner.RunAsync(
+            new SubagentRequest("x", "do x", ParentModel: "qwen-medium-after-slash-model"),
+            CancellationToken.None);
+
+        var body = handler.RequestBodies.Single();
+        body.Should().Contain("\"model\":\"qwen-medium-after-slash-model\"");
+        body.Should().NotContain("parent-startup-model");
+    }
+
+    [Fact]
+    public async Task RunAsync_falls_back_to_parent_Options_Model_when_ParentModel_null()
+    {
+        // Backwards-compat: a SubagentRequest constructed without ParentModel (older tests,
+        // tools building one directly) keeps using the AgentLoop's startup Options.Model.
+        var handler = new StubHandler(Sse(SimpleResponseSse("ok")));
+        var registry = new ToolRegistry();
+        var parent = BuildParentAgent(handler, registry, model: "startup-model");
+        var runner = new SubagentRunner(parent);
+
+        await runner.RunAsync(new SubagentRequest("x", "do x"), CancellationToken.None);
+
+        handler.RequestBodies.Single().Should().Contain("\"model\":\"startup-model\"");
+    }
+
+    [Fact]
+    public async Task RunAsync_uses_empty_string_ParentModel_as_unset_falls_back_to_startup()
+    {
+        // Defensive: an empty string is not a meaningful model id. The runner should treat
+        // it the same as null and fall back to the parent's option, otherwise an upstream
+        // bug or copy-paste of `""` would silently send `"model":""` to LiteLLM (which
+        // returns a confusing 400 several seconds later).
+        var handler = new StubHandler(Sse(SimpleResponseSse("ok")));
+        var registry = new ToolRegistry();
+        var parent = BuildParentAgent(handler, registry, model: "startup-model");
+        var runner = new SubagentRunner(parent);
+
+        await runner.RunAsync(
+            new SubagentRequest("x", "do x", ParentModel: ""),
+            CancellationToken.None);
+
+        handler.RequestBodies.Single().Should().Contain("\"model\":\"startup-model\"");
+    }
+
+    [Fact]
+    public async Task Parallel_subagents_share_the_same_handler_without_deadlocking()
+    {
+        // Pre-3W: AgentLoop's parallel batch path ran multiple TaskTool calls in parallel,
+        // each opening its own AnsiConsole.Status() spinner — Spectre's interactive lock then
+        // threw "Trying to run one or more interactive functions concurrently" and the whole
+        // batch crashed mid-flight. After the fix, TaskTool no longer opens a Status; this
+        // test runs a 4-way parallel dispatch directly on the runner to prove no exclusivity
+        // collision happens regardless of how Spectre is configured. Headless StringWriters
+        // make the console capability pretty much irrelevant, but the regression we're guarding
+        // against is the dispatcher itself, not the renderer.
+        var handler = new StubHandler(
+            Sse(SimpleResponseSse("worker-1")),
+            Sse(SimpleResponseSse("worker-2")),
+            Sse(SimpleResponseSse("worker-3")),
+            Sse(SimpleResponseSse("worker-4")));
+        var registry = new ToolRegistry();
+        var parent = BuildParentAgent(handler, registry, model: "m");
+        var runner = new SubagentRunner(parent);
+
+        var tasks = Enumerable.Range(1, 4)
+            .Select(i => runner.RunAsync(
+                new SubagentRequest($"worker {i}", "do work", ParentModel: "m"),
+                CancellationToken.None))
+            .ToArray();
+
+        var results = await Task.WhenAll(tasks);
+
+        results.Should().HaveCount(4);
+        results.Select(r => r.FinalText).Should().BeEquivalentTo(
+            "worker-1", "worker-2", "worker-3", "worker-4");
+        handler.Requests.Should().HaveCount(4);
+    }
+
     private sealed class FakeSubagentRunner : ISubagentRunner
     {
         public IReadOnlyList<string> AvailableTypes => Array.Empty<string>();

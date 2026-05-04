@@ -123,8 +123,19 @@ public sealed class SubagentRunner : ISubagentRunner
     private async Task<SubagentResult> RunOnceAsync(SubagentRequest request, CancellationToken ct)
     {
         var subRegistry = BuildRegistryForType(request.Type, _parent.Tools);
+        // Resolve which model the subagent runs on. Priority:
+        //   1. request.ParentModel — TaskTool plumbs the parent's CURRENT session model
+        //      (i.e. whatever /model last set), so a mid-conversation model switch reaches
+        //      subagents. This is the path real callers always take.
+        //   2. _parent.Options.Model — the agent's startup-frozen option, used as fallback
+        //      when the request didn't specify (e.g. tests that build a SubagentRequest
+        //      directly without a TaskTool / ToolContext in front).
+        var resolvedModel = !string.IsNullOrEmpty(request.ParentModel)
+            ? request.ParentModel
+            : _parent.Options.Model;
         var subOptions = _parent.Options with
         {
+            Model = resolvedModel,
             SystemPrompt = SystemPromptForType(request.Type),
             MaxTurns = request.MaxTurns,
         };

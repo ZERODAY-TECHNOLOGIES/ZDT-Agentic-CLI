@@ -4,7 +4,15 @@ namespace Zdtllm.Tools;
 
 public sealed record ToolSchema(string Name, string Description, JsonElement Parameters);
 
-public sealed record ToolContext(string Cwd);
+/// <summary>
+/// Per-turn execution context handed to every tool. <see cref="Cwd"/> is the working
+/// directory the agent considers home (the ambient process cwd at turn start). <see
+/// cref="Model"/> is the resolved model id of the session that's currently driving the
+/// turn — populated by AgentLoop from <c>session.Model</c> so a /model switch propagates
+/// to tools that need to know it (notably TaskTool, which uses it as the subagent's model
+/// instead of the parent's stale startup option).
+/// </summary>
+public sealed record ToolContext(string Cwd, string? Model = null);
 
 public sealed record ToolResult(string Content, bool IsError)
 {

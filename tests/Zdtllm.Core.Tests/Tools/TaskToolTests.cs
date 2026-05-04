@@ -121,6 +121,43 @@ public sealed class TaskToolTests
     }
 
     [Fact]
+    public async Task ToolContext_Model_is_forwarded_as_SubagentRequest_ParentModel()
+    {
+        // /model in the REPL mutates session.Model, AgentLoop populates ctx.Model from
+        // session.Model on each turn, and TaskTool must thread ctx.Model into the
+        // SubagentRequest so the runner uses the CURRENT model — not the parent
+        // AgentLoop's startup-frozen one. This test pins that wiring.
+        var runner = new RecordingRunner(new SubagentResult("ok", 1, null, null));
+        var tool = new TaskTool(runner);
+
+        using var doc = JsonDocument.Parse("""{"description":"d","prompt":"p"}""");
+        await tool.ExecuteAsync(
+            doc.RootElement,
+            new ToolContext(Cwd: Path.GetTempPath(), Model: "qwen-medium"),
+            CancellationToken.None);
+
+        runner.LastRequest!.ParentModel.Should().Be("qwen-medium");
+    }
+
+    [Fact]
+    public async Task Null_ToolContext_Model_yields_null_ParentModel_letting_runner_fall_back()
+    {
+        // Backwards-compat path: a caller that doesn't set ctx.Model (older test fixtures,
+        // tools constructing ToolContext without piping a session in) shouldn't fabricate
+        // a model name — the runner should observe null and fall back to its own option.
+        var runner = new RecordingRunner(new SubagentResult("ok", 1, null, null));
+        var tool = new TaskTool(runner);
+
+        using var doc = JsonDocument.Parse("""{"description":"d","prompt":"p"}""");
+        await tool.ExecuteAsync(
+            doc.RootElement,
+            new ToolContext(Cwd: Path.GetTempPath()), // Model defaults to null
+            CancellationToken.None);
+
+        runner.LastRequest!.ParentModel.Should().BeNull();
+    }
+
+    [Fact]
     public void Specifier_for_permissions_is_the_subagent_type()
     {
         var tool = new TaskTool(new RecordingRunner(new SubagentResult("x", 0, null, null)));

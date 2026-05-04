@@ -1,6 +1,5 @@
 using System.Text;
 using System.Text.Json;
-using Spectre.Console;
 
 namespace Zdtllm.Tools;
 
@@ -69,19 +68,37 @@ public sealed class TaskTool : ITool
         var maxTurns = ReadInt(args, "max_turns", 25);
 
         if (string.IsNullOrWhiteSpace(description))
-            return ToolResult.Error("Task: missing 'description' parameter.");
+            return ToolResult.Error("Agent: missing 'description' parameter.");
         if (string.IsNullOrWhiteSpace(prompt))
-            return ToolResult.Error("Task: missing 'prompt' parameter.");
+            return ToolResult.Error("Agent: missing 'prompt' parameter.");
         if (!_runner.SupportsType(type))
         {
             return ToolResult.Error(
-                $"Task: unknown subagent_type '{type}'. Available: {string.Join(", ", _runner.AvailableTypes)}.");
+                $"Agent: unknown subagent_type '{type}'. Available: {string.Join(", ", _runner.AvailableTypes)}.");
         }
 
         try
         {
-            var request = new SubagentRequest(description!, prompt!, type, maxTurns);
-            var result = await RunWithSpinnerAsync(request, ct).ConfigureAwait(false);
+            // Forward the parent session's CURRENT model so a /model switch in the REPL
+            // reaches the subagent. ParentModel is null when the caller didn't set ctx.Model
+            // (e.g. unit tests building a ToolContext directly) — runner falls back to its
+            // own AgentLoop options in that case.
+            var request = new SubagentRequest(
+                Description: description!,
+                Prompt: prompt!,
+                Type: type,
+                MaxTurns: maxTurns,
+                ParentModel: ctx.Model);
+
+            // Deliberately NOT wrapping the call in AnsiConsole.Status(): when several Agent
+            // tool calls dispatch in parallel (the parent's parallel-batch path), each parallel
+            // RunWithSpinnerAsync would race on Spectre's single AnsiConsole exclusivity lock
+            // and throw "Trying to run one or more interactive functions concurrently". The
+            // parent agent already prints a "[Agent] {description}" status line per call before
+            // dispatch (see AgentLoop.FormatStatusLine), and for sequential single calls the
+            // parent's ExecuteToolWithSpinnerAsync wraps execution in its own Status() — so we
+            // already have the visual feedback without the nested-Status conflict.
+            var result = await _runner.RunAsync(request, ct).ConfigureAwait(false);
 
             var sb = new StringBuilder();
             sb.Append("[subagent ").Append(type)
@@ -96,27 +113,8 @@ public sealed class TaskTool : ITool
         }
         catch (Exception ex)
         {
-            return ToolResult.Error($"Task: subagent failed: {ex.Message}");
+            return ToolResult.Error($"Agent: subagent failed: {ex.Message}");
         }
-    }
-
-    /// <summary>
-    /// On a real terminal, wrap the subagent call in a Spectre Status spinner so the
-    /// user sees that something is happening (subagents can take 10-60s). Spectre
-    /// auto-falls-back to plain output when stdout isn't a TTY (CI, piped invocations,
-    /// most unit tests), so this never breaks scripted use.
-    /// </summary>
-    private async Task<SubagentResult> RunWithSpinnerAsync(SubagentRequest request, CancellationToken ct)
-    {
-        if (!AnsiConsole.Console.Profile.Capabilities.Interactive)
-            return await _runner.RunAsync(request, ct).ConfigureAwait(false);
-
-        var label = $"[#1BEACD]subagent ▸ {request.Type}[/] [#687B89]({Markup.Escape(request.Description)})[/]";
-        return await AnsiConsole.Status()
-            .Spinner(Spinner.Known.Dots)
-            .SpinnerStyle(new Style(new Color(0x1B, 0xEA, 0xCD)))
-            .StartAsync(label, async _ => await _runner.RunAsync(request, ct).ConfigureAwait(false))
-            .ConfigureAwait(false);
     }
 
     private static string? ReadString(JsonElement args, string name) =>

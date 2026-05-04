@@ -138,7 +138,11 @@ public sealed class AgentLoop
             toolDefList = defs.Count > 0 ? defs : null;
         }
 
-        var ctx = new ToolContext(Cwd: Directory.GetCurrentDirectory());
+        // Model on ToolContext intentionally tracks session.Model (which /model mutates), not
+        // _options.Model (frozen at startup). Tools that fan out further work — TaskTool
+        // dispatching a subagent in particular — need the CURRENT model so a mid-conversation
+        // /model switch reaches downstream agents instead of stranding them on the original.
+        var ctx = new ToolContext(Cwd: Directory.GetCurrentDirectory(), Model: session.Model);
         int? lastPromptTokens = null;
         int? lastCompletionTokens = null;
         // Running totals across all iterations of THIS turn — fed to OnResultAsync so the

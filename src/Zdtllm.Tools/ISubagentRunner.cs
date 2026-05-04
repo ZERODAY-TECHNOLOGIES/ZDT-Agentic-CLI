@@ -27,7 +27,15 @@ public sealed record SubagentRequest(
     string Description,
     string Prompt,
     string Type = "general-purpose",
-    int MaxTurns = 25);
+    int MaxTurns = 25,
+    /// <summary>
+    /// Resolved model id for the subagent — usually the parent session's CURRENT model
+    /// (after any /model switch), forwarded by TaskTool from <see cref="ToolContext.Model"/>.
+    /// When null, the runner falls back to the parent AgentLoop's startup options. Threading
+    /// it through the request rather than reading parent.Options statically lets a /model
+    /// change in the REPL take effect for the next subagent dispatch, not just the parent.
+    /// </summary>
+    string? ParentModel = null);
 
 public sealed record SubagentResult(
     string FinalText,
