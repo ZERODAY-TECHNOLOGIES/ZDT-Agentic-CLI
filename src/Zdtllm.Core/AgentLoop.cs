@@ -291,9 +291,17 @@ public sealed class AgentLoop
                 totalOutputTokens += c;
             }
 
+            // GLM-5 (and likely other Ollama-Cloud models trained with looser tool-use data)
+            // sometimes emit "parallel" calls by concatenating N JSON arg objects into a single
+            // tool_call entry: {"x":1}{"y":2}{"z":3}. The downstream tool would reject the
+            // string as malformed JSON, and LiteLLM rejects the next request when we echo it
+            // back as history. SplitConcatenatedArgs detects this exact pattern (parse fails
+            // with "Extra data") and rewrites one ToolCall into N — single-object args
+            // bypass the path entirely so non-buggy models are unaffected.
             var nativeCalls = pending.Values
                 .Where(v => v.Id is not null && v.FunctionName is not null)
                 .Select(v => new ToolCall(v.Id!, v.FunctionName!, v.Arguments.ToString()))
+                .SelectMany(c => SplitConcatenatedArgs(c, status))
                 .ToImmutableArray();
 
             IReadOnlyList<ParsedXmlToolCall> xmlCalls = nativeCalls.Length == 0 && xmlMode
@@ -895,5 +903,90 @@ public sealed class AgentLoop
         public string? Id { get; set; }
         public string? FunctionName { get; set; }
         public StringBuilder Arguments { get; } = new();
+    }
+
+    /// <summary>
+    /// If <paramref name="call"/>'s arguments parse as a single JSON value, returns a
+    /// 1-element list with the original — the common case, bit-for-bit unchanged. If the
+    /// args fail to parse AND can be sliced into 2+ independent valid JSON objects (the
+    /// GLM-5 parallel-tool-calls bug: <c>{"x":1}{"y":2}{"z":3}</c>), returns N ToolCalls
+    /// with the same function name and one slice each. Any other failure mode — truly
+    /// malformed args, single object that doesn't parse, mixed-validity slices — returns
+    /// the original untouched, so the downstream tool surfaces its own clear error.
+    /// </summary>
+    internal static IReadOnlyList<ToolCall> SplitConcatenatedArgs(ToolCall call, TextWriter? status = null)
+    {
+        if (string.IsNullOrWhiteSpace(call.Arguments))
+            return [call];
+
+        // Quick path: a single valid JSON value parses cleanly. Covers every well-behaved
+        // model + the edge case where args legitimately contain `}{` inside a JSON string.
+        if (IsValidJson(call.Arguments))
+            return [call];
+
+        // Try slicing into top-level {...} blocks. We commit to a split only if (a) we get
+        // ≥2 slices and (b) every slice independently parses as JSON — otherwise we can't
+        // trust the boundaries we drew, and pass through is safer than synthetic sub-calls.
+        var parts = SliceTopLevelObjects(call.Arguments);
+        if (parts.Count <= 1)
+            return [call];
+
+        foreach (var p in parts)
+            if (!IsValidJson(p))
+                return [call];
+
+        status?.WriteLine(
+            $"  ↳ {call.FunctionName}: detected {parts.Count} concatenated arg objects, splitting into separate calls");
+
+        var split = new ToolCall[parts.Count];
+        for (var i = 0; i < parts.Count; i++)
+            split[i] = new ToolCall($"{call.Id}_s{i}", call.FunctionName, parts[i]);
+        return split;
+    }
+
+    private static bool IsValidJson(string text)
+    {
+        try
+        {
+            using var _ = JsonDocument.Parse(text);
+            return true;
+        }
+        catch (JsonException) { return false; }
+    }
+
+    private static List<string> SliceTopLevelObjects(string args)
+    {
+        var parts = new List<string>();
+        var depth = 0;
+        var start = -1;
+        var inString = false;
+        var escaped = false;
+        for (var i = 0; i < args.Length; i++)
+        {
+            var c = args[i];
+            if (inString)
+            {
+                if (escaped) { escaped = false; continue; }
+                if (c == '\\') { escaped = true; continue; }
+                if (c == '"') inString = false;
+                continue;
+            }
+            if (c == '"') { inString = true; continue; }
+            if (c == '{')
+            {
+                if (depth == 0) start = i;
+                depth++;
+            }
+            else if (c == '}')
+            {
+                depth--;
+                if (depth == 0 && start >= 0)
+                {
+                    parts.Add(args.Substring(start, i - start + 1));
+                    start = -1;
+                }
+            }
+        }
+        return parts;
     }
 }
