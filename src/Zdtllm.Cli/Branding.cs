@@ -1,4 +1,6 @@
+using System.Text;
 using Spectre.Console;
+using Spectre.Console.Rendering;
 using Zdtllm.Core;
 
 namespace Zdtllm.Cli;
@@ -36,11 +38,7 @@ internal static class Branding
         ToolCallingMode mode,
         string sessionDisplay)
     {
-        var zer0 = new FigletText("zer0").LeftJustified().Color(BrandCyan);
-        var day = new FigletText("day").LeftJustified().Color(BrandGold);
-
-        var grid = new Grid().AddColumn().AddColumn();
-        grid.AddRow(zer0, day);
+        var wordmark = BuildSplitWordmark();
 
         var subtitle = new Markup(
             $"[bold {Hex(BrandCyan)}]zdtllmcli[/] " +
@@ -54,7 +52,7 @@ internal static class Branding
 
         var url = new Markup($"[link={Url} {Hex(BrandCyan)}]{Url}[/]");
 
-        var stack = new Rows(grid, new Markup(string.Empty), subtitle, meta, url);
+        var stack = new Rows(wordmark, new Markup(string.Empty), subtitle, meta, url);
 
         var panel = new Panel(stack)
             .Border(BoxBorder.Rounded)
@@ -87,4 +85,74 @@ internal static class Branding
 
     public static string Hex(Color color) =>
         $"#{color.R:X2}{color.G:X2}{color.B:X2}";
+
+    /// <summary>
+    /// Render "zer0day" as a single tight figlet block whose middle "0" glyph is
+    /// vertically halved — the left half painted cyan, the right half gold —
+    /// matching the live zer0day.ro logo's gradient pivot. We render once with
+    /// no colour to grab the raw glyph rows, then re-emit each row as Spectre
+    /// markup, splitting at the column that sits in the middle of the "0".
+    /// </summary>
+    private static IRenderable BuildSplitWordmark()
+    {
+        var rows = CaptureFigletRows("zer0day");
+        var splitColumn = (FigletWidth("zer") + FigletWidth("zer0")) / 2;
+
+        var sb = new StringBuilder();
+        for (var i = 0; i < rows.Count; i++)
+        {
+            var row = rows[i];
+            var leftLen = Math.Min(splitColumn, row.Length);
+            var left = row[..leftLen];
+            var right = row.Length > leftLen ? row[leftLen..] : string.Empty;
+
+            sb.Append($"[{Hex(BrandCyan)}]");
+            sb.Append(Markup.Escape(left));
+            sb.Append("[/]");
+            if (right.Length > 0)
+            {
+                sb.Append($"[{Hex(BrandGold)}]");
+                sb.Append(Markup.Escape(right.TrimEnd()));
+                sb.Append("[/]");
+            }
+            if (i < rows.Count - 1) sb.Append('\n');
+        }
+        return new Markup(sb.ToString());
+    }
+
+    /// <summary>
+    /// Capture the colourless figlet output for <paramref name="text"/> and
+    /// return the rows. Trailing all-whitespace rows are dropped, but rows that
+    /// are visually blank yet sit between glyph rows are kept (some characters
+    /// have empty leading rows in the standard font, and removing them would
+    /// misalign the wordmark).
+    /// </summary>
+    private static IReadOnlyList<string> CaptureFigletRows(string text)
+    {
+        var sw = new StringWriter();
+        var capture = AnsiConsole.Create(new AnsiConsoleSettings
+        {
+            Ansi = AnsiSupport.No,
+            ColorSystem = ColorSystemSupport.NoColors,
+            Out = new AnsiConsoleOutput(sw),
+            Interactive = InteractionSupport.No,
+        });
+        capture.Profile.Width = 500;
+        capture.Write(new FigletText(text).LeftJustified());
+
+        var rawRows = sw.ToString().Split('\n')
+            .Select(r => r.TrimEnd('\r'))
+            .ToList();
+
+        // Drop trailing all-empty rows but keep mid-glyph blank rows.
+        var lastNonEmpty = rawRows.FindLastIndex(r => r.TrimEnd().Length > 0);
+        if (lastNonEmpty < 0) return Array.Empty<string>();
+        return rawRows.Take(lastNonEmpty + 1).ToList();
+    }
+
+    private static int FigletWidth(string text)
+    {
+        var rows = CaptureFigletRows(text);
+        return rows.Count == 0 ? 0 : rows.Max(r => r.TrimEnd().Length);
+    }
 }
