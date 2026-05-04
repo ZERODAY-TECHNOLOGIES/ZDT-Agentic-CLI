@@ -114,7 +114,16 @@ try {
 
     # SHA256 verification — best-effort, skip with a warning if the release didn't ship checksums.txt.
     try {
-        $checksumsRaw = (Invoke-WebRequest -UseBasicParsing -Uri $checksumUrl -ErrorAction Stop).Content
+        # Invoke-WebRequest -UseBasicParsing returns .Content as either a string OR a byte[]
+        # depending on PS version + content-type sniffing. If it comes back as bytes,
+        # `-split "`n"` would iterate ONE BYTE PER ENTRY (giving us "54", "51", "98", ...)
+        # instead of one line per entry, and no pattern would ever match. Force UTF-8 decode.
+        $response = Invoke-WebRequest -UseBasicParsing -Uri $checksumUrl -ErrorAction Stop
+        $content = $response.Content
+        if ($content -is [byte[]]) {
+            $content = [System.Text.Encoding]::UTF8.GetString($content)
+        }
+        $checksumsRaw = $content
         # Build the regex by concatenation so PowerShell string interpolation can't mangle the
         # trailing end-of-line anchor. Earlier we had `\$` inside a "..." string which PowerShell
         # treated as literal `\$` and the regex matched against a non-existent literal $ in the
