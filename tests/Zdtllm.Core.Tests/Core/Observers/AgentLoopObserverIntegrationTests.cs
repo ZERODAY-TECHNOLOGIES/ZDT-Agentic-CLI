@@ -276,6 +276,92 @@ public sealed class AgentLoopObserverIntegrationTests
     }
 
     [Fact]
+    public async Task Stream_json_xml_mode_surfaces_tool_use_blocks_and_strips_function_calls_from_text()
+    {
+        // XML-mode regression: when the model emits <function_calls> in plain text, AgentLoop
+        // extracts the calls and runs them — but the stream-json observer must ALSO see them as
+        // structured tool_use blocks, not as raw XML in content[].text. Discovered via a Siembiot
+        // SAST run where 60/60 assistant events came through with content=[{type:"text",...}]
+        // only — AppSec-Automator parses Anthropic's tool_use blocks, so it would have seen
+        // zero tool calls despite tools running fine.
+        var round1 =
+            "data: " + JsonSerializer.Serialize(new
+            {
+                choices = new[] { new { delta = new { content =
+                    "I'll echo it.\n<function_calls>\n<invoke name=\"Echo\">\n" +
+                    "<parameter name=\"text\">hello</parameter>\n</invoke>\n</function_calls>" } } },
+            }) + "\n\n" +
+            "data: " + JsonSerializer.Serialize(new
+            {
+                choices = new[] { new { finish_reason = "stop" } },
+            }) + "\n\n" +
+            "data: [DONE]\n\n";
+        var round2 =
+            "data: " + JsonSerializer.Serialize(new
+            {
+                choices = new[] { new { delta = new { content = "all done" } } },
+            }) + "\n\n" +
+            "data: " + JsonSerializer.Serialize(new
+            {
+                choices = new[] { new { finish_reason = "stop" } },
+            }) + "\n\n" +
+            "data: [DONE]\n\n";
+
+        var handler = new StubHandler(Sse(round1), Sse(round2));
+        var http = new HttpClient(handler);
+        var client = new LiteLLMClient(http, new LiteLLMClientOptions
+        {
+            BaseUrl = "http://stub", ApiKey = "k", MaxRetries = 0,
+            InitialBackoff = TimeSpan.FromMilliseconds(1),
+        });
+
+        var registry = new ToolRegistry();
+        registry.Register(new EchoTool());
+
+        var sw = new StringWriter();
+        IAgentObserver observer = new StreamJsonObserver(sw);
+
+        var agent = new AgentLoop(
+            client, registry, PermissionRuleSet.Empty,
+            new AgentLoopOptions
+            {
+                Model = "qwen-test",
+                MaxTurns = 5,
+                ToolCallingMode = ToolCallingMode.Xml,
+            },
+            observer: observer);
+
+        using var session = Session.NewEphemeral("qwen-test", ToolCallingMode.Xml);
+        await agent.RunTurnAsync(session, "go", new StringWriter(), new StringWriter());
+
+        var events = sw.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => JsonDocument.Parse(line).RootElement.Clone())
+            .ToList();
+
+        events.Select(e => e.GetProperty("type").GetString()).Should().Equal(
+            "assistant", "assistant", "result");
+
+        // Iteration 1 must contain a tool_use block (NOT just a text block with raw XML).
+        var iter1Content = events[0].GetProperty("message").GetProperty("content");
+        var blocks = iter1Content.EnumerateArray().ToList();
+        var toolUse = blocks.FirstOrDefault(c => c.GetProperty("type").GetString() == "tool_use");
+        toolUse.ValueKind.Should().NotBe(JsonValueKind.Undefined,
+            "XML-extracted call must be surfaced as a tool_use block");
+        toolUse.GetProperty("name").GetString().Should().Be("Echo");
+        toolUse.GetProperty("id").GetString().Should().Be("xml_1_0");
+        toolUse.GetProperty("input").GetProperty("text").GetString().Should().Be("hello");
+
+        // The text block (if any) MUST NOT contain <function_calls> — that markup is now
+        // represented structurally; emitting it raw in text duplicates the payload.
+        foreach (var b in blocks.Where(b => b.GetProperty("type").GetString() == "text"))
+            b.GetProperty("text").GetString().Should().NotContain("function_calls");
+
+        // Iteration 2: final text only.
+        var iter2Content = events[1].GetProperty("message").GetProperty("content");
+        iter2Content[0].GetProperty("text").GetString().Should().Be("all done");
+    }
+
+    [Fact]
     public void Tools_allowlist_drops_non_listed_tools_from_registry()
     {
         var registry = new ToolRegistry();

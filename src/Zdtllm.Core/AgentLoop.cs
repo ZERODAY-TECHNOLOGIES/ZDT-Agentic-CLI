@@ -286,12 +286,31 @@ public sealed class AgentLoop
                 ? XmlToolCallParser.ExtractCalls(assistantText.ToString())
                 : [];
 
+            // Surface XML-extracted calls as ToolCall items in the assistant event so
+            // stream-json consumers (AppSec-Automator) get the same {type:"tool_use",...}
+            // blocks they would for native mode. The id format must match what
+            // ExecuteXmlRoundAsync uses below so any later tool_result correlates.
+            var observableCalls = nativeCalls.Length > 0
+                ? nativeCalls
+                : xmlCalls.Count > 0
+                    ? xmlCalls
+                        .Select((c, i) => new ToolCall($"xml_{turn}_{i}", c.FunctionName, c.ArgumentsJson))
+                        .ToImmutableArray()
+                    : ImmutableArray<ToolCall>.Empty;
+
+            // For XML mode, strip the raw <function_calls> markup out of the text we hand to
+            // observers — the data is already represented by tool_use blocks, and emitting the
+            // unparsed XML alongside duplicates the payload and confuses Anthropic-shaped consumers.
+            var observableText = xmlMode
+                ? XmlToolCallParser.Strip(assistantText.ToString()).TrimEnd()
+                : assistantText.ToString();
+
             // Notify observers about the assistant message that just streamed (text + tool
             // calls + per-turn usage). For stream-json mode this is the per-iteration
             // {"type":"assistant",...} event AppSec-Automator scans for billed-token totals.
             await SafeNotifyAsync(_observer?.OnAssistantTurnAsync(
-                assistantText.ToString(),
-                nativeCalls,
+                observableText,
+                observableCalls,
                 session.Model,
                 turnPromptTokens,
                 turnCompletionTokens,
