@@ -509,7 +509,13 @@ internal static class Program
                 window = apiWindow;
         }
 
-        if (window is null) return null;
+        // Default to 200k when neither settings nor /model/info provide a value. Reasoning:
+        // most modern frontier-class models ship with 128k+ contexts (Claude/GPT-4/Qwen3/etc),
+        // so 200k is a safe upper bound that keeps ContextManager active by default. Users with
+        // smaller-window deployments (e.g. vLLM with --max-model-len 16384) MUST set
+        // litellm.contextWindows.<alias> in settings.json — otherwise auto-compact won't fire
+        // before LiteLLM rejects the request with a 400.
+        window ??= 200_000;
 
         var mediumName = settings.LiteLLM.Models.TryGetValue("medium", out var m) && !string.IsNullOrEmpty(m)
             ? m

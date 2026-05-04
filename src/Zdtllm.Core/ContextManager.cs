@@ -45,6 +45,22 @@ public sealed class ContextManager
     public bool IsBeyondHardThreshold => UsageFraction >= HardThreshold;
 
     /// <summary>
+    /// Forward-looking variant of <see cref="IsBeyondHardThreshold"/>. Estimates the size of the
+    /// CURRENT session (including any tool results just appended) and reports whether the NEXT
+    /// iteration's prompt would blow the hard threshold. Needed because per-turn usage chunks
+    /// only count up through the assistant message — tool results land afterwards and the next
+    /// iteration sends them all back. Without this check, a turn that read two large files and
+    /// crossed 90% would not auto-compact and the next request would hit the LiteLLM 400.
+    /// </summary>
+    public bool IsProjectedBeyondHardThreshold(Session session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        var totalTokens = 0;
+        foreach (var (_, t) in EstimateTokensByRole(session)) totalTokens += t;
+        return totalTokens >= ContextWindow * HardThreshold;
+    }
+
+    /// <summary>
     /// Approximate per-role token usage for the current session, estimated at
     /// 4 chars / token. Used by /context for the breakdown view; the totals
     /// across roles will not match LastPromptTokens exactly because the API's

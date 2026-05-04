@@ -315,12 +315,18 @@ public sealed class AgentLoop
                     .ConfigureAwait(false);
             }
 
-            // Mid-turn auto-compact: if the just-finished iteration pushed us past
-            // the hard threshold, summarise older history before the next iteration
-            // sends an even bigger context. This is the only path that fires inside
-            // a subagent (subagents have their own ContextManager and never hit the
-            // pre-prompt path that the parent's REPL might run).
-            if (_context is not null && _context.IsBeyondHardThreshold)
+            // Mid-turn auto-compact: if the just-finished iteration OR the just-appended tool
+            // results pushed us past the hard threshold, summarise older history before the next
+            // iteration sends an even bigger context.
+            //   - IsBeyondHardThreshold uses the LAST prompt_tokens from the server (only counts
+            //     through the assistant message);
+            //   - IsProjectedBeyondHardThreshold estimates the CURRENT session size including
+            //     tool results we just appended — catches the "Read 2 huge files → next prompt
+            //     blows the limit" case that the per-turn counter alone misses.
+            // This is the only path that fires inside a subagent (subagents have their own
+            // ContextManager and never hit the pre-prompt path that the parent's REPL might run).
+            if (_context is not null
+                && (_context.IsBeyondHardThreshold || _context.IsProjectedBeyondHardThreshold(session)))
             {
                 await status.WriteLineAsync(
                     Palette.Red($"[auto-compact at {_context.UsagePercent}%]") + " " +

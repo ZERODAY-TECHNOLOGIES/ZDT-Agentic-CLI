@@ -87,6 +87,44 @@ public sealed class ContextManagerTests : IDisposable
     }
 
     [Fact]
+    public void Projected_threshold_catches_tool_results_added_after_last_usage_chunk()
+    {
+        // The scenario the AgentLoop's auto-compact has to defend against: a turn read several
+        // big files, the server reported moderate prompt_tokens for the iteration that produced
+        // the tool calls, but the tool results just appended push the NEXT prompt over budget.
+        // RegisterTurn-based IsBeyondHardThreshold says "fine" (we're under 90% based on last
+        // server count), but the projected check on the session size says "compact now".
+        var ctx = new ContextManager(contextWindow: 1_000, mediumModel: "med");
+
+        // Pretend the last server roundtrip saw 500 prompt tokens — under the 0.9 threshold.
+        ctx.RegisterTurn(500, 50);
+        ctx.IsBeyondHardThreshold.Should().BeFalse();
+
+        // Build a session whose total estimated content is ~1100 tokens (well over 0.9 × 1000).
+        // With chars/4 token estimation, we need ~4400 chars across messages.
+        using var session = Session.NewEphemeral("test");
+        session.AddSystem(new string('s', 200));                          // ~50 tok
+        session.AddUser(new string('q', 200));                            // ~50 tok
+        session.AddAssistant("ok", ImmutableArray<ToolCall>.Empty);        // ~1 tok
+        session.AddTool("call-1", new string('x', 4_000));                // ~1000 tok — the big file we just read
+
+        ctx.IsProjectedBeyondHardThreshold(session).Should().BeTrue(
+            "tool results just landed in the session, so the next iteration's prompt would blow the window");
+    }
+
+    [Fact]
+    public void Projected_threshold_says_false_when_session_is_well_under_budget()
+    {
+        var ctx = new ContextManager(contextWindow: 10_000, mediumModel: "med");
+        using var session = Session.NewEphemeral("test");
+        session.AddSystem("sys");
+        session.AddUser("hello");
+        session.AddAssistant("hi", ImmutableArray<ToolCall>.Empty);
+
+        ctx.IsProjectedBeyondHardThreshold(session).Should().BeFalse();
+    }
+
+    [Fact]
     public void Slice_returns_empty_body_when_fewer_than_5_user_turns()
     {
         // 4 user turns: nothing eligible to compact yet.
