@@ -163,6 +163,28 @@ public sealed class AgentLoop
                 // the gap to first chunk can be 30s+, and a frozen label looks broken.
                 statusCtx?.Status(BuildSpinnerLabel(streamSw.Elapsed, charsStreamed));
 
+                // Periodic ticker: advance the elapsed counter every ~500ms even when no chunks
+                // arrive. Without this, a slow / hung backend leaves the spinner frozen at "0s ·
+                // ↓ 0 tokens" so the user can't tell if zdt is broken or just waiting. With it,
+                // they see "5s · 12s · 30s · ..." and can decide when to Ctrl+C.
+                using var tickerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                var tickerTask = statusCtx is null
+                    ? Task.CompletedTask
+                    : Task.Run(async () =>
+                    {
+                        try
+                        {
+                            while (!tickerCts.Token.IsCancellationRequested)
+                            {
+                                await Task.Delay(500, tickerCts.Token).ConfigureAwait(false);
+                                statusCtx.Status(BuildSpinnerLabel(streamSw.Elapsed, charsStreamed));
+                            }
+                        }
+                        catch (OperationCanceledException) { /* normal shutdown */ }
+                    }, tickerCts.Token);
+
+                try
+                {
                 await foreach (var chunk in _client.StreamChatAsync(session.Messages, toolDefList, session.Model, ct).ConfigureAwait(false))
                 {
                     switch (chunk)
@@ -208,6 +230,16 @@ public sealed class AgentLoop
                         case ChatChunk.Done:
                             break;
                     }
+                }
+                }
+                finally
+                {
+                    // Always stop the ticker — without this, a thrown exception inside the await
+                    // foreach would leak the background task. Wait briefly for it to observe the
+                    // cancellation; swallow on timeout (the task is harmless if it lingers).
+                    tickerCts.Cancel();
+                    try { await tickerTask.WaitAsync(TimeSpan.FromMilliseconds(200)).ConfigureAwait(false); }
+                    catch { /* swallow */ }
                 }
             }
 
