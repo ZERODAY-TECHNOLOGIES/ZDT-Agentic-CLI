@@ -48,6 +48,7 @@ public sealed class AgentLoop
     private readonly AgentLoopOptions _options;
     private readonly ContextManager? _context;
     private readonly IAnsiConsole? _richConsole;
+    private readonly IAgentObserver? _observer;
 
     public AgentLoop(
         LiteLLMClient client,
@@ -55,7 +56,8 @@ public sealed class AgentLoop
         PermissionRuleSet perms,
         AgentLoopOptions options,
         ContextManager? context = null,
-        IAnsiConsole? richConsole = null)
+        IAnsiConsole? richConsole = null,
+        IAgentObserver? observer = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(tools);
@@ -67,6 +69,7 @@ public sealed class AgentLoop
         _options = options;
         _context = context;
         _richConsole = richConsole;
+        _observer = observer;
     }
 
     public PermissionRuleSet Permissions => _perms;
@@ -75,6 +78,7 @@ public sealed class AgentLoop
     public ContextManager? Context => _context;
     public AgentLoopOptions Options => _options;
     public IAnsiConsole? RichConsole => _richConsole;
+    public IAgentObserver? Observer => _observer;
 
     /// <summary>
     /// Backwards-compatible one-shot entry point: spins up an ephemeral
@@ -153,6 +157,10 @@ public sealed class AgentLoop
                     {
                         case ChatChunk.TextDelta td:
                             assistantText.Append(td.Text);
+                            // Observer always sees raw deltas — that's what stream-json wants. The
+                            // text writer / rich console split below is purely for the human-facing
+                            // terminal, which the observer pipeline doesn't go through.
+                            await SafeNotifyAsync(_observer?.OnTextDeltaAsync(td.Text, ct)).ConfigureAwait(false);
                             // Rich console suppresses per-delta writes — markdown gets rendered as one block
                             // once the stream completes (or just before tool dispatch). Keeps terminal clean
                             // while the thinking spinner runs.
@@ -237,6 +245,8 @@ public sealed class AgentLoop
                     content: displayText.Length > 0 ? displayText : null,
                     toolCalls: ImmutableArray<ToolCall>.Empty);
 
+                await SafeNotifyAsync(_observer?.OnFinalAsync(
+                    displayText, turn, lastPromptTokens, lastCompletionTokens, ct)).ConfigureAwait(false);
                 return new AgentResult(displayText, turn, lastPromptTokens, lastCompletionTokens);
             }
 
@@ -377,11 +387,13 @@ public sealed class AgentLoop
 
         // For parallel batches we always print the per-call status lines up-front (so the user
         // sees what is firing concurrently). For sequential single-tool dispatch with a rich
-        // console, we suppress the static line and use a Status spinner instead.
+        // console, we suppress the static line and use a Status spinner instead. When an
+        // observer is wired in (--verbose, --output-format) it owns the user-facing trace, so
+        // we suppress the legacy status print to avoid duplicate lines.
         var useSpinnerPerCall = _richConsole is not null
             && (!allParallelisable || calls.Length == 1);
 
-        if (!useSpinnerPerCall)
+        if (!useSpinnerPerCall && _observer is null)
         {
             foreach (var call in calls)
             {
@@ -463,9 +475,20 @@ public sealed class AgentLoop
 
     private async Task<string> ExecuteToolAsync(ToolCall call, ToolContext ctx, CancellationToken ct)
     {
+        await SafeNotifyAsync(_observer?.OnToolCallAsync(call.FunctionName, call.Arguments, ct)).ConfigureAwait(false);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var (content, isError) = await ExecuteToolCoreAsync(call, ctx, ct).ConfigureAwait(false);
+        sw.Stop();
+        await SafeNotifyAsync(_observer?.OnToolResultAsync(call.FunctionName, content, isError, sw.Elapsed, ct))
+            .ConfigureAwait(false);
+        return content;
+    }
+
+    private async Task<(string Content, bool IsError)> ExecuteToolCoreAsync(ToolCall call, ToolContext ctx, CancellationToken ct)
+    {
         var tool = _tools.Get(call.FunctionName);
         if (tool is null)
-            return $"[Unknown tool: {call.FunctionName}]";
+            return ($"[Unknown tool: {call.FunctionName}]", true);
 
         JsonDocument argsDoc;
         try
@@ -476,7 +499,7 @@ public sealed class AgentLoop
         }
         catch (JsonException ex)
         {
-            return $"[Invalid arguments JSON for {call.FunctionName}: {ex.Message}]";
+            return ($"[Invalid arguments JSON for {call.FunctionName}: {ex.Message}]", true);
         }
 
         using (argsDoc)
@@ -486,15 +509,28 @@ public sealed class AgentLoop
             var decision = _perms.Evaluate(call.FunctionName, specifier);
 
             if (decision == PermissionDecision.Deny)
-                return $"[Permission denied: {call.FunctionName}({specifier ?? string.Empty})]";
+                return ($"[Permission denied: {call.FunctionName}({specifier ?? string.Empty})]", true);
 
             if (decision == PermissionDecision.Ask && !_options.SkipPermissions)
-                return $"[Permission required for {call.FunctionName}({specifier ?? string.Empty}). " +
-                       "Add an allow rule in settings.json or pass --dangerously-skip-permissions.]";
+                return ($"[Permission required for {call.FunctionName}({specifier ?? string.Empty}). " +
+                       "Add an allow rule in settings.json or pass --dangerously-skip-permissions.]", true);
 
             var res = await tool.ExecuteAsync(args, ctx, ct).ConfigureAwait(false);
-            return res.Content;
+            return (res.Content, res.IsError);
         }
+    }
+
+    /// <summary>
+    /// Best-effort observer notification: awaits the supplied task but swallows any exception
+    /// (and respects null) so a misbehaving observer can't crash the agent. Cancellations
+    /// propagate normally — they're a legitimate caller signal, not an observer bug.
+    /// </summary>
+    private static async Task SafeNotifyAsync(Task? notification)
+    {
+        if (notification is null) return;
+        try { await notification.ConfigureAwait(false); }
+        catch (OperationCanceledException) { throw; }
+        catch { /* swallow — observers are decorative */ }
     }
 
     private static string FormatStatusLine(string toolName, string arguments) =>

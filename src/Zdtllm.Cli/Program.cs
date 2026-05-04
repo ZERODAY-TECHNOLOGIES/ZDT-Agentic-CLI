@@ -2,6 +2,7 @@ using System.Reflection;
 using Spectre.Console;
 using Zdtllm.Config;
 using Zdtllm.Core;
+using Zdtllm.Core.Observers;
 using Zdtllm.Core.Repl;
 using Zdtllm.Core.Sessions;
 using Zdtllm.Core.Setup;
@@ -123,6 +124,11 @@ internal static class Program
         // mangle redirected output. Interactive mode benefits from rich rendering.
         var richConsole = parsed.PrintMode ? null : AnsiConsole.Console;
 
+        // Compose the agent observer based on --output-format / --verbose. stream-json owns
+        // stdout in -p mode (delta events go through the observer); aggregating json captures
+        // everything and emits at the end. Verbose stacks on top of any of these via Composite.
+        var (observer, aggregator, formatOwnsStdout) = BuildObserver(parsed);
+
         var agent = new AgentLoop(
             client,
             registry,
@@ -142,13 +148,20 @@ internal static class Program
                     skills: skills),
             },
             context: contextManager,
-            richConsole: richConsole);
+            richConsole: formatOwnsStdout ? null : richConsole,
+            observer: observer);
 
         // Task tool needs the parent agent to spawn subagents from. Register it AFTER the
         // agent is built — the registry holds a live reference, so the parent agent will see
         // Task on subsequent turns.
         var subagentRunner = new SubagentRunner(agent);
         registry.Register(new TaskTool(subagentRunner));
+
+        // --tools filter: applied last so it can drop builtins, MCP tools, and Task uniformly.
+        if (parsed.AllowedTools.Count > 0)
+        {
+            ApplyToolsAllowlist(registry, parsed.AllowedTools);
+        }
 
         // Single CTS feeds program-wide cancellation: a second Ctrl+C exits the process,
         // a first one just halts the current turn (handled inside the REPL via per-turn CTS
@@ -164,12 +177,18 @@ internal static class Program
         if (parsed.PrintMode)
         {
             Console.CancelKeyPress += (_, e) => { e.Cancel = true; programCts.Cancel(); };
+            // For json / stream-json the model's text goes through the observer; AgentLoop's
+            // own output writer must be muted so the same text doesn't double-print to stdout.
+            var loopOutput = formatOwnsStdout ? TextWriter.Null : Console.Out;
             await agent.RunTurnAsync(
                 session,
                 parsed.Query!,
-                output: Console.Out,
+                output: loopOutput,
                 status: Console.Error,
                 ct: programCts.Token).ConfigureAwait(false);
+
+            if (aggregator is not null)
+                await aggregator.EmitAsync(Console.Out, programCts.Token).ConfigureAwait(false);
             return 0;
         }
 
@@ -211,6 +230,104 @@ internal static class Program
         {
             await mcpManager.DisposeAsync().ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Compose the IAgentObserver based on --output-format / --verbose. Returns:
+    ///   observer        — the actual sink wired into AgentLoop (null when nothing requested)
+    ///   aggregator      — non-null only for --output-format=json (CLI flushes it at exit)
+    ///   formatOwnsStdout — true when stdout is reserved for the format (stream-json's NDJSON
+    ///                      lines or json's single object) and the loop's text writer must be muted.
+    /// </summary>
+    private static (IAgentObserver? observer, AggregatingJsonObserver? aggregator, bool formatOwnsStdout)
+        BuildObserver(ParsedArgs parsed)
+    {
+        var format = (parsed.OutputFormat ?? "text").ToLowerInvariant();
+        var observers = new List<IAgentObserver>();
+        AggregatingJsonObserver? aggregator = null;
+        var formatOwnsStdout = false;
+
+        switch (format)
+        {
+            case "text":
+                break;
+            case "stream-json":
+                if (!parsed.PrintMode)
+                {
+                    Console.Error.WriteLine("zdt: --output-format=stream-json is only honoured with -p; falling back to text.");
+                    break;
+                }
+                observers.Add(new StreamJsonObserver(Console.Out));
+                formatOwnsStdout = true;
+                break;
+            case "json":
+                if (!parsed.PrintMode)
+                {
+                    Console.Error.WriteLine("zdt: --output-format=json is only honoured with -p; falling back to text.");
+                    break;
+                }
+                aggregator = new AggregatingJsonObserver();
+                observers.Add(aggregator);
+                formatOwnsStdout = true;
+                break;
+            default:
+                Console.Error.WriteLine($"zdt: unknown --output-format '{format}'. Valid: text | json | stream-json.");
+                break;
+        }
+
+        if (parsed.Verbose)
+            observers.Add(new VerboseObserver(Console.Error));
+
+        IAgentObserver? observer = observers.Count switch
+        {
+            0 => null,
+            1 => observers[0],
+            _ => new CompositeObserver(observers),
+        };
+        return (observer, aggregator, formatOwnsStdout);
+    }
+
+    /// <summary>
+    /// Drop every tool whose name isn't in <paramref name="allowed"/>. Logs which tools
+    /// got removed (helpful when a typo silently strips a feature) and warns if the
+    /// allowlist mentions a tool that isn't registered.
+    /// </summary>
+    private static void ApplyToolsAllowlist(ToolRegistry registry, IReadOnlyList<string> allowed)
+    {
+        var keep = new HashSet<string>(allowed, StringComparer.Ordinal);
+        var present = registry.All.Select(t => t.Schema.Name).ToHashSet(StringComparer.Ordinal);
+
+        foreach (var requested in allowed)
+        {
+            if (!present.Contains(requested))
+                Console.Error.WriteLine($"zdt: --tools: '{requested}' is not a registered tool (typo? case mismatch?).");
+        }
+
+        var toRemove = present.Where(n => !keep.Contains(n)).ToList();
+        foreach (var name in toRemove) registry.Remove(name);
+
+        if (toRemove.Count > 0)
+            Console.Error.WriteLine($"zdt: --tools allowlist active — kept {registry.All.Length}, dropped {toRemove.Count}.");
+    }
+
+    /// <summary>
+    /// Fans observer events out to a list of underlying observers. Each notification fires
+    /// every observer sequentially; failures in one don't short-circuit the others (the
+    /// AgentLoop's SafeNotifyAsync wrapper already swallows observer exceptions, so failures
+    /// here just mean the failing observer skipped this event).
+    /// </summary>
+    private sealed class CompositeObserver : IAgentObserver
+    {
+        private readonly IReadOnlyList<IAgentObserver> _inner;
+        public CompositeObserver(IReadOnlyList<IAgentObserver> inner) { _inner = inner; }
+        public async Task OnTextDeltaAsync(string text, CancellationToken ct)
+        { foreach (var o in _inner) await o.OnTextDeltaAsync(text, ct).ConfigureAwait(false); }
+        public async Task OnToolCallAsync(string toolName, string argumentsJson, CancellationToken ct)
+        { foreach (var o in _inner) await o.OnToolCallAsync(toolName, argumentsJson, ct).ConfigureAwait(false); }
+        public async Task OnToolResultAsync(string toolName, string content, bool isError, TimeSpan duration, CancellationToken ct)
+        { foreach (var o in _inner) await o.OnToolResultAsync(toolName, content, isError, duration, ct).ConfigureAwait(false); }
+        public async Task OnFinalAsync(string finalText, int turns, int? promptTokens, int? completionTokens, CancellationToken ct)
+        { foreach (var o in _inner) await o.OnFinalAsync(finalText, turns, promptTokens, completionTokens, ct).ConfigureAwait(false); }
     }
 
     /// <summary>
@@ -503,6 +620,16 @@ internal static class Program
                 case "--mcp-config":
                     result.McpConfigs.Add(NextValue(args, ref i, "--mcp-config"));
                     break;
+                case "--verbose":
+                    result.Verbose = true;
+                    break;
+                case "--output-format":
+                    result.OutputFormat = NextValue(args, ref i, "--output-format");
+                    break;
+                case "--tools":
+                    foreach (var t in NextValue(args, ref i, "--tools").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                        result.AllowedTools.Add(t);
+                    break;
                 case "--session-id":
                     result.SessionId = NextValue(args, ref i, "--session-id");
                     break;
@@ -570,6 +697,9 @@ internal static class Program
         Console.WriteLine("  --append-system-prompt-file <p>  append file contents after the default/replaced prompt");
         Console.WriteLine("  --add-dir <path>               add an extra accessible directory (repeatable)");
         Console.WriteLine("  --mcp-config <path>            load MCP server config from a JSON file (repeatable, last wins per server)");
+        Console.WriteLine("  --verbose                      trace tool calls + results to stderr (durations, args/preview)");
+        Console.WriteLine("  --output-format <fmt>          text (default) | json | stream-json — only honoured with -p");
+        Console.WriteLine("  --tools <a,b,c>                allowlist of tool names — registry is filtered after MCP/Task register");
         Console.WriteLine("  --session-id <uuid>            create or resume a persistent session at this id");
         Console.WriteLine("  -c, --continue                 resume the most recent session for this directory");
         Console.WriteLine("  -r, --resume <uuid>            resume the specified session");
@@ -598,6 +728,9 @@ internal static class Program
         public string? AppendSystemPromptFile { get; set; }
         public List<string> AddDirs { get; } = new();
         public List<string> McpConfigs { get; } = new();
+        public bool Verbose { get; set; }
+        public string? OutputFormat { get; set; }
+        public List<string> AllowedTools { get; } = new();
         public bool ShowVersion { get; set; }
         public bool ShowHelp { get; set; }
         public string? Query { get; set; }

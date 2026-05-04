@@ -18,4 +18,10 @@ public sealed class ToolRegistry
 
     public ImmutableArray<ToolSchema> Schemas =>
         [.._tools.Values.Select(t => t.Schema)];
+
+    /// <summary>
+    /// Drop the named tool from the registry. Returns true if it was present. Used by
+    /// the --tools allowlist after every builtin / MCP / Task tool has been registered.
+    /// </summary>
+    public bool Remove(string name) => _tools.Remove(name);
 }
