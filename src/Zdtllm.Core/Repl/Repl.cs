@@ -1,3 +1,4 @@
+using Spectre.Console;
 using Zdtllm.Core.Sessions;
 
 namespace Zdtllm.Core.Repl;
@@ -10,6 +11,12 @@ namespace Zdtllm.Core.Repl;
 /// </summary>
 public sealed class Repl
 {
+    private static readonly Spectre.Console.Color BrandCyan = new(0x1B, 0xEA, 0xCD);
+    private static readonly Spectre.Console.Color BrandGold = new(0xE5, 0xD9, 0x36);
+    private static readonly Spectre.Console.Color MuteText = new(0x68, 0x7B, 0x89);
+    private static readonly Spectre.Console.Color BorderTint = new(0x36, 0x4A, 0x5E);
+    private static readonly Spectre.Console.Color RedAccent = new(0xE5, 0x4D, 0x4D);
+
     private readonly Session _session;
     private readonly AgentLoop _agent;
     private readonly TextReader _input;
@@ -17,6 +24,7 @@ public sealed class Repl
     private readonly TextWriter _error;
     private readonly string _cwd;
     private readonly ReplOptions _options;
+    private readonly IAnsiConsole? _richConsole;
 
     public Repl(
         Session session,
@@ -25,7 +33,8 @@ public sealed class Repl
         TextWriter output,
         TextWriter error,
         string cwd,
-        ReplOptions? options = null)
+        ReplOptions? options = null,
+        IAnsiConsole? richConsole = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(agent);
@@ -41,6 +50,7 @@ public sealed class Repl
         _error = error;
         _cwd = cwd;
         _options = options ?? new ReplOptions();
+        _richConsole = richConsole;
     }
 
     public async Task<int> RunAsync(string? initialPrompt = null, CancellationToken ct = default)
@@ -298,16 +308,48 @@ public sealed class Repl
     {
         var rs = _agent.Permissions;
         var counts = rs.RuleCounts;
+
+        // Header line is identical in both modes — the existing tests grep for "rules:" + tokens
+        // ("deny=0", "ask=0", "allow=0") and we must not break them.
         await _output.WriteLineAsync(
                 $"  {Palette.Mute("rules:")} " +
                 $"{Palette.Red($"deny={counts.deny}")} " +
                 $"{Palette.Gold($"ask={counts.ask}")} " +
                 $"{Palette.Cyan($"allow={counts.allow}")}")
             .ConfigureAwait(false);
+
+        if (_richConsole is not null && counts is not (0, 0, 0))
+        {
+            // Side-by-side table — one column per precedence bucket. Empty buckets render as "—".
+            var table = new Table()
+                .Border(TableBorder.Rounded)
+                .BorderColor(BorderTint)
+                .Title($"[bold {Hex(BrandCyan)}]permission rules[/]");
+            table.AddColumn(new TableColumn(new Markup($"[bold {Hex(RedAccent)}]deny[/]")));
+            table.AddColumn(new TableColumn(new Markup($"[bold {Hex(BrandGold)}]ask[/]")));
+            table.AddColumn(new TableColumn(new Markup($"[bold {Hex(BrandCyan)}]allow[/]")));
+
+            var deny = rs.DenyRules;
+            var ask = rs.AskRules;
+            var allow = rs.AllowRules;
+            var rowCount = Math.Max(deny.Count, Math.Max(ask.Count, allow.Count));
+
+            for (var i = 0; i < rowCount; i++)
+            {
+                var d = i < deny.Count ? Markup.Escape(deny[i]) : $"[{Hex(MuteText)}]—[/]";
+                var a = i < ask.Count ? Markup.Escape(ask[i]) : $"[{Hex(MuteText)}]—[/]";
+                var w = i < allow.Count ? Markup.Escape(allow[i]) : $"[{Hex(MuteText)}]—[/]";
+                table.AddRow(new Markup(d), new Markup(a), new Markup(w));
+            }
+            _richConsole.Write(table);
+        }
+
         await _output.WriteLineAsync(
                 Palette.Mute("  Defaults: tools requiring permission (Bash, Edit, Write, WebFetch, WebSearch, Skill) Ask without an explicit allow."))
             .ConfigureAwait(false);
     }
+
+    private static string Hex(Spectre.Console.Color c) => $"#{c.R:X2}{c.G:X2}{c.B:X2}";
 
     private async Task HandleContextCommandAsync()
     {

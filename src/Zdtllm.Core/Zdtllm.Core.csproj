@@ -5,6 +5,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Spectre.Console" Version="0.49.1" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Zdtllm.LiteLLM\Zdtllm.LiteLLM.csproj" />
     <ProjectReference Include="..\Zdtllm.Tools\Zdtllm.Tools.csproj" />
     <ProjectReference Include="..\Zdtllm.Permissions\Zdtllm.Permissions.csproj" />

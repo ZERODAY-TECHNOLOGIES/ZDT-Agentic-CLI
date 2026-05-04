@@ -112,6 +112,10 @@ internal static class Program
         var appendText = ResolveAppendSystemPrompt(parsed);
         var additionalDirs = MergeAdditionalDirectories(parsed.AddDirs, settings.Permissions.AdditionalDirectories);
 
+        // Print mode pipes stdout through the shell so a spinner/markdown renderer would
+        // mangle redirected output. Interactive mode benefits from rich rendering.
+        var richConsole = parsed.PrintMode ? null : AnsiConsole.Console;
+
         var agent = new AgentLoop(
             client,
             registry,
@@ -129,7 +133,8 @@ internal static class Program
                     additionalDirectories: additionalDirs,
                     skills: skills),
             },
-            context: contextManager);
+            context: contextManager,
+            richConsole: richConsole);
 
         // Task tool needs the parent agent to spawn subagents from. Register it AFTER the
         // agent is built — the registry holds a live reference, so the parent agent will see
@@ -157,7 +162,8 @@ internal static class Program
             Console.In,
             Console.Out,
             Console.Error,
-            cwd);
+            cwd,
+            richConsole: richConsole);
         return await repl.RunAsync(parsed.Query, CancellationToken.None).ConfigureAwait(false);
     }
 

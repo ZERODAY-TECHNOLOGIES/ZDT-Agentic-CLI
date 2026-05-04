@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Text;
 using System.Text.Json;
+using Spectre.Console;
 using Zdtllm.Core.Sessions;
 using Zdtllm.LiteLLM;
 using Zdtllm.Permissions;
@@ -30,18 +31,23 @@ public sealed record AgentResult(
 
 public sealed class AgentLoop
 {
+    private static readonly Color BrandCyan = new(0x1B, 0xEA, 0xCD);
+    private static readonly Color MuteText = new(0x68, 0x7B, 0x89);
+
     private readonly LiteLLMClient _client;
     private readonly ToolRegistry _tools;
     private readonly PermissionRuleSet _perms;
     private readonly AgentLoopOptions _options;
     private readonly ContextManager? _context;
+    private readonly IAnsiConsole? _richConsole;
 
     public AgentLoop(
         LiteLLMClient client,
         ToolRegistry tools,
         PermissionRuleSet perms,
         AgentLoopOptions options,
-        ContextManager? context = null)
+        ContextManager? context = null,
+        IAnsiConsole? richConsole = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(tools);
@@ -52,6 +58,7 @@ public sealed class AgentLoop
         _perms = perms;
         _options = options;
         _context = context;
+        _richConsole = richConsole;
     }
 
     public PermissionRuleSet Permissions => _perms;
@@ -59,6 +66,7 @@ public sealed class AgentLoop
     public LiteLLMClient Client => _client;
     public ContextManager? Context => _context;
     public AgentLoopOptions Options => _options;
+    public IAnsiConsole? RichConsole => _richConsole;
 
     /// <summary>
     /// Backwards-compatible one-shot entry point: spins up an ephemeral
@@ -129,37 +137,56 @@ public sealed class AgentLoop
             int? turnPromptTokens = null;
             int? turnCompletionTokens = null;
 
-            await foreach (var chunk in _client.StreamChatAsync(session.Messages, toolDefList, session.Model, ct).ConfigureAwait(false))
+            async Task ConsumeStreamAsync()
             {
-                switch (chunk)
+                await foreach (var chunk in _client.StreamChatAsync(session.Messages, toolDefList, session.Model, ct).ConfigureAwait(false))
                 {
-                    case ChatChunk.TextDelta td:
-                        assistantText.Append(td.Text);
-                        if (!xmlMode)
-                        {
-                            await output.WriteAsync(td.Text.AsMemory(), ct).ConfigureAwait(false);
-                            await output.FlushAsync(ct).ConfigureAwait(false);
-                        }
-                        break;
+                    switch (chunk)
+                    {
+                        case ChatChunk.TextDelta td:
+                            assistantText.Append(td.Text);
+                            // Rich console suppresses per-delta writes — markdown gets rendered as one block
+                            // once the stream completes (or just before tool dispatch). Keeps terminal clean
+                            // while the thinking spinner runs.
+                            if (!xmlMode && _richConsole is null)
+                            {
+                                await output.WriteAsync(td.Text.AsMemory(), ct).ConfigureAwait(false);
+                                await output.FlushAsync(ct).ConfigureAwait(false);
+                            }
+                            break;
 
-                    case ChatChunk.ToolCallDelta tcd:
-                        if (!pending.TryGetValue(tcd.Index, out var acc))
-                            pending[tcd.Index] = acc = new ToolCallAccumulator();
-                        if (tcd.Id is not null) acc.Id = tcd.Id;
-                        if (tcd.FunctionName is not null) acc.FunctionName = tcd.FunctionName;
-                        if (tcd.ArgumentsDelta is not null) acc.Arguments.Append(tcd.ArgumentsDelta);
-                        break;
+                        case ChatChunk.ToolCallDelta tcd:
+                            if (!pending.TryGetValue(tcd.Index, out var acc))
+                                pending[tcd.Index] = acc = new ToolCallAccumulator();
+                            if (tcd.Id is not null) acc.Id = tcd.Id;
+                            if (tcd.FunctionName is not null) acc.FunctionName = tcd.FunctionName;
+                            if (tcd.ArgumentsDelta is not null) acc.Arguments.Append(tcd.ArgumentsDelta);
+                            break;
 
-                    case ChatChunk.Usage u:
-                        turnPromptTokens = u.PromptTokens;
-                        turnCompletionTokens = u.CompletionTokens;
-                        lastPromptTokens = u.PromptTokens;
-                        lastCompletionTokens = u.CompletionTokens;
-                        break;
+                        case ChatChunk.Usage u:
+                            turnPromptTokens = u.PromptTokens;
+                            turnCompletionTokens = u.CompletionTokens;
+                            lastPromptTokens = u.PromptTokens;
+                            lastCompletionTokens = u.CompletionTokens;
+                            break;
 
-                    case ChatChunk.Done:
-                        break;
+                        case ChatChunk.Done:
+                            break;
+                    }
                 }
+            }
+
+            if (_richConsole is not null)
+            {
+                await _richConsole.Status()
+                    .Spinner(Spinner.Known.Dots)
+                    .SpinnerStyle(new Style(BrandCyan))
+                    .StartAsync($"[{Hex(BrandCyan)}]thinking[/]", async _ => await ConsumeStreamAsync())
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                await ConsumeStreamAsync().ConfigureAwait(false);
             }
 
             if (turnPromptTokens is int p && turnCompletionTokens is int c)
@@ -183,11 +210,20 @@ public sealed class AgentLoop
                     ? XmlToolCallParser.Strip(assistantText.ToString()).TrimEnd()
                     : assistantText.ToString();
 
-                if (xmlMode && displayText.Length > 0)
-                    await output.WriteAsync(displayText.AsMemory(), ct).ConfigureAwait(false);
+                if (_richConsole is not null && displayText.Length > 0)
+                {
+                    // Rich path: text was buffered (not streamed). Render as markdown now.
+                    _richConsole.Write(MarkdownRenderer.Render(displayText));
+                    _richConsole.WriteLine();
+                }
+                else
+                {
+                    if (xmlMode && displayText.Length > 0)
+                        await output.WriteAsync(displayText.AsMemory(), ct).ConfigureAwait(false);
 
-                if (assistantText.Length > 0)
-                    await output.WriteLineAsync().ConfigureAwait(false);
+                    if (assistantText.Length > 0)
+                        await output.WriteLineAsync().ConfigureAwait(false);
+                }
 
                 session.AddAssistant(
                     content: displayText.Length > 0 ? displayText : null,
@@ -248,7 +284,18 @@ public sealed class AgentLoop
             toolCalls: calls);
 
         if (assistantText.Length > 0)
-            await output.WriteLineAsync().ConfigureAwait(false);
+        {
+            if (_richConsole is not null)
+            {
+                // Render the model's pre-toolcall narration as markdown before the tool spinner kicks in.
+                _richConsole.Write(MarkdownRenderer.Render(assistantText.ToString()));
+                _richConsole.WriteLine();
+            }
+            else
+            {
+                await output.WriteLineAsync().ConfigureAwait(false);
+            }
+        }
 
         var results = await DispatchToolCallsAsync(calls, ctx, status, ct).ConfigureAwait(false);
         for (var i = 0; i < calls.Length; i++)
@@ -268,8 +315,16 @@ public sealed class AgentLoop
         var cleaned = XmlToolCallParser.Strip(assistantText.ToString()).Trim();
         if (cleaned.Length > 0)
         {
-            await output.WriteAsync(cleaned.AsMemory(), ct).ConfigureAwait(false);
-            await output.WriteLineAsync().ConfigureAwait(false);
+            if (_richConsole is not null)
+            {
+                _richConsole.Write(MarkdownRenderer.Render(cleaned));
+                _richConsole.WriteLine();
+            }
+            else
+            {
+                await output.WriteAsync(cleaned.AsMemory(), ct).ConfigureAwait(false);
+                await output.WriteLineAsync().ConfigureAwait(false);
+            }
         }
 
         // Persist the original XML-bearing text so the model's own action survives
@@ -312,22 +367,31 @@ public sealed class AgentLoop
             return tool is not null && tool.CanRunInParallel;
         });
 
-        foreach (var call in calls)
+        // For parallel batches we always print the per-call status lines up-front (so the user
+        // sees what is firing concurrently). For sequential single-tool dispatch with a rich
+        // console, we suppress the static line and use a Status spinner instead.
+        var useSpinnerPerCall = _richConsole is not null
+            && (!allParallelisable || calls.Length == 1);
+
+        if (!useSpinnerPerCall)
         {
-            await status.WriteLineAsync(FormatStatusLine(call.FunctionName, call.Arguments))
-                .ConfigureAwait(false);
-        }
-        if (allParallelisable && calls.Length > 1)
-        {
-            await status.WriteLineAsync(Palette.Mute($"  ↳ dispatching {calls.Length} calls in parallel"))
-                .ConfigureAwait(false);
+            foreach (var call in calls)
+            {
+                await status.WriteLineAsync(FormatStatusLine(call.FunctionName, call.Arguments))
+                    .ConfigureAwait(false);
+            }
+            if (allParallelisable && calls.Length > 1)
+            {
+                await status.WriteLineAsync(Palette.Mute($"  ↳ dispatching {calls.Length} calls in parallel"))
+                    .ConfigureAwait(false);
+            }
         }
 
         if (!allParallelisable || calls.Length == 1)
         {
             var sequential = new string[calls.Length];
             for (var i = 0; i < calls.Length; i++)
-                sequential[i] = await ExecuteToolAsync(calls[i], ctx, ct).ConfigureAwait(false);
+                sequential[i] = await ExecuteToolWithSpinnerAsync(calls[i], ctx, useSpinnerPerCall, ct).ConfigureAwait(false);
             return sequential;
         }
 
@@ -335,6 +399,31 @@ public sealed class AgentLoop
         for (var i = 0; i < calls.Length; i++)
             tasks[i] = ExecuteToolAsync(calls[i], ctx, ct);
         return await Task.WhenAll(tasks).ConfigureAwait(false);
+    }
+
+    private async Task<string> ExecuteToolWithSpinnerAsync(
+        ToolCall call,
+        ToolContext ctx,
+        bool useSpinner,
+        CancellationToken ct)
+    {
+        if (!useSpinner || _richConsole is null)
+            return await ExecuteToolAsync(call, ctx, ct).ConfigureAwait(false);
+
+        var label = $"[{Hex(BrandCyan)}]{Markup.Escape(call.FunctionName)}[/] " +
+                    $"[{Hex(MuteText)}]{Markup.Escape(Truncate(call.Arguments, 80))}[/]";
+        string result = string.Empty;
+        await _richConsole.Status()
+            .Spinner(Spinner.Known.Dots)
+            .SpinnerStyle(new Style(BrandCyan))
+            .StartAsync(label, async _ =>
+            {
+                result = await ExecuteToolAsync(call, ctx, ct).ConfigureAwait(false);
+            })
+            .ConfigureAwait(false);
+        // Print a confirmation line after the spinner clears so the call stays in scrollback.
+        _richConsole.MarkupLine($"[{Hex(BrandCyan)}]✓[/] {label}");
+        return result;
     }
 
     private async Task<string> ExecuteToolAsync(ToolCall call, ToolContext ctx, CancellationToken ct)
@@ -378,6 +467,8 @@ public sealed class AgentLoop
 
     private static string Truncate(string s, int max) =>
         s.Length <= max ? s : string.Concat(s.AsSpan(0, max), "…");
+
+    private static string Hex(Color c) => $"#{c.R:X2}{c.G:X2}{c.B:X2}";
 
     internal static string BuildXmlSystemPrompt(string baseSystem, ImmutableArray<ToolSchema> schemas)
     {

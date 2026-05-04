@@ -39,6 +39,17 @@ public sealed class PermissionRuleSet
     public (int deny, int ask, int allow) RuleCounts =>
         (_deny.Length, _ask.Length, _allow.Length);
 
+    /// <summary>
+    /// Human-readable rule strings ("Bash", "Bash(git *)") for each precedence bucket,
+    /// in the order they were configured. Used by /permissions to populate a table.
+    /// </summary>
+    public IReadOnlyList<string> AllowRules => _allow.Select(FormatRule).ToList();
+    public IReadOnlyList<string> AskRules => _ask.Select(FormatRule).ToList();
+    public IReadOnlyList<string> DenyRules => _deny.Select(FormatRule).ToList();
+
+    private static string FormatRule(ParsedRule r) =>
+        r.Specifier is null ? r.ToolName : $"{r.ToolName}({r.Specifier})";
+
     public static PermissionRuleSet Build(
         IReadOnlyList<string> allow,
         IReadOnlyList<string> ask,
