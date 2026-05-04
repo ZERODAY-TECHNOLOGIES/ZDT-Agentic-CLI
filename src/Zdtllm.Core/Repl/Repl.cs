@@ -1,5 +1,6 @@
 using Spectre.Console;
 using Zdtllm.Core.Sessions;
+using Zdtllm.Tools;
 
 namespace Zdtllm.Core.Repl;
 
@@ -25,6 +26,8 @@ public sealed class Repl
     private readonly string _cwd;
     private readonly ReplOptions _options;
     private readonly IAnsiConsole? _richConsole;
+    private readonly ISubagentRunner? _subagentRunner;
+    private CancellationTokenSource? _currentTurnCts;
 
     public Repl(
         Session session,
@@ -34,7 +37,8 @@ public sealed class Repl
         TextWriter error,
         string cwd,
         ReplOptions? options = null,
-        IAnsiConsole? richConsole = null)
+        IAnsiConsole? richConsole = null,
+        ISubagentRunner? subagentRunner = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(agent);
@@ -51,7 +55,16 @@ public sealed class Repl
         _cwd = cwd;
         _options = options ?? new ReplOptions();
         _richConsole = richConsole;
+        _subagentRunner = subagentRunner;
     }
+
+    /// <summary>
+    /// Cancels whatever turn is currently in flight, if any. Wired up to
+    /// Console.CancelKeyPress in Program.cs so Ctrl+C halts the running agent
+    /// (and any subagents it spawned, since they share this token chain) but
+    /// keeps the REPL alive for the next prompt.
+    /// </summary>
+    public void CancelCurrentTurn() => _currentTurnCts?.Cancel();
 
     public async Task<int> RunAsync(string? initialPrompt = null, CancellationToken ct = default)
     {
@@ -97,9 +110,17 @@ public sealed class Repl
         // fires between iterations regardless of whether we're driving the parent here
         // or a subagent inside SubagentRunner. We keep ONLY the post-turn soft-threshold
         // hint here because it's a UI nudge specific to the interactive REPL.
+        //
+        // Per-turn CTS is linked to the outer ct so program-level shutdown cancels
+        // everything, but Ctrl+C only kills THIS turn — the next prompt iteration gets
+        // a fresh token. The current turn's cts is published via _currentTurnCts so
+        // the Cli's CancelKeyPress hook can flip it without holding a direct reference
+        // to AgentLoop / its tool plumbing.
+        using var turnCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _currentTurnCts = turnCts;
         try
         {
-            await _agent.RunTurnAsync(_session, prompt, _output, _error, ct).ConfigureAwait(false);
+            await _agent.RunTurnAsync(_session, prompt, _output, _error, turnCts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -108,6 +129,10 @@ public sealed class Repl
         catch (Exception ex)
         {
             await _error.WriteLineAsync(Palette.Red($"zdt: {ex.Message}")).ConfigureAwait(false);
+        }
+        finally
+        {
+            _currentTurnCts = null;
         }
 
         var ctx = _agent.Context;
@@ -157,6 +182,10 @@ public sealed class Repl
                 await PrintPermissionsAsync().ConfigureAwait(false);
                 return SlashOutcome.Continue;
 
+            case "/agents":
+                await PrintAgentsAsync().ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
             case "/compact":
                 await HandleCompactCommandAsync(ct).ConfigureAwait(false);
                 return SlashOutcome.Continue;
@@ -193,6 +222,69 @@ public sealed class Repl
         await WriteCommandRowAsync("/permissions", "show the current permission rule set").ConfigureAwait(false);
         await WriteCommandRowAsync("/init", "create ZDTLLM.md (project memory file) in the cwd").ConfigureAwait(false);
         await WriteCommandRowAsync("/compact", "summarize older turns to free context").ConfigureAwait(false);
+        await WriteCommandRowAsync("/agents", "list available subagent types and their tool sets").ConfigureAwait(false);
+    }
+
+    private async Task PrintAgentsAsync()
+    {
+        if (_subagentRunner is null)
+        {
+            await _output.WriteLineAsync(
+                Palette.Mute("/agents requires the Task tool to be wired up. ") +
+                Palette.Mute("(Re-launch zdt; subagents are configured automatically in interactive mode.)"))
+                .ConfigureAwait(false);
+            return;
+        }
+
+        var infos = _subagentRunner.GetTypeInfo();
+        await _output.WriteLineAsync(
+                Palette.BodyBold("Subagent profiles:") + " " +
+                Palette.Mute($"({infos.Count} available)"))
+            .ConfigureAwait(false);
+
+        if (_richConsole is not null && infos.Count > 0)
+        {
+            // Spectre table version — three columns (type, blurb, allowed tools) for fast scanning.
+            var table = new Table()
+                .Border(TableBorder.Rounded)
+                .BorderColor(BorderTint)
+                .Title($"[bold {Hex(BrandCyan)}]subagent types[/]");
+            table.AddColumn(new TableColumn(new Markup($"[bold {Hex(BrandCyan)}]type[/]")));
+            table.AddColumn(new TableColumn(new Markup($"[bold {Hex(BrandGold)}]description[/]")));
+            table.AddColumn(new TableColumn(new Markup($"[bold {Hex(MuteText)}]tools[/]")));
+
+            foreach (var info in infos)
+            {
+                var tools = info.AllowedTools.Count == 1 && info.AllowedTools[0] == "*"
+                    ? "all (except Task)"
+                    : string.Join(", ", info.AllowedTools);
+                table.AddRow(
+                    new Markup($"[bold {Hex(BrandGold)}]{Markup.Escape(info.Name)}[/]"),
+                    new Markup(Markup.Escape(info.Description)),
+                    new Markup($"[{Hex(MuteText)}]{Markup.Escape(tools)}[/]"));
+            }
+            _richConsole.Write(table);
+        }
+        else
+        {
+            // Plain text fallback — same content, line-per-type.
+            foreach (var info in infos)
+            {
+                var tools = info.AllowedTools.Count == 1 && info.AllowedTools[0] == "*"
+                    ? "all (except Task)"
+                    : string.Join(", ", info.AllowedTools);
+                await _output.WriteLineAsync(
+                        $"  {Palette.GoldBold(info.Name.PadRight(18))} {Palette.Body(info.Description)}")
+                    .ConfigureAwait(false);
+                await _output.WriteLineAsync(
+                        $"    {Palette.Mute("tools: " + tools)}")
+                    .ConfigureAwait(false);
+            }
+        }
+
+        await _output.WriteLineAsync(
+                Palette.Mute("  Spawned via the Task tool. Failed runs auto-retry once and may fall back to general-purpose."))
+            .ConfigureAwait(false);
     }
 
     private Task WriteCommandRowAsync(string command, string description) =>

@@ -124,6 +124,7 @@ internal static class Program
             {
                 Model = session.Model,
                 MaxTurns = parsed.MaxTurns ?? 30,
+                MaxParallel = parsed.MaxParallel ?? 0,
                 SkipPermissions = parsed.DangerouslySkipPermissions,
                 ToolCallingMode = session.Mode,
                 SystemPrompt = SystemPromptComposer.Compose(
@@ -139,16 +140,23 @@ internal static class Program
         // Task tool needs the parent agent to spawn subagents from. Register it AFTER the
         // agent is built — the registry holds a live reference, so the parent agent will see
         // Task on subsequent turns.
-        registry.Register(new TaskTool(new SubagentRunner(agent)));
+        var subagentRunner = new SubagentRunner(agent);
+        registry.Register(new TaskTool(subagentRunner));
+
+        // Single CTS feeds program-wide cancellation: a second Ctrl+C exits the process,
+        // a first one just halts the current turn (handled inside the REPL via per-turn CTS
+        // linked to this one). Print mode short-circuits to "first Ctrl+C exits".
+        using var programCts = new CancellationTokenSource();
 
         if (parsed.PrintMode)
         {
+            Console.CancelKeyPress += (_, e) => { e.Cancel = true; programCts.Cancel(); };
             await agent.RunTurnAsync(
                 session,
                 parsed.Query!,
                 output: Console.Out,
                 status: Console.Error,
-                ct: CancellationToken.None).ConfigureAwait(false);
+                ct: programCts.Token).ConfigureAwait(false);
             return 0;
         }
 
@@ -163,8 +171,28 @@ internal static class Program
             Console.Out,
             Console.Error,
             cwd,
-            richConsole: richConsole);
-        return await repl.RunAsync(parsed.Query, CancellationToken.None).ConfigureAwait(false);
+            richConsole: richConsole,
+            subagentRunner: subagentRunner);
+
+        var ctrlCCount = 0;
+        Console.CancelKeyPress += (_, e) =>
+        {
+            // First Ctrl+C: cancel the active turn (kills agent + every subagent it spawned via
+            // the linked CT chain) but keep the REPL alive. Second Ctrl+C in a row: exit hard.
+            if (Interlocked.Increment(ref ctrlCCount) >= 2)
+            {
+                e.Cancel = false;
+                programCts.Cancel();
+                return;
+            }
+            e.Cancel = true;
+            repl.CancelCurrentTurn();
+            // Reset the counter once the current turn finishes — we install a one-shot timer
+            // via Task.Delay so a slow second Ctrl+C doesn't accidentally exit.
+            _ = Task.Delay(1500).ContinueWith(_ => Interlocked.Exchange(ref ctrlCCount, 0));
+        };
+
+        return await repl.RunAsync(parsed.Query, programCts.Token).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -375,6 +403,9 @@ internal static class Program
                 case "--max-turns":
                     result.MaxTurns = int.Parse(NextValue(args, ref i, "--max-turns"));
                     break;
+                case "--max-parallel":
+                    result.MaxParallel = int.Parse(NextValue(args, ref i, "--max-parallel"));
+                    break;
                 case "--dangerously-skip-permissions":
                     result.DangerouslySkipPermissions = true;
                     break;
@@ -458,6 +489,7 @@ internal static class Program
         Console.WriteLine("  -p, --print                    print mode (one-shot, exit)");
         Console.WriteLine("  --model <alias|name>           model alias (light/medium/heavy) or full name");
         Console.WriteLine("  --max-turns <n>                cap agent loop iterations (default 30)");
+        Console.WriteLine("  --max-parallel <n>             cap concurrent tool calls in a parallel batch (0 = unlimited)");
         Console.WriteLine("  --dangerously-skip-permissions auto-allow tools that would otherwise prompt");
         Console.WriteLine("  --no-wizard                    skip the first-run setup wizard");
         Console.WriteLine("  --bare                         skip auto-discovery of skills");
@@ -481,6 +513,7 @@ internal static class Program
         public bool PrintMode { get; set; }
         public string? Model { get; set; }
         public int? MaxTurns { get; set; }
+        public int? MaxParallel { get; set; }
         public bool DangerouslySkipPermissions { get; set; }
         public bool NoWizard { get; set; }
         public bool Bare { get; set; }

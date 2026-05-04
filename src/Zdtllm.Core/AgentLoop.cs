@@ -21,6 +21,14 @@ public sealed record AgentLoopOptions
     public bool SkipPermissions { get; init; }
     public ToolCallingMode ToolCallingMode { get; init; } = ToolCallingMode.Native;
     public string SystemPrompt { get; init; } = DefaultSystemPrompt;
+
+    /// <summary>
+    /// Cap on concurrent tool executions when a batch is parallel-eligible. 0 or
+    /// negative means "no cap" (the historical Task.WhenAll behaviour). The cap
+    /// matters mainly for Task-tool fan-out: each parallel subagent triggers its
+    /// own LiteLLM stream, and most proxies enforce per-key rate limits.
+    /// </summary>
+    public int MaxParallel { get; init; } = 0;
 }
 
 public sealed record AgentResult(
@@ -395,10 +403,37 @@ public sealed class AgentLoop
             return sequential;
         }
 
+        var maxParallel = _options.MaxParallel;
+        if (maxParallel > 0 && maxParallel < calls.Length)
+        {
+            // Throttled fan-out — semaphore caps concurrent in-flight executions. Useful when
+            // the parent dispatches a fan of Task subagents and the LiteLLM proxy is rate-limited.
+            await status.WriteLineAsync(
+                Palette.Mute($"  ↳ throttled to {maxParallel} concurrent (--max-parallel)"))
+                .ConfigureAwait(false);
+
+            using var sem = new SemaphoreSlim(maxParallel);
+            var throttled = new Task<string>[calls.Length];
+            for (var i = 0; i < calls.Length; i++)
+            {
+                var call = calls[i];
+                throttled[i] = RunWithSemaphore(sem, call, ctx, ct);
+            }
+            return await Task.WhenAll(throttled).ConfigureAwait(false);
+        }
+
         var tasks = new Task<string>[calls.Length];
         for (var i = 0; i < calls.Length; i++)
             tasks[i] = ExecuteToolAsync(calls[i], ctx, ct);
         return await Task.WhenAll(tasks).ConfigureAwait(false);
+    }
+
+    private async Task<string> RunWithSemaphore(
+        SemaphoreSlim sem, ToolCall call, ToolContext ctx, CancellationToken ct)
+    {
+        await sem.WaitAsync(ct).ConfigureAwait(false);
+        try { return await ExecuteToolAsync(call, ctx, ct).ConfigureAwait(false); }
+        finally { sem.Release(); }
     }
 
     private async Task<string> ExecuteToolWithSpinnerAsync(

@@ -127,6 +127,8 @@ public sealed class TaskToolTests
 
         public IReadOnlyList<string> AvailableTypes => Available;
         public bool SupportsType(string type) => Available.Contains(type, StringComparer.Ordinal);
+        public IReadOnlyList<SubagentTypeInfo> GetTypeInfo() =>
+            Available.Select(t => new SubagentTypeInfo(t, "stub", new[] { "*" })).ToList();
 
         public Task<SubagentResult> RunAsync(SubagentRequest request, CancellationToken ct)
         {
@@ -139,6 +141,8 @@ public sealed class TaskToolTests
     {
         public IReadOnlyList<string> AvailableTypes { get; } = new[] { "general-purpose" };
         public bool SupportsType(string type) => true;
+        public IReadOnlyList<SubagentTypeInfo> GetTypeInfo() =>
+            new[] { new SubagentTypeInfo("general-purpose", "stub", new[] { "*" }) };
         public Task<SubagentResult> RunAsync(SubagentRequest request, CancellationToken ct) =>
             throw new InvalidOperationException("synthetic boom");
     }

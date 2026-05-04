@@ -245,6 +245,7 @@ public sealed class SubagentRunnerTests
     {
         public IReadOnlyList<string> AvailableTypes => Array.Empty<string>();
         public bool SupportsType(string type) => false;
+        public IReadOnlyList<SubagentTypeInfo> GetTypeInfo() => Array.Empty<SubagentTypeInfo>();
         public Task<SubagentResult> RunAsync(SubagentRequest request, CancellationToken ct) =>
             throw new NotImplementedException("test stub");
     }

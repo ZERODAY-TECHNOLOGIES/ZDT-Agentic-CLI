@@ -38,6 +38,14 @@ public sealed class SubagentRunner : ISubagentRunner
         "explore",
     };
 
+    private static readonly Dictionary<string, string> TypeBlurbs =
+        new(StringComparer.Ordinal)
+        {
+            ["general-purpose"] = "All tools the parent has, except Task itself (no recursive sub-spawning).",
+            ["code-reviewer"]   = "Read-only review profile — analyses code without ever modifying it.",
+            ["explore"]         = "Read-only research profile — local FS plus web fetch for sourced answers.",
+        };
+
     private readonly AgentLoop _parent;
 
     public SubagentRunner(AgentLoop parent)
@@ -51,10 +59,69 @@ public sealed class SubagentRunner : ISubagentRunner
     public bool SupportsType(string type) =>
         AvailableTypeNames.Contains(type, StringComparer.Ordinal);
 
+    public IReadOnlyList<SubagentTypeInfo> GetTypeInfo()
+    {
+        var infos = new List<SubagentTypeInfo>(AvailableTypeNames.Length);
+        foreach (var type in AvailableTypeNames)
+        {
+            var allowed = ToolPolicyByType.TryGetValue(type, out var set)
+                ? (IReadOnlyList<string>)set.OrderBy(n => n, StringComparer.Ordinal).ToList()
+                : new[] { "*" };
+            var blurb = TypeBlurbs.TryGetValue(type, out var b) ? b : string.Empty;
+            infos.Add(new SubagentTypeInfo(type, blurb, allowed));
+        }
+        return infos;
+    }
+
     public async Task<SubagentResult> RunAsync(SubagentRequest request, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        // Attempt 1: requested type. Attempt 2: same type (transient retry — most LiteLLM/network
+        // failures are flaky one-shot timeouts). Attempt 3 (only if requested type wasn't already
+        // general-purpose): fall back to general-purpose, which has the broadest tool set and the
+        // simplest prompt — likeliest to succeed when a constrained profile keeps failing.
+        var attempts = new List<(string Type, bool IsFallback)>
+        {
+            (request.Type, false),
+            (request.Type, false),
+        };
+        if (!string.Equals(request.Type, "general-purpose", StringComparison.Ordinal))
+            attempts.Add(("general-purpose", true));
+
+        Exception? lastError = null;
+        for (var i = 0; i < attempts.Count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var (effectiveType, isFallback) = attempts[i];
+            try
+            {
+                var result = await RunOnceAsync(request with { Type = effectiveType }, ct).ConfigureAwait(false);
+                if (isFallback)
+                {
+                    var note = $"[fallback to general-purpose after {i} failure(s) of '{request.Type}']\n\n";
+                    return result with { FinalText = note + result.FinalText };
+                }
+                return result;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // User-requested cancellation — surface immediately, do not retry.
+                throw;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+            }
+        }
+
+        throw new SubagentExecutionException(
+            $"Subagent '{request.Type}' failed after {attempts.Count} attempt(s): {lastError?.Message}",
+            lastError);
+    }
+
+    private async Task<SubagentResult> RunOnceAsync(SubagentRequest request, CancellationToken ct)
+    {
         var subRegistry = BuildRegistryForType(request.Type, _parent.Tools);
         var subOptions = _parent.Options with
         {
@@ -168,4 +235,14 @@ public sealed class SubagentRunner : ISubagentRunner
         "You are a research subagent. Investigate using Read, Glob, Grep on the local " +
         "filesystem and WebFetch for URLs. Synthesize what you find into a clear, sourced " +
         "answer. Do not modify any files (no write tools available).";
+}
+
+/// <summary>
+/// Raised when a subagent's RunAsync exhausts its retry+fallback budget. The original
+/// exception is preserved as InnerException so callers can diagnose the underlying cause.
+/// </summary>
+public sealed class SubagentExecutionException : Exception
+{
+    public SubagentExecutionException(string message, Exception? inner)
+        : base(message, inner) { }
 }

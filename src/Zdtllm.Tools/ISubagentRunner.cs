@@ -15,6 +15,12 @@ public interface ISubagentRunner
 
     /// <summary>Human-readable list of supported types — surfaced in error messages.</summary>
     IReadOnlyList<string> AvailableTypes { get; }
+
+    /// <summary>
+    /// Per-type metadata for /agents and any UI that lists profiles. Each entry covers
+    /// one supported type and includes a short blurb plus the tools that type may use.
+    /// </summary>
+    IReadOnlyList<SubagentTypeInfo> GetTypeInfo();
 }
 
 public sealed record SubagentRequest(
@@ -28,3 +34,13 @@ public sealed record SubagentResult(
     int Turns,
     int? PromptTokens,
     int? CompletionTokens);
+
+/// <summary>
+/// What /agents and the Task-tool error messages need to know about a profile.
+/// AllowedTools is "*" when the profile inherits the parent's full tool set
+/// (general-purpose); otherwise it lists the explicitly permitted tools.
+/// </summary>
+public sealed record SubagentTypeInfo(
+    string Name,
+    string Description,
+    IReadOnlyList<string> AllowedTools);
