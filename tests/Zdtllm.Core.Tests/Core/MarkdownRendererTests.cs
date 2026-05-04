@@ -155,4 +155,108 @@ public sealed class MarkdownRendererTests
         var output = Render("Just a normal sentence.");
         output.Should().Contain("Just a normal sentence.");
     }
+
+    [Fact]
+    public void Markdown_language_fence_unwraps_and_renders_inner_content_as_markdown()
+    {
+        // Qwen / Codestral / a few other models occasionally wrap their full response in
+        // ```markdown ... ``` thinking it preserves formatting; the literal effect was the
+        // opposite — our renderer used to wrap it in a code Panel and the table + headings
+        // surfaced as raw '#' / '|' / '**' characters. The unwrap branch in ConsumeCodeFence
+        // makes the markdown render normally inside the fence.
+        var output = Render(
+            "```markdown\n" +
+            "# Findings\n" +
+            "\n" +
+            "| Issue | Severity |\n" +
+            "|-------|----------|\n" +
+            "| IDOR  | High     |\n" +
+            "```\n");
+
+        output.Should().Contain("Findings");
+        output.Should().Contain("Issue");
+        output.Should().Contain("Severity");
+        output.Should().Contain("IDOR");
+        output.Should().Contain("High");
+        // The literal '#' heading marker MUST be consumed (would survive in a code-block panel).
+        output.Should().NotContain("# Findings");
+        // The literal '|---|---|' separator MUST be consumed by the table parser.
+        output.Should().NotContain("|-------|");
+    }
+
+    [Fact]
+    public void Md_language_fence_unwraps_same_as_markdown()
+    {
+        var output = Render(
+            "```md\n" +
+            "## Recap\n" +
+            "**Bold** word.\n" +
+            "```\n");
+
+        output.Should().Contain("Recap");
+        output.Should().Contain("Bold");
+        output.Should().NotContain("## Recap");
+        output.Should().NotContain("**Bold**");
+    }
+
+    [Fact]
+    public void Markdown_fence_followed_by_more_markdown_renders_both_correctly()
+    {
+        // The exact shape that broke in the user's Qwen scan output: a markdown fence
+        // wrapping a heading + table, then a closing fence, then more markdown OUTSIDE
+        // the fence. Both halves must render visibly.
+        var output = Render(
+            "```markdown\n" +
+            "# Vulnerability Assessment\n" +
+            "\n" +
+            "| Vuln | Sev |\n" +
+            "|------|-----|\n" +
+            "| IDOR | Crit |\n" +
+            "```\n" +
+            "\n" +
+            "Recommendations\n" +
+            "\n" +
+            "1. Fix IDOR\n" +
+            "2. Add rate limit\n");
+
+        output.Should().Contain("Vulnerability Assessment");
+        output.Should().Contain("IDOR");
+        output.Should().Contain("Recommendations");
+        output.Should().Contain("Fix IDOR");
+        output.Should().Contain("Add rate limit");
+        // No literal markdown source should leak through.
+        output.Should().NotContain("# Vulnerability");
+        output.Should().NotContain("```");
+    }
+
+    [Fact]
+    public void Python_fence_still_renders_as_code_block_unchanged()
+    {
+        // Make sure the unwrap branch doesn't apply to non-markdown languages — we want
+        // ```python and friends to keep their code-block panel.
+        var output = Render(
+            "```python\n" +
+            "# This comment must survive as code, not become an h1\n" +
+            "print('hi')\n" +
+            "```\n");
+
+        // The '#' on the first line must be preserved as a literal — if the unwrap branch
+        // mis-fired, ConsumeCodeFence would have re-rendered it as a heading instead.
+        output.Should().Contain("# This comment must survive as code, not become an h1");
+        output.Should().Contain("print('hi')");
+    }
+
+    [Fact]
+    public void Markdown_fence_with_attributes_after_language_still_unwraps()
+    {
+        // Pandoc-style `{attrs}` after the language hint shouldn't disable the unwrap path.
+        // ExtractFenceLanguage stops at whitespace so `markdown {.numbered}` → "markdown".
+        var output = Render(
+            "```markdown {.numbered}\n" +
+            "# Heading\n" +
+            "```\n");
+
+        output.Should().Contain("Heading");
+        output.Should().NotContain("# Heading");
+    }
 }

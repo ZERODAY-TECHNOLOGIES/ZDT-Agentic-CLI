@@ -111,8 +111,11 @@ public static partial class MarkdownRenderer
 
     private static int ConsumeCodeFence(string[] lines, int start, List<IRenderable> blocks)
     {
-        // Skip opening fence (and grab language hint if present, just for color flavor)
+        // Pull the language hint immediately after the opening backticks: ```markdown / ```py / ...
+        // We trim a leading "```" of any length (CommonMark allows ≥3) and read what follows.
         var fence = lines[start].TrimStart();
+        var hint = ExtractFenceLanguage(fence);
+
         var i = start + 1;
         var code = new StringBuilder();
         while (i < lines.Length && !lines[i].TrimStart().StartsWith("```", StringComparison.Ordinal))
@@ -124,12 +127,43 @@ public static partial class MarkdownRenderer
         if (i < lines.Length) i++; // skip closing fence
 
         var content = code.ToString();
+
+        // Models occasionally wrap their full markdown response in ```markdown ... ``` (or ```md)
+        // — e.g. Qwen-Coder when it wants to "preserve formatting". Without this branch the
+        // wrapper would render as a literal code block and the table / headings inside would
+        // surface as raw '#' and '|' characters. Recursively rendering the inner content as
+        // markdown is the user-intended behaviour. Other language hints (python, bash, json, ...)
+        // continue to render as code blocks.
+        if (string.Equals(hint, "markdown", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(hint, "md", StringComparison.OrdinalIgnoreCase))
+        {
+            blocks.Add(Render(content));
+            return i;
+        }
+
         var panel = new Panel(new Markup(Markup.Escape(content), new Style(BodyText)))
             .Border(BoxBorder.Rounded)
             .BorderColor(BorderTint)
             .Padding(1, 0);
         blocks.Add(panel);
         return i;
+    }
+
+    /// <summary>
+    /// Extract the language hint from a fence opening line: <c>```markdown</c> → "markdown",
+    /// <c>```python {linenos}</c> → "python", <c>```</c> → "". Stops at whitespace so
+    /// pandoc-style fence attributes don't leak into the hint.
+    /// </summary>
+    private static string ExtractFenceLanguage(string fenceLine)
+    {
+        var s = fenceLine.AsSpan();
+        var k = 0;
+        while (k < s.Length && s[k] == '`') k++;
+        if (k >= s.Length) return string.Empty;
+        var rest = s[k..];
+        var end = 0;
+        while (end < rest.Length && !char.IsWhiteSpace(rest[end])) end++;
+        return rest[..end].ToString();
     }
 
     private static bool IsTableHeader(string headerLine, string nextLine) =>
