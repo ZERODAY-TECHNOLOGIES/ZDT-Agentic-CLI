@@ -200,6 +200,10 @@ public sealed class Repl
                 await HandleModelCommandAsync(args).ConfigureAwait(false);
                 return SlashOutcome.Continue;
 
+            case "/tool-calling":
+                await HandleToolCallingCommandAsync(args).ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
             case "/permissions":
                 await PrintPermissionsAsync().ConfigureAwait(false);
                 return SlashOutcome.Continue;
@@ -241,6 +245,7 @@ public sealed class Repl
         await WriteCommandRowAsync("/status", "show session id, model, mode, message count").ConfigureAwait(false);
         await WriteCommandRowAsync("/context", "show current context-window usage and per-role breakdown").ConfigureAwait(false);
         await WriteCommandRowAsync("/model <name>", "switch model used by the next turn").ConfigureAwait(false);
+        await WriteCommandRowAsync("/tool-calling <native|xml>", "switch tool-call transport for the next turn").ConfigureAwait(false);
         await WriteCommandRowAsync("/permissions", "show the current permission rule set").ConfigureAwait(false);
         await WriteCommandRowAsync("/init", "create ZDTLLM.md (project memory file) in the cwd").ConfigureAwait(false);
         await WriteCommandRowAsync("/compact", "summarize older turns to free context").ConfigureAwait(false);
@@ -414,6 +419,36 @@ public sealed class Repl
         _session.SetModel(args.Trim());
         await _output.WriteLineAsync(
             Palette.Cyan("✓") + " " + Palette.Body($"Model set to {_session.Model}") +
+            Palette.Mute(" (takes effect on next turn)."))
+            .ConfigureAwait(false);
+    }
+
+    private async Task HandleToolCallingCommandAsync(string args)
+    {
+        if (string.IsNullOrWhiteSpace(args))
+        {
+            await _output.WriteLineAsync(
+                $"{Palette.Mute("Current tool-calling mode:")} {Palette.GoldBold(_session.Mode.ToString().ToLowerInvariant())}")
+                .ConfigureAwait(false);
+            await _output.WriteLineAsync(Palette.Mute("Usage: /tool-calling <native|xml>"))
+                .ConfigureAwait(false);
+            return;
+        }
+
+        if (!ToolCallingModeParse.TryParse(args.Trim(), out var newMode))
+        {
+            await _output.WriteLineAsync(
+                Palette.Red($"Unknown mode: {args.Trim()}.") + " " +
+                Palette.Mute("Use ") + Palette.Body("native") + Palette.Mute(" or ") +
+                Palette.Body("xml") + Palette.Mute("."))
+                .ConfigureAwait(false);
+            return;
+        }
+
+        _session.SetMode(newMode);
+        await _output.WriteLineAsync(
+            Palette.Cyan("✓") + " " +
+            Palette.Body($"Tool-calling mode set to {newMode.ToString().ToLowerInvariant()}") +
             Palette.Mute(" (takes effect on next turn)."))
             .ConfigureAwait(false);
     }

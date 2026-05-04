@@ -87,6 +87,9 @@ public sealed class Session : IDisposable
                 case ModelChangedEvent mc:
                     model = mc.Model;
                     break;
+                case ModeChangedEvent md:
+                    mode = md.Mode;
+                    break;
                 case CompactionEvent compact:
                     msgs.Clear();
                     foreach (var snapshot in compact.KeptMessages)
@@ -168,6 +171,12 @@ public sealed class Session : IDisposable
         ArgumentException.ThrowIfNullOrEmpty(newModel);
         Model = newModel;
         _store?.Append(new ModelChangedEvent(newModel));
+    }
+
+    public void SetMode(ToolCallingMode newMode)
+    {
+        Mode = newMode;
+        _store?.Append(new ModeChangedEvent(newMode));
     }
 
     /// <summary>

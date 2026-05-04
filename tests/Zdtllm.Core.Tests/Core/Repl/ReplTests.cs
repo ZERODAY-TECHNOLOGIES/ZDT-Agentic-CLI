@@ -90,6 +90,7 @@ public sealed class ReplTests : IDisposable
         text.Should().Contain("/status");
         text.Should().Contain("/init");
         text.Should().Contain("/model");
+        text.Should().Contain("/tool-calling");
         text.Should().Contain("/permissions");
     }
 
@@ -202,6 +203,55 @@ public sealed class ReplTests : IDisposable
         var text = output.ToString();
         text.Should().Contain("Current model:");
         text.Should().Contain("test-model");
+    }
+
+    [Fact]
+    public async Task Slash_tool_calling_switches_mode_for_next_turn()
+    {
+        // Sessions start in Native by default in BuildRepl. Switching to xml must update
+        // session.Mode so AgentLoop's `xmlMode = session.Mode == ToolCallingMode.Xml`
+        // pickup on the very next turn — same plumbing /model relies on.
+        var (repl, session, output, _) = BuildRepl("/tool-calling xml\n/exit\n");
+
+        await repl.RunAsync();
+
+        session.Mode.Should().Be(ToolCallingMode.Xml);
+        output.ToString().Should().Contain("Tool-calling mode set to xml");
+    }
+
+    [Fact]
+    public async Task Slash_tool_calling_back_to_native_works()
+    {
+        var (repl, session, output, _) = BuildRepl(
+            "/tool-calling xml\n/tool-calling native\n/exit\n");
+
+        await repl.RunAsync();
+
+        session.Mode.Should().Be(ToolCallingMode.Native);
+        output.ToString().Should().Contain("Tool-calling mode set to native");
+    }
+
+    [Fact]
+    public async Task Slash_tool_calling_without_arg_prints_current_mode()
+    {
+        var (repl, _, output, _) = BuildRepl("/tool-calling\n/exit\n");
+
+        await repl.RunAsync();
+
+        var text = output.ToString();
+        text.Should().Contain("Current tool-calling mode:");
+        text.Should().Contain("native");
+    }
+
+    [Fact]
+    public async Task Slash_tool_calling_with_invalid_mode_keeps_current_and_warns()
+    {
+        var (repl, session, output, _) = BuildRepl("/tool-calling banana\n/exit\n");
+
+        await repl.RunAsync();
+
+        session.Mode.Should().Be(ToolCallingMode.Native);
+        output.ToString().Should().Contain("Unknown mode: banana");
     }
 
     [Fact]

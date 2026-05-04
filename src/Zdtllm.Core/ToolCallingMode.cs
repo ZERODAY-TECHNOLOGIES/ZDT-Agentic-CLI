@@ -33,4 +33,23 @@ public static class ToolCallingModeParse
                 $"Unknown tool-calling mode '{value}'. Expected 'native' or 'xml'."),
         };
     }
+
+    public static bool TryParse(string? value, out ToolCallingMode mode)
+    {
+        mode = ToolCallingMode.Native;
+        if (string.IsNullOrWhiteSpace(value)) return false;
+        switch (value.Trim().ToLowerInvariant())
+        {
+            case "native":
+                mode = ToolCallingMode.Native;
+                return true;
+            case "xml":
+            case "openhands":
+            case "qwen":
+                mode = ToolCallingMode.Xml;
+                return true;
+            default:
+                return false;
+        }
+    }
 }

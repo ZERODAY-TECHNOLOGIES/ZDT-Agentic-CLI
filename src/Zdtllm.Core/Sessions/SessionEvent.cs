@@ -14,6 +14,7 @@ namespace Zdtllm.Core.Sessions;
 [JsonDerivedType(typeof(UsageEvent), "usage")]
 [JsonDerivedType(typeof(ClearEvent), "clear")]
 [JsonDerivedType(typeof(ModelChangedEvent), "modelChanged")]
+[JsonDerivedType(typeof(ModeChangedEvent), "modeChanged")]
 [JsonDerivedType(typeof(CompactionEvent), "compaction")]
 public abstract record SessionEvent
 {
@@ -48,6 +49,12 @@ public sealed record ClearEvent(bool KeepSystem) : SessionEvent;
 /// Records a /model command. On Resume(), updates the session's Model field.
 /// </summary>
 public sealed record ModelChangedEvent(string Model) : SessionEvent;
+
+/// <summary>
+/// Records a /tool-calling command. On Resume(), updates the session's Mode field so
+/// the agent loop continues with the same tool-call transport the user last selected.
+/// </summary>
+public sealed record ModeChangedEvent(ToolCallingMode Mode) : SessionEvent;
 
 /// <summary>
 /// Records a /compact (or auto-compact) operation. The KeptMessages list is the
