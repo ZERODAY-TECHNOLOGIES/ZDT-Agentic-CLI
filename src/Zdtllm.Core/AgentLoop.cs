@@ -149,14 +149,27 @@ public sealed class AgentLoop
             int? turnPromptTokens = null;
             int? turnCompletionTokens = null;
 
-            async Task ConsumeStreamAsync()
+            // Live spinner counters: number of characters streamed (for a tokens-approximation
+            // since servers don't send incremental usage), and total chunks (debug-style metric).
+            // The Stopwatch is the live "elapsed" the spinner shows.
+            var streamSw = System.Diagnostics.Stopwatch.StartNew();
+            var charsStreamed = 0;
+            var lastSpinnerUpdate = TimeSpan.Zero;
+
+            async Task ConsumeStreamAsync(StatusContext? statusCtx)
             {
+                // Show an initial label immediately so the user sees "thinking (0s)" instead of
+                // a static "thinking" until the first chunk arrives — for slow-thinking models
+                // the gap to first chunk can be 30s+, and a frozen label looks broken.
+                statusCtx?.Status(BuildSpinnerLabel(streamSw.Elapsed, charsStreamed));
+
                 await foreach (var chunk in _client.StreamChatAsync(session.Messages, toolDefList, session.Model, ct).ConfigureAwait(false))
                 {
                     switch (chunk)
                     {
                         case ChatChunk.TextDelta td:
                             assistantText.Append(td.Text);
+                            charsStreamed += td.Text.Length;
                             // Observer always sees raw deltas — that's what stream-json wants. The
                             // text writer / rich console split below is purely for the human-facing
                             // terminal, which the observer pipeline doesn't go through.
@@ -169,6 +182,7 @@ public sealed class AgentLoop
                                 await output.WriteAsync(td.Text.AsMemory(), ct).ConfigureAwait(false);
                                 await output.FlushAsync(ct).ConfigureAwait(false);
                             }
+                            UpdateSpinnerThrottled(statusCtx, streamSw, charsStreamed, ref lastSpinnerUpdate);
                             break;
 
                         case ChatChunk.ToolCallDelta tcd:
@@ -177,6 +191,11 @@ public sealed class AgentLoop
                             if (tcd.Id is not null) acc.Id = tcd.Id;
                             if (tcd.FunctionName is not null) acc.FunctionName = tcd.FunctionName;
                             if (tcd.ArgumentsDelta is not null) acc.Arguments.Append(tcd.ArgumentsDelta);
+                            // Tool-call deltas have args text we can use for the char counter too —
+                            // gives "thinking" a visible heartbeat even on tool-call turns where
+                            // there's no assistant text yet.
+                            charsStreamed += tcd.ArgumentsDelta?.Length ?? 0;
+                            UpdateSpinnerThrottled(statusCtx, streamSw, charsStreamed, ref lastSpinnerUpdate);
                             break;
 
                         case ChatChunk.Usage u:
@@ -194,15 +213,18 @@ public sealed class AgentLoop
 
             if (_richConsole is not null)
             {
+                // Spectre's Status() can periodically refresh the label without us repainting —
+                // we still call ctx.Status(...) on each chunk so the elapsed counter advances
+                // visibly even between text deltas.
                 await _richConsole.Status()
                     .Spinner(Spinner.Known.Dots)
                     .SpinnerStyle(new Style(BrandCyan))
-                    .StartAsync($"[{Hex(BrandCyan)}]thinking[/]", async _ => await ConsumeStreamAsync())
+                    .StartAsync(BuildSpinnerLabel(TimeSpan.Zero, 0), async ctx => await ConsumeStreamAsync(ctx))
                     .ConfigureAwait(false);
             }
             else
             {
-                await ConsumeStreamAsync().ConfigureAwait(false);
+                await ConsumeStreamAsync(null).ConfigureAwait(false);
             }
 
             if (turnPromptTokens is int p && turnCompletionTokens is int c)
@@ -540,6 +562,49 @@ public sealed class AgentLoop
         s.Length <= max ? s : string.Concat(s.AsSpan(0, max), "…");
 
     private static string Hex(Color c) => $"#{c.R:X2}{c.G:X2}{c.B:X2}";
+
+    /// <summary>
+    /// Build the live spinner label: <c>thinking (3m 39s · ↓ 11.3k tokens)</c>. Tokens are
+    /// approximated as chars/4, the conventional rule-of-thumb that's fine for English/code;
+    /// servers don't send incremental usage so this is the best signal we can show before the
+    /// final Usage chunk arrives. We still display the *real* prompt/completion totals after
+    /// the turn ends via the existing /context output and the observer's OnFinal.
+    /// </summary>
+    private static string BuildSpinnerLabel(TimeSpan elapsed, int charsStreamed)
+    {
+        var seconds = (int)elapsed.TotalSeconds;
+        string time;
+        if (seconds < 60) time = $"{seconds}s";
+        else if (seconds < 3600) time = $"{seconds / 60}m {seconds % 60}s";
+        else time = $"{seconds / 3600}h {(seconds % 3600) / 60}m";
+
+        var approxTokens = charsStreamed / 4;
+        string tokens;
+        if (approxTokens < 1_000) tokens = approxTokens.ToString();
+        else if (approxTokens < 1_000_000) tokens = $"{approxTokens / 1000.0:F1}k";
+        else tokens = $"{approxTokens / 1_000_000.0:F1}M";
+
+        return $"[{Hex(BrandCyan)}]thinking[/] " +
+               $"[{Hex(MuteText)}]({time} · ↓ {tokens} tokens)[/]";
+    }
+
+    /// <summary>
+    /// Throttle spinner-label redraws to ~10 per second. Without throttling, a fast model
+    /// streaming 50+ chunks/sec would Status() faster than Spectre can repaint and we'd see
+    /// flicker / wasted work. The throttle is per-turn (lastUpdate is reset by the caller).
+    /// </summary>
+    private static void UpdateSpinnerThrottled(
+        StatusContext? statusCtx,
+        System.Diagnostics.Stopwatch sw,
+        int charsStreamed,
+        ref TimeSpan lastUpdate)
+    {
+        if (statusCtx is null) return;
+        var now = sw.Elapsed;
+        if (now - lastUpdate < TimeSpan.FromMilliseconds(100)) return;
+        lastUpdate = now;
+        statusCtx.Status(BuildSpinnerLabel(now, charsStreamed));
+    }
 
     internal static string BuildXmlSystemPrompt(string baseSystem, ImmutableArray<ToolSchema> schemas)
     {

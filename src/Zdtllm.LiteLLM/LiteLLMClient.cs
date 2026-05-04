@@ -188,6 +188,16 @@ public sealed class LiteLLMClient
             {
                 lastException = ex;
             }
+            catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
+            {
+                // FINAL attempt timed out via HttpClient.Timeout (NOT via the user's CT). If we
+                // didn't catch this, the raw TaskCanceledException would propagate up — being
+                // an OperationCanceledException, the Repl would treat it as user cancellation
+                // and print "(turn cancelled)" with no signal of what really happened. Capture
+                // it so the loop falls through to the LiteLLMException wrap below.
+                lastException = ex;
+                break;
+            }
         }
 
         throw new LiteLLMException(

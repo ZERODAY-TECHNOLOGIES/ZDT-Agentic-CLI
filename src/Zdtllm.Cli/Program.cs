@@ -27,6 +27,17 @@ internal static class Program
             Console.OutputEncoding = System.Text.Encoding.UTF8;
             return await RunAsync(args).ConfigureAwait(false);
         }
+        catch (OperationCanceledException ex) when (ex is TaskCanceledException && !IsUserCancellation(ex))
+        {
+            // HttpClient.Timeout-derived OCE that didn't originate from our CT chain. Print a
+            // diagnostic message so users can fix their timeoutSeconds instead of seeing the
+            // misleading "zdt: cancelled." that suggests they pressed Ctrl+C.
+            await Console.Error.WriteLineAsync(
+                $"zdt: request timed out (HttpClient.Timeout). " +
+                $"Remove litellm.timeoutSeconds from settings.json or raise it. " +
+                $"[{ex.GetType().Name}: {ex.Message}]").ConfigureAwait(false);
+            return 124; // POSIX timeout exit code
+        }
         catch (OperationCanceledException)
         {
             await Console.Error.WriteLineAsync("zdt: cancelled.").ConfigureAwait(false);
@@ -38,6 +49,15 @@ internal static class Program
             return 1;
         }
     }
+
+    /// <summary>
+    /// Best-effort heuristic: was the OperationCanceledException triggered by a CT we own
+    /// (Ctrl+C / programCts) versus an HttpClient internal timeout? If the OCE's token has
+    /// IsCancellationRequested, it was a genuine cancellation; if not, the cancellation
+    /// fired from the HttpClient.Timeout path which creates its own internal CTS.
+    /// </summary>
+    private static bool IsUserCancellation(OperationCanceledException ex) =>
+        ex.CancellationToken.IsCancellationRequested;
 
     private static async Task<int> RunAsync(string[] args)
     {
@@ -71,10 +91,17 @@ internal static class Program
                 "litellm.baseUrl is still not configured. Run `zdt` interactively (no -p) to launch " +
                 "the setup wizard, or edit ~/.zdtllm/settings.json by hand.");
 
-        using var http = new HttpClient
-        {
-            Timeout = TimeSpan.FromSeconds(settings.LiteLLM.TimeoutSeconds ?? 120),
-        };
+        // Default to InfiniteTimeSpan: an agentic CLI legitimately waits many minutes for the
+        // model to produce a complex first chunk, especially with XML mode + a large system
+        // prompt. The previous 120 s default surfaced as a confusing "(turn cancelled)" after
+        // ~8 min of HttpClient.Timeout firing across MaxRetries+1 attempts. Cancellation flows
+        // through the agent's CT chain (Ctrl+C → CancelCurrentTurn) instead.
+        // GetModelInfoAsync wraps its own 10 s CTS so this doesn't make /model/info hang.
+        var configuredTimeout = settings.LiteLLM.TimeoutSeconds;
+        var httpTimeout = configuredTimeout is null or <= 0
+            ? Timeout.InfiniteTimeSpan
+            : TimeSpan.FromSeconds(configuredTimeout.Value);
+        using var http = new HttpClient { Timeout = httpTimeout };
         var client = new LiteLLMClient(http, new LiteLLMClientOptions
         {
             BaseUrl = settings.LiteLLM.BaseUrl!,

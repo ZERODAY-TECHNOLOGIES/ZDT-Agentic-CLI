@@ -130,9 +130,23 @@ public sealed class Repl
         {
             await _agent.RunTurnAsync(_session, prompt, _output, _error, turnCts.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (turnCts.IsCancellationRequested)
         {
+            // Our CT chain is what fired — i.e. user pressed Ctrl+C and CancelCurrentTurn ran,
+            // or the program-level CT was cancelled. This is the genuine "user cancelled" path.
             await _error.WriteLineAsync(Palette.Mute("(turn cancelled)")).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex)
+        {
+            // OCE that ISN'T our CT — almost always an HttpClient.Timeout firing on the LLM
+            // call. Surface this as a real error rather than masquerading as user cancellation,
+            // so the user can spot misconfigured timeouts instead of staring at a confusing
+            // "(turn cancelled)" they didn't trigger.
+            await _error.WriteLineAsync(
+                Palette.Red("zdt: turn aborted — request timed out (HttpClient.Timeout). ") +
+                Palette.Mute("Set litellm.timeoutSeconds in settings.json (or remove it for no timeout). " +
+                            $"[{ex.GetType().Name}: {ex.Message}]"))
+                .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
