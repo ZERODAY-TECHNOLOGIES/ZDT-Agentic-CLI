@@ -150,31 +150,48 @@ internal static class SelfUpdate
 
     private static int SpawnDetachedWindowsInstaller()
     {
-        // The bootstrap waits 2 s, then re-runs install.ps1 from main. Cache-bust on the
-        // raw URL so a CDN copy doesn't serve a stale script. Read-Host at the end keeps the
-        // window visible so the user can see "✓ checksum verified" / banner instead of it
-        // flashing closed.
-        var bootstrap = $@"
+        // We write the bootstrap to a temp .ps1 file and launch it via `-File <path>` instead of
+        // `-Command "<inline>"`. The inline form requires escaping every embedded quote through
+        // both C# and Win32 CommandLineToArgvW conventions; mismatches there silently nuke the
+        // script and leave the user staring at an empty cmd window. -File reads the script as-is
+        // and is the recommended path for non-trivial bootstraps.
+        //
+        // The bootstrap waits 2 s for our zdt.exe lock to drop, runs install.ps1, prints status,
+        // self-deletes its .ps1, and pauses for the user before closing so they can read the
+        // banner instead of seeing the window flash closed.
+        var scriptPath = Path.Combine(Path.GetTempPath(), $"zdt-self-update-{Guid.NewGuid():N}.ps1");
+        var bootstrap = $$"""
 $ErrorActionPreference = 'Stop'
+$selfPath = $MyInvocation.MyCommand.Path
 Start-Sleep -Seconds 2
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $cb = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-try {{
-    $script = Invoke-RestMethod ""{PoshInstallUrl}?cb=$cb""
+try {
+    $script = Invoke-RestMethod "{{PoshInstallUrl}}?cb=$cb"
     Invoke-Expression $script
-}} catch {{
-    Write-Host ""✗ self-update failed: $($_.Exception.Message)"" -ForegroundColor Red
-}}
-Write-Host """"
-Write-Host ""Press Enter to close this window.""
+} catch {
+    Write-Host "✗ self-update failed: $($_.Exception.Message)" -ForegroundColor Red
+}
+Write-Host ""
+Write-Host "Press Enter to close this window."
 Read-Host | Out-Null
-";
+try { Remove-Item -Force $selfPath -ErrorAction SilentlyContinue } catch { }
+""";
+
+        try
+        {
+            File.WriteAllText(scriptPath, bootstrap);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"zdt: failed to write bootstrap script: {ex.Message}");
+            return 1;
+        }
 
         var psi = new ProcessStartInfo
         {
             FileName = "powershell.exe",
-            // -NoProfile keeps the bootstrap clean; -Command runs the inline script.
-            Arguments = $"-NoProfile -ExecutionPolicy Bypass -Command \"{bootstrap.Replace("\"", "\\\"")}\"",
+            Arguments = $"-NoProfile -ExecutionPolicy Bypass -File \"{scriptPath}\"",
             // UseShellExecute=true on Windows opens a new console window for the spawn,
             // which is what we want — we're about to exit, and the user needs somewhere
             // to see the install output.
@@ -189,6 +206,7 @@ Read-Host | Out-Null
         catch (Exception ex)
         {
             Console.Error.WriteLine($"zdt: failed to launch installer: {ex.Message}");
+            try { File.Delete(scriptPath); } catch { /* swallow */ }
             return 1;
         }
 
