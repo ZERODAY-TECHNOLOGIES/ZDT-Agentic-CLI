@@ -46,6 +46,11 @@ internal static class Program
         if (parsed.ShowVersion) { PrintVersion(); return 0; }
         if (parsed.ShowHelp) { PrintHelp(); return 0; }
 
+        // Both update flags short-circuit before settings/wizard — they don't touch LiteLLM
+        // and shouldn't fail just because the user hasn't configured the proxy yet.
+        if (parsed.CheckUpdates) return await SelfUpdate.RunCheckUpdatesAsync().ConfigureAwait(false);
+        if (parsed.SelfUpdate)   return await SelfUpdate.RunSelfUpdateAsync().ConfigureAwait(false);
+
         if (parsed.PrintMode && string.IsNullOrWhiteSpace(parsed.Query))
         {
             await Console.Error.WriteLineAsync("zdt -p requires a query.").ConfigureAwait(false);
@@ -660,6 +665,12 @@ internal static class Program
                 case "--version":
                     result.ShowVersion = true;
                     break;
+                case "--check-updates":
+                    result.CheckUpdates = true;
+                    break;
+                case "--self-update":
+                    result.SelfUpdate = true;
+                    break;
                 case "-h":
                 case "--help":
                     result.ShowHelp = true;
@@ -720,6 +731,8 @@ internal static class Program
         Console.WriteLine("  -c, --continue                 resume the most recent session for this directory");
         Console.WriteLine("  -r, --resume <uuid>            resume the specified session");
         Console.WriteLine("  --version                      print version and exit");
+        Console.WriteLine("  --check-updates                check GitHub for a newer release and exit");
+        Console.WriteLine("  --self-update                  download + install the latest release in place");
         Console.WriteLine("  -h, --help                     show this help");
         Console.WriteLine();
         Console.WriteLine($"More at {Url}");
@@ -749,6 +762,8 @@ internal static class Program
         public List<string> AllowedTools { get; } = new();
         public bool ShowVersion { get; set; }
         public bool ShowHelp { get; set; }
+        public bool CheckUpdates { get; set; }
+        public bool SelfUpdate { get; set; }
         public string? Query { get; set; }
     }
 }

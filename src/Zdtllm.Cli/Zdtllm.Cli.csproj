@@ -23,4 +23,8 @@
     <ProjectReference Include="..\Zdtllm.Mcp\Zdtllm.Mcp.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Zdtllm.Core.Tests" />
+  </ItemGroup>
+
 </Project>
