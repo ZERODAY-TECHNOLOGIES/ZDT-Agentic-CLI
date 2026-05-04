@@ -1,0 +1,23 @@
+# Pin line endings on files where the shell / parser is line-ending sensitive.
+# Without this, Git's autocrlf would store them as LF in the repo but check them
+# out as CRLF on Windows, and any user who curl-piped install.sh on Linux from a
+# Windows clone would hit `bash: bad interpreter` failures.
+
+*.sh        text eol=lf
+*.bash      text eol=lf
+*.ps1       text eol=crlf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+
+# C# / project files — leave to autocrlf default (works on every host).
+*.cs        text
+*.csproj    text
+*.sln       text
+*.json      text
+*.md        text
+
+# Binary or archive — never normalise.
+*.png       binary
+*.jpg       binary
+*.zip       binary
+*.tar.gz    binary

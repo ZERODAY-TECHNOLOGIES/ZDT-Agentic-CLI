@@ -18,12 +18,35 @@ your own LiteLLM proxy and your own models.
 
 The binary is `zdt`.
 
-## Status
+## Install
 
-This repository is in **Phase 1**: scaffold and end-to-end agent loop. Today the
-CLI exposes a single mode — `zdt -p "<query>"` — wired to `Read` and `Bash` tools.
-Sessions, the interactive REPL, slash commands, skills, the rest of the tool
-catalog, and context compaction all land in subsequent phases.
+Self-contained binaries — no .NET runtime required.
+
+**Linux / macOS:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ZERODAY-TECHNOLOGIES/ZDT-Agentic-CLI/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/ZERODAY-TECHNOLOGIES/ZDT-Agentic-CLI/main/install.ps1 | iex
+```
+
+The installer downloads the binary for your OS + arch, verifies its SHA256, drops
+it into `~/.zdtllm/bin` (Linux/macOS) or `%LOCALAPPDATA%\zdtllm\bin` (Windows), and
+adds the directory to your shell PATH. After install:
+
+- Open a new terminal *or* re-source your shell rc (`source ~/.zshrc`, `source ~/.bashrc`,
+  or on PowerShell `$env:Path = [Environment]::GetEnvironmentVariable('Path','User')`).
+- Run `zdt` for the first-run setup wizard, or `zdt --help` for all flags.
+
+Pin a specific version: append `-s -- --version v0.1.0` (bash) or `-Version v0.1.0`
+(PowerShell). Uninstall: `--uninstall` / `-Uninstall`.
+
+Supported targets: `linux-x64`, `linux-arm64`, `osx-x64`, `osx-arm64`, `win-x64`,
+`win-arm64`.
 
 ## Configure
 
@@ -57,15 +80,19 @@ the environment at load time.
 
 ## Run
 
+After install:
+
+```bash
+zdt                                                  # interactive REPL (first run launches the setup wizard)
+zdt -p "Read README.md and tell me what it contains" # one-shot, non-interactive
+zdt --help                                           # full flag list
+```
+
+From source (`dotnet` SDK 9.0+ required):
+
 ```bash
 dotnet build
 dotnet run --project src/Zdtllm.Cli -- -p "Read README.md and tell me what it contains"
-```
-
-Or after `dotnet publish`:
-
-```bash
-zdt -p "Read README.md and tell me what it contains"
 ```
 
 ## License
