@@ -434,6 +434,229 @@ public sealed class AgentLoopObserverIntegrationTests
     }
 
     [Fact]
+    public async Task Stream_json_emits_terminal_result_event_when_run_ends_on_empty_completion()
+    {
+        // Regression: GLM-5.1 / Ollama-Cloud sometimes finish a run by emitting a stream with
+        // no content delta and no tool_calls — just `finish_reason:"stop"` and [DONE]. Before
+        // the fix the agent loop took the "no tool calls -> exit" branch but the trailing
+        // assistant + result events never made it to disk: stream.ndjson stopped right after
+        // the previous (tool-bearing) iteration. AppSec-Automator and any other consumer that
+        // waits for {"type":"result"} would block / time out on otherwise-successful runs.
+        //
+        // Round 1: model emits a tool call (this works today). Round 2: stream is content-less
+        // (a single finish_reason:stop chunk) — this is the case the regression covers.
+        var round1 =
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[" +
+                "{\"index\":0,\"id\":\"c1\",\"type\":\"function\"," +
+                "\"function\":{\"name\":\"Echo\",\"arguments\":\"{\\\"text\\\":\\\"hi\\\"}\"}}]}}]}\n\n" +
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n" +
+            "data: [DONE]\n\n";
+        var round2_empty =
+            "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n" +
+            "data: [DONE]\n\n";
+
+        var handler = new StubHandler(Sse(round1), Sse(round2_empty));
+        var http = new HttpClient(handler);
+        var client = new LiteLLMClient(http, new LiteLLMClientOptions
+        {
+            BaseUrl = "http://stub", ApiKey = "k", MaxRetries = 0,
+            InitialBackoff = TimeSpan.FromMilliseconds(1),
+        });
+
+        var registry = new ToolRegistry();
+        registry.Register(new EchoTool());
+
+        var sw = new StringWriter();
+        IAgentObserver observer = new StreamJsonObserver(sw);
+
+        var agent = new AgentLoop(
+            client, registry, PermissionRuleSet.Empty,
+            new AgentLoopOptions { Model = "test-model", MaxTurns = 5 },
+            observer: observer);
+
+        using var session = Session.NewEphemeral("test-model");
+        await agent.RunTurnAsync(session, "go", new StringWriter(), new StringWriter());
+
+        var events = sw.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => JsonDocument.Parse(line).RootElement.Clone())
+            .ToList();
+
+        // Two assistant frames (turn 1 with tool_use; turn 2 empty-content) plus the result.
+        events.Select(e => e.GetProperty("type").GetString()).Should().Equal(
+            "assistant", "assistant", "result");
+
+        // Turn 2's assistant frame: empty content array, no text, no tool_use.
+        var turn2Content = events[1].GetProperty("message").GetProperty("content");
+        turn2Content.GetArrayLength().Should().Be(0);
+
+        // The terminal result event that was missing pre-fix. subtype=success, stop_reason=
+        // end_turn (we treat any no-tool-calls completion as a clean turn-ending — the loop
+        // doesn't differentiate empty vs non-empty text).
+        var result = events[2];
+        result.GetProperty("subtype").GetString().Should().Be("success");
+        result.GetProperty("is_error").GetBoolean().Should().BeFalse();
+        result.GetProperty("num_turns").GetInt32().Should().Be(2);
+        result.GetProperty("stop_reason").GetString().Should().Be("end_turn");
+    }
+
+    [Fact]
+    public async Task Stream_json_terminal_result_event_is_emitted_after_many_tool_turns_followed_by_empty_completion()
+    {
+        // Production repro: GLM-5.1 ran a 90-min Network Pentest, emitted 37 tool-bearing
+        // turns, then turn 38 came back with finish_reason:"stop" and zero content. The run
+        // exited cleanly (exit code 0) but the stream.ndjson file ended at frame 37 with no
+        // {"type":"result"} terminal event. AppSec-Automator's StreamJsonResult.php waits
+        // for that terminal event and would record the engagement as "no_result" / "engine
+        // exited before emitting a final result".
+        //
+        // Reproduce with 10 tool-bearing rounds + 1 empty closer. We're chasing whether high
+        // turn counts shift any state that swallows the terminal emit (reused HttpClient,
+        // session message accumulator size, etc.) — the 2-turn variant above passes.
+        var responses = new List<HttpResponseMessage>();
+        const int toolRounds = 10;
+        for (var i = 0; i < toolRounds; i++)
+        {
+            responses.Add(Sse(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[" +
+                    $"{{\"index\":0,\"id\":\"c{i}\",\"type\":\"function\"," +
+                    $"\"function\":{{\"name\":\"Echo\",\"arguments\":\"{{\\\"text\\\":\\\"hi{i}\\\"}}\"}}}}]}}}}]}}\n\n" +
+                "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n" +
+                "data: [DONE]\n\n"));
+        }
+        responses.Add(Sse(
+            "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n" +
+            "data: [DONE]\n\n"));
+
+        var handler = new StubHandler(responses.ToArray());
+        var http = new HttpClient(handler);
+        var client = new LiteLLMClient(http, new LiteLLMClientOptions
+        {
+            BaseUrl = "http://stub", ApiKey = "k", MaxRetries = 0,
+            InitialBackoff = TimeSpan.FromMilliseconds(1),
+        });
+
+        var registry = new ToolRegistry();
+        registry.Register(new EchoTool());
+
+        var sw = new StringWriter();
+        IAgentObserver observer = new StreamJsonObserver(sw);
+
+        var agent = new AgentLoop(
+            client, registry, PermissionRuleSet.Empty,
+            new AgentLoopOptions { Model = "test-model", MaxTurns = toolRounds + 5 },
+            observer: observer);
+
+        using var session = Session.NewEphemeral("test-model");
+        await agent.RunTurnAsync(session, "go", new StringWriter(), new StringWriter());
+
+        var events = sw.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => JsonDocument.Parse(line).RootElement.Clone())
+            .ToList();
+
+        // Expect 11 assistant frames (10 tool rounds + 1 empty closer) + 1 terminal result.
+        events.Count.Should().Be(toolRounds + 2);
+        events.Last().GetProperty("type").GetString().Should().Be("result");
+        events.Last().GetProperty("subtype").GetString().Should().Be("success");
+        events.Last().GetProperty("num_turns").GetInt32().Should().Be(toolRounds + 1);
+    }
+
+    [Fact]
+    public async Task Stream_json_emits_terminal_result_event_with_cancelled_stop_reason_when_run_is_cancelled()
+    {
+        // Regression: when zdt is cancelled mid-stream — Ctrl+C, SIGTERM (zdt now hooks
+        // PosixSignalRegistration so `timeout` / k8s kill don't drop the terminal frame),
+        // or any orchestrator-initiated cancellation — the AgentLoop's catch
+        // (OperationCanceledException) branch is responsible for writing exactly one
+        // terminal {"type":"result","stop_reason":"cancelled"} stream-json event before
+        // rethrowing. AppSec-Automator parses that to mark the engagement as cancelled
+        // (vs "no_result" — engine exited mid-action). Pin it with a real cancellation.
+        //
+        // We cancel between turn 1 (tool call) and turn 2 (would be the model's follow-up)
+        // by using a CancellationTokenSource that the test cancels as soon as the LLM
+        // request for round 2 is made.
+        var round1 =
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[" +
+                "{\"index\":0,\"id\":\"c1\",\"type\":\"function\"," +
+                "\"function\":{\"name\":\"Echo\",\"arguments\":\"{\\\"text\\\":\\\"hi\\\"}\"}}]}}]}\n\n" +
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n" +
+            "data: [DONE]\n\n";
+
+        // Round 2 hangs forever — simulates an in-flight LLM call that gets cancelled.
+        var infiniteResponses = new HttpResponseMessage[]
+        {
+            Sse(round1),
+            new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StreamContent(new HangingStream()),
+            },
+        };
+        infiniteResponses[1].Content.Headers.ContentType =
+            new System.Net.Http.Headers.MediaTypeHeaderValue("text/event-stream");
+
+        var handler = new StubHandler(infiniteResponses);
+        var http = new HttpClient(handler);
+        var client = new LiteLLMClient(http, new LiteLLMClientOptions
+        {
+            BaseUrl = "http://stub", ApiKey = "k", MaxRetries = 0,
+            InitialBackoff = TimeSpan.FromMilliseconds(1),
+        });
+
+        var registry = new ToolRegistry();
+        registry.Register(new EchoTool());
+
+        var sw = new StringWriter();
+        IAgentObserver observer = new StreamJsonObserver(sw);
+
+        var agent = new AgentLoop(
+            client, registry, PermissionRuleSet.Empty,
+            new AgentLoopOptions { Model = "test-model", MaxTurns = 5 },
+            observer: observer);
+
+        using var session = Session.NewEphemeral("test-model");
+        using var cts = new CancellationTokenSource();
+
+        // Cancel after the first round's tool result is processed but before the second
+        // round can produce any output. 200 ms is generous — round 1 completes near-instantly.
+        cts.CancelAfter(TimeSpan.FromMilliseconds(200));
+
+        var run = agent.RunTurnAsync(session, "go", new StringWriter(), new StringWriter(), cts.Token);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+
+        var events = sw.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => JsonDocument.Parse(line).RootElement.Clone())
+            .ToList();
+
+        // The very last event must be the terminal result, even though the run was killed.
+        var result = events.Last();
+        result.GetProperty("type").GetString().Should().Be("result");
+        result.GetProperty("subtype").GetString().Should().Be("error_during_execution");
+        result.GetProperty("is_error").GetBoolean().Should().BeTrue();
+        result.GetProperty("stop_reason").GetString().Should().Be("cancelled");
+    }
+
+    /// <summary>HTTP stream that blocks forever on read. Used to simulate an in-flight LLM call
+    /// that the agent loop cancels mid-stream.</summary>
+    private sealed class HangingStream : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => 0; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) =>
+            throw new NotSupportedException();
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct)
+        {
+            await Task.Delay(Timeout.Infinite, ct).ConfigureAwait(false);
+            return 0; // unreachable — Task.Delay throws on cancellation
+        }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    [Fact]
     public void Tools_allowlist_drops_non_listed_tools_from_registry()
     {
         var registry = new ToolRegistry();

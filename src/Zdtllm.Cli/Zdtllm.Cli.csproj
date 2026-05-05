@@ -6,7 +6,7 @@
     <AssemblyName>zdt</AssemblyName>
     <!-- Default dev-build version. The release workflow overrides this with the
          git tag (without the leading 'v') via -p:Version=0.1.0 at publish time. -->
-    <Version>0.2.7</Version>
+    <Version>0.2.8</Version>
   </PropertyGroup>
 
   <ItemGroup>

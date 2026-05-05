@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.InteropServices;
 using Spectre.Console;
 using Zdtllm.Config;
 using Zdtllm.Core;
@@ -243,15 +244,45 @@ internal static class Program
         if (parsed.PrintMode)
         {
             Console.CancelKeyPress += (_, e) => { e.Cancel = true; programCts.Cancel(); };
+
+            // Hook SIGTERM (and SIGQUIT/SIGHUP where applicable) the same way as Ctrl+C —
+            // cancel programCts and let AgentLoop's catch (OperationCanceledException) branch
+            // emit the terminal {"type":"result","stop_reason":"cancelled"} stream-json event
+            // before the process exits. Without this, `timeout` / `kill <pid>` / k8s SIGTERM
+            // tear the process down mid-stream, the trailing result event never makes it to
+            // disk, and consumers like AppSec-Automator's StreamJsonResult.php record the run
+            // as "no_result" (engine exited before emitting a final result event) even though
+            // the run actually had useful work to report.
+            //
+            // PosixSignalRegistration accepts the same SIGTERM constant on Windows in .NET 6+,
+            // routed through the console control handler. SIGINT/Ctrl+Break already go through
+            // the CancelKeyPress path, so we deliberately don't double-subscribe SIGINT here.
+            void OnSignal(PosixSignalContext ctx) { ctx.Cancel = true; programCts.Cancel(); }
+            using var sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, OnSignal);
+            using var sighup  = PosixSignalRegistration.Create(PosixSignal.SIGHUP,  OnSignal);
+            using var sigquit = PosixSignalRegistration.Create(PosixSignal.SIGQUIT, OnSignal);
+
             // For json / stream-json the model's text goes through the observer; AgentLoop's
             // own output writer must be muted so the same text doesn't double-print to stdout.
             var loopOutput = formatOwnsStdout ? TextWriter.Null : Console.Out;
-            await agent.RunTurnAsync(
-                session,
-                parsed.Query!,
-                output: loopOutput,
-                status: Console.Error,
-                ct: programCts.Token).ConfigureAwait(false);
+            try
+            {
+                await agent.RunTurnAsync(
+                    session,
+                    parsed.Query!,
+                    output: loopOutput,
+                    status: Console.Error,
+                    ct: programCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (programCts.IsCancellationRequested)
+            {
+                // The agent loop has already emitted a terminal result event with
+                // stop_reason="cancelled" via its catch (OperationCanceledException) branch.
+                // Surface a non-zero exit so callers know it didn't run to completion (130 =
+                // POSIX SIGINT convention; we don't try to distinguish SIGTERM here since the
+                // shape of the result event already records cancellation).
+                return 130;
+            }
 
             if (aggregator is not null)
                 await aggregator.EmitAsync(Console.Out, programCts.Token).ConfigureAwait(false);
