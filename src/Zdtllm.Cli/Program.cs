@@ -219,8 +219,9 @@ internal static class Program
         var subagentRunner = new SubagentRunner(agent);
         var modelAliases = settings.LiteLLM.Models;
         var subagentOverrides = settings.LiteLLM.SubagentModels;
+        var smallFastModel = settings.LiteLLM.SmallFastModel;
         Func<string, string?, string?> tieredModelResolver = (subagentType, _parent) =>
-            SubagentModelResolver.Resolve(subagentType, modelAliases, subagentOverrides);
+            SubagentModelResolver.Resolve(subagentType, modelAliases, subagentOverrides, smallFastModel);
         registry.Register(new TaskTool(subagentRunner, tieredModelResolver));
 
         // --tools filter: applied last so it can drop builtins, MCP tools, and Task uniformly.
@@ -742,6 +743,12 @@ internal static class Program
         Console.WriteLine("  --check-updates                check GitHub for a newer release and exit");
         Console.WriteLine("  --self-update                  download + install the latest release in place");
         Console.WriteLine("  -h, --help                     show this help");
+        Console.WriteLine();
+        Console.WriteLine("ENV:");
+        Console.WriteLine("  ZDT_DEFAULT_HEAVY_MODEL        model id for the 'heavy' tier (overrides litellm.models.heavy)");
+        Console.WriteLine("  ZDT_DEFAULT_MEDIUM_MODEL       model id for the 'medium' tier (overrides litellm.models.medium)");
+        Console.WriteLine("  ZDT_DEFAULT_LIGHT_MODEL        model id for the 'light' tier (overrides litellm.models.light)");
+        Console.WriteLine("  ZDT_SMALL_FAST_MODEL           default model for read-only subagents (code-reviewer, explore)");
         Console.WriteLine();
         Console.WriteLine($"More at {Url}");
     }

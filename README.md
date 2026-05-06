@@ -88,6 +88,24 @@ Agent tool) to a different model than the parent. The defaults are `code-reviewe
 including `general-purpose`, inherit the parent's current model. Override with an alias
 from `models` or with a literal model id.
 
+### Env vars
+
+Four env vars override settings.json at runtime — same role as claude-cli's
+`ANTHROPIC_*_MODEL` knobs, but the var names use zdt's canonical tier vocabulary
+(`light`/`medium`/`heavy`) so there's one naming convention across settings, CLI flags,
+and env:
+
+| env var                    | effect                                                                         |
+| -------------------------- | ------------------------------------------------------------------------------ |
+| `ZDT_DEFAULT_HEAVY_MODEL`  | overrides `litellm.models.heavy`                                                |
+| `ZDT_DEFAULT_MEDIUM_MODEL` | overrides `litellm.models.medium`                                               |
+| `ZDT_DEFAULT_LIGHT_MODEL`  | overrides `litellm.models.light`                                                |
+| `ZDT_SMALL_FAST_MODEL`     | default model for read-only subagents (`code-reviewer`, `explore`)              |
+
+The env layer wins over committed settings.json so a runtime `export` always pins the
+model. `ZDT_SMALL_FAST_MODEL` only applies when `subagentModels` hasn't already pinned
+the relevant subagent type explicitly.
+
 ## Run
 
 After install:

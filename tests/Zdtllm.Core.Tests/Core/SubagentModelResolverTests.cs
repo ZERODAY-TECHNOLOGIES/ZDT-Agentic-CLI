@@ -122,4 +122,71 @@ public sealed class SubagentModelResolverTests
 
         result.Should().Be("qwen-fast");
     }
+
+    [Fact]
+    public void Small_fast_model_takes_precedence_over_builtin_default_for_code_reviewer()
+    {
+        // ZDT_SMALL_FAST_MODEL=foo with no subagentModels override — code-reviewer should
+        // route to foo, not to the "light" tier from Models.
+        var aliases = Aliases(("light", "qwen-fast"), ("medium", "qwen-mid"));
+        var overrides = ImmutableDictionary<string, string>.Empty;
+
+        var result = SubagentModelResolver.Resolve(
+            "code-reviewer", aliases, overrides, smallFastModel: "small-fast-pin");
+
+        result.Should().Be("small-fast-pin");
+    }
+
+    [Fact]
+    public void Small_fast_model_also_applies_to_explore()
+    {
+        var aliases = Aliases(("light", "qwen-fast"));
+        var overrides = ImmutableDictionary<string, string>.Empty;
+
+        var result = SubagentModelResolver.Resolve(
+            "explore", aliases, overrides, smallFastModel: "small-fast-pin");
+
+        result.Should().Be("small-fast-pin");
+    }
+
+    [Fact]
+    public void Small_fast_model_does_not_apply_to_general_purpose()
+    {
+        // general-purpose is not a "fast subagent" — ZDT_SMALL_FAST_MODEL must not affect it.
+        var aliases = Aliases(("light", "qwen-fast"));
+        var overrides = ImmutableDictionary<string, string>.Empty;
+
+        var result = SubagentModelResolver.Resolve(
+            "general-purpose", aliases, overrides, smallFastModel: "small-fast-pin");
+
+        result.Should().BeNull();
+    }
+
+    [Fact]
+    public void Explicit_subagent_override_still_wins_over_small_fast_env()
+    {
+        // The user explicitly pinned code-reviewer to medium in settings — that beats the
+        // ZDT_SMALL_FAST_MODEL env var (env can't override an explicit user choice).
+        var aliases = Aliases(("light", "qwen-fast"), ("medium", "qwen-mid"));
+        var overrides = Aliases(("code-reviewer", "medium"));
+
+        var result = SubagentModelResolver.Resolve(
+            "code-reviewer", aliases, overrides, smallFastModel: "should-not-win");
+
+        result.Should().Be("qwen-mid");
+    }
+
+    [Fact]
+    public void Small_fast_value_is_alias_expanded_through_models_map()
+    {
+        // ZDT_SMALL_FAST_MODEL=light should resolve through the Models map instead of being
+        // sent to LiteLLM as the literal string "light".
+        var aliases = Aliases(("light", "qwen-fast"));
+        var overrides = ImmutableDictionary<string, string>.Empty;
+
+        var result = SubagentModelResolver.Resolve(
+            "code-reviewer", aliases, overrides, smallFastModel: "light");
+
+        result.Should().Be("qwen-fast");
+    }
 }

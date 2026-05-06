@@ -14,10 +14,15 @@ namespace Zdtllm.Core;
 ///      be either a tier alias from <c>litellm.models</c> (preferred — keeps the model id
 ///      in one place) or a literal model id (escape hatch when a subagent needs something
 ///      that's not in the alias map).
-///   2. Built-in default for the type — <c>code-reviewer</c> and <c>explore</c> default to
+///   2. <c>smallFastModel</c> — populated from the <c>ZDT_SMALL_FAST_MODEL</c> env var (the
+///      zdt rename of claude-cli's <c>ANTHROPIC_SMALL_FAST_MODEL</c>). Applies ONLY to the
+///      "small/fast" subagent profiles (<c>code-reviewer</c>, <c>explore</c>) — those that
+///      claude-cli internally dispatches on the haiku tier. <c>general-purpose</c> and any
+///      custom type ignore this layer because they aren't conceptually "fast subagents".
+///   3. Built-in default for the type — <c>code-reviewer</c> and <c>explore</c> default to
 ///      the <c>light</c> alias (they're meant to be cheap, parallel, and read-only). All
 ///      other types — including <c>general-purpose</c> — default to inheriting the parent.
-///   3. Returns <c>null</c> — meaning "no tier override, inherit the parent's model". The
+///   4. Returns <c>null</c> — meaning "no tier override, inherit the parent's model". The
 ///      caller is responsible for falling back; the resolver explicitly does NOT return the
 ///      parent model so callers can distinguish "no override" from "override happens to
 ///      match parent" (the second case still needs explicit pinning so a /model switch on
@@ -38,6 +43,10 @@ public static class SubagentModelResolver
             // general-purpose intentionally absent → fall through to parent inheritance.
         });
 
+    /// <summary>Subagent types that the <c>ZDT_SMALL_FAST_MODEL</c> env var applies to.</summary>
+    private static readonly HashSet<string> SmallFastEligibleTypes =
+        new(StringComparer.Ordinal) { "code-reviewer", "explore" };
+
     /// <summary>
     /// Pick the model id to run a subagent of <paramref name="subagentType"/> on, or null
     /// if no tier override applies (caller inherits the parent's model in that case).
@@ -45,10 +54,12 @@ public static class SubagentModelResolver
     /// <param name="subagentType">The <c>subagent_type</c> the parent requested via the Agent tool.</param>
     /// <param name="modelAliases">The <c>litellm.models</c> alias map (alias → model id).</param>
     /// <param name="subagentOverrides">The <c>litellm.subagentModels</c> map (subagent_type → alias|model id).</param>
+    /// <param name="smallFastModel">Optional model id from <c>ZDT_SMALL_FAST_MODEL</c>; applies to fast subagents only.</param>
     public static string? Resolve(
         string subagentType,
         IReadOnlyDictionary<string, string> modelAliases,
-        IReadOnlyDictionary<string, string> subagentOverrides)
+        IReadOnlyDictionary<string, string> subagentOverrides,
+        string? smallFastModel = null)
     {
         ArgumentNullException.ThrowIfNull(subagentType);
         ArgumentNullException.ThrowIfNull(modelAliases);
@@ -61,7 +72,16 @@ public static class SubagentModelResolver
             return ExpandAliasOrLiteral(overrideValue, modelAliases);
         }
 
-        // (2) built-in default — only kicks in when the alias actually resolves to a model.
+        // (2) ZDT_SMALL_FAST_MODEL — only for fast subagent profiles. The env var is also
+        // alias-expanded so users can write either the literal model id or an alias name
+        // (e.g. ZDT_SMALL_FAST_MODEL=light) and get consistent semantics with subagentModels.
+        if (!string.IsNullOrEmpty(smallFastModel)
+            && SmallFastEligibleTypes.Contains(subagentType))
+        {
+            return ExpandAliasOrLiteral(smallFastModel, modelAliases);
+        }
+
+        // (3) built-in default — only kicks in when the alias actually resolves to a model.
         // If the user removed e.g. the "light" entry from litellm.models, we silently fall
         // through to "no override" rather than emitting a phantom alias that AgentLoop would
         // pass to LiteLLM as-is (which would 404 at request time).
@@ -72,7 +92,7 @@ public static class SubagentModelResolver
             return defaultModel;
         }
 
-        // (3) no override — caller falls back to the parent.
+        // (4) no override — caller falls back to the parent.
         return null;
     }
 

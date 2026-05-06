@@ -247,6 +247,133 @@ public sealed class SettingsLoaderTests : IDisposable
     }
 
     [Fact]
+    public void Env_default_model_vars_populate_light_medium_heavy_aliases()
+    {
+        // Empty settings.json — the env layer alone provides the alias map.
+        var env = new Dictionary<string, string?>
+        {
+            ["ZDT_DEFAULT_HEAVY_MODEL"]  = "heavy-from-env",
+            ["ZDT_DEFAULT_MEDIUM_MODEL"] = "medium-from-env",
+            ["ZDT_DEFAULT_LIGHT_MODEL"]  = "light-from-env",
+        };
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options(env));
+
+        s.LiteLLM.Models.Should().BeEquivalentTo(new Dictionary<string, string>
+        {
+            ["heavy"]  = "heavy-from-env",
+            ["medium"] = "medium-from-env",
+            ["light"]  = "light-from-env",
+        });
+    }
+
+    [Fact]
+    public void Env_default_model_vars_override_same_tier_in_settings_json()
+    {
+        // Settings pins light → A; env pins light → B; env wins because it's the highest
+        // precedence layer below CLI args.
+        WriteUser("""
+        {
+          "litellm": {
+            "models": { "light": "settings-light" }
+          }
+        }
+        """);
+        var env = new Dictionary<string, string?>
+        {
+            ["ZDT_DEFAULT_LIGHT_MODEL"] = "env-light-wins",
+        };
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options(env));
+
+        s.LiteLLM.Models["light"].Should().Be("env-light-wins");
+    }
+
+    [Fact]
+    public void Env_layer_does_not_disturb_unrelated_tiers_or_extra_aliases()
+    {
+        WriteUser("""
+        {
+          "litellm": {
+            "models": { "light": "qwen-fast", "medium": "qwen-mid", "custom": "x" }
+          }
+        }
+        """);
+        var env = new Dictionary<string, string?>
+        {
+            ["ZDT_DEFAULT_HEAVY_MODEL"] = "heavy-from-env",
+        };
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options(env));
+
+        s.LiteLLM.Models.Should().BeEquivalentTo(new Dictionary<string, string>
+        {
+            ["light"]  = "qwen-fast",
+            ["medium"] = "qwen-mid",
+            ["custom"] = "x",
+            ["heavy"]  = "heavy-from-env",
+        });
+    }
+
+    [Fact]
+    public void Env_small_fast_model_populates_litellm_smallFastModel()
+    {
+        var env = new Dictionary<string, string?>
+        {
+            ["ZDT_SMALL_FAST_MODEL"] = "fast-subagent-model",
+        };
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options(env));
+
+        s.LiteLLM.SmallFastModel.Should().Be("fast-subagent-model");
+    }
+
+    [Fact]
+    public void Env_layer_no_op_when_no_zdt_vars_present()
+    {
+        // Settings file alone — no env vars. SmallFastModel stays null and Models matches
+        // exactly what settings.json declared (no phantom tier entries).
+        WriteUser("""
+        {
+          "litellm": {
+            "models": { "medium": "qwen-mid" }
+          }
+        }
+        """);
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options());
+
+        s.LiteLLM.SmallFastModel.Should().BeNull();
+        s.LiteLLM.Models.Should().BeEquivalentTo(new Dictionary<string, string>
+        {
+            ["medium"] = "qwen-mid",
+        });
+    }
+
+    [Fact]
+    public void Env_empty_string_value_is_ignored()
+    {
+        // export ZDT_DEFAULT_LIGHT_MODEL= (intentional unset via empty value) — must not
+        // overwrite the settings entry with an empty string that would later 404 at LiteLLM.
+        WriteUser("""
+        {
+          "litellm": {
+            "models": { "light": "settings-light" }
+          }
+        }
+        """);
+        var env = new Dictionary<string, string?>
+        {
+            ["ZDT_DEFAULT_LIGHT_MODEL"] = "",
+        };
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options(env));
+
+        // Settings entry survives; empty env doesn't blank it.
+        s.LiteLLM.Models["light"].Should().Be("settings-light");
+    }
+
+    [Fact]
     public void Subagent_models_merge_per_key_with_higher_layer_winning()
     {
         WriteUser("""

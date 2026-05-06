@@ -74,7 +74,15 @@ public sealed record LiteLLMSettings(
     string? ToolCallingMode,
     ImmutableDictionary<string, string> Models,
     ImmutableDictionary<string, int> ContextWindows,
-    ImmutableDictionary<string, string> SubagentModels)
+    ImmutableDictionary<string, string> SubagentModels,
+    /// <summary>
+    /// Implicit small/fast model used by read-only subagents (code-reviewer, explore) when
+    /// the user hasn't pinned them via <see cref="SubagentModels"/>. Populated from the
+    /// <c>ZDT_SMALL_FAST_MODEL</c> env var (the zdt rename of claude-cli's
+    /// <c>ANTHROPIC_SMALL_FAST_MODEL</c>) so a single env line can route every fast
+    /// subagent through one cheap model without touching settings.json.
+    /// </summary>
+    string? SmallFastModel)
 {
     public static LiteLLMSettings Empty { get; } = new(
         BaseUrl: null,
@@ -83,7 +91,8 @@ public sealed record LiteLLMSettings(
         ToolCallingMode: null,
         Models: ImmutableDictionary<string, string>.Empty,
         ContextWindows: ImmutableDictionary<string, int>.Empty,
-        SubagentModels: ImmutableDictionary<string, string>.Empty);
+        SubagentModels: ImmutableDictionary<string, string>.Empty,
+        SmallFastModel: null);
 
     public LiteLLMSettings Merge(LiteLLMSettings higher) => new(
         BaseUrl: higher.BaseUrl ?? BaseUrl,
@@ -92,5 +101,6 @@ public sealed record LiteLLMSettings(
         ToolCallingMode: higher.ToolCallingMode ?? ToolCallingMode,
         Models: EffectiveSettings.MergeOverride(Models, higher.Models),
         ContextWindows: EffectiveSettings.MergeOverride(ContextWindows, higher.ContextWindows),
-        SubagentModels: EffectiveSettings.MergeOverride(SubagentModels, higher.SubagentModels));
+        SubagentModels: EffectiveSettings.MergeOverride(SubagentModels, higher.SubagentModels),
+        SmallFastModel: higher.SmallFastModel ?? SmallFastModel);
 }
