@@ -316,6 +316,114 @@ public sealed class SettingsLoaderTests : IDisposable
     }
 
     [Fact]
+    public void Env_base_url_populates_litellm_baseUrl_when_settings_empty()
+    {
+        var env = new Dictionary<string, string?>
+        {
+            ["ZDT_BASE_URL"] = "http://litellm-from-env:4000",
+        };
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options(env));
+
+        s.LiteLLM.BaseUrl.Should().Be("http://litellm-from-env:4000");
+    }
+
+    [Fact]
+    public void Env_api_key_populates_litellm_apiKey_when_settings_empty()
+    {
+        var env = new Dictionary<string, string?>
+        {
+            ["ZDT_API_KEY"] = "sk-from-env-key",
+        };
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options(env));
+
+        s.LiteLLM.ApiKey.Should().Be("sk-from-env-key");
+    }
+
+    [Fact]
+    public void Env_base_url_overrides_settings_json_baseUrl()
+    {
+        // Same precedence rule as the model overrides — env wins. Critical so a CI runner
+        // can swap the proxy at runtime without rewriting committed settings.
+        WriteUser("""
+        {
+          "litellm": {
+            "baseUrl": "http://settings-baseurl:4000"
+          }
+        }
+        """);
+        var env = new Dictionary<string, string?>
+        {
+            ["ZDT_BASE_URL"] = "http://env-baseurl:4000",
+        };
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options(env));
+
+        s.LiteLLM.BaseUrl.Should().Be("http://env-baseurl:4000");
+    }
+
+    [Fact]
+    public void Env_api_key_overrides_settings_json_apiKey()
+    {
+        WriteUser("""
+        {
+          "litellm": {
+            "apiKey": "sk-from-settings"
+          }
+        }
+        """);
+        var env = new Dictionary<string, string?>
+        {
+            ["ZDT_API_KEY"] = "sk-from-env",
+        };
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options(env));
+
+        s.LiteLLM.ApiKey.Should().Be("sk-from-env");
+    }
+
+    [Fact]
+    public void Env_base_url_empty_string_is_ignored()
+    {
+        // export ZDT_BASE_URL= must not blank a settings entry — same rule as model overrides.
+        WriteUser("""
+        {
+          "litellm": {
+            "baseUrl": "http://settings-baseurl:4000"
+          }
+        }
+        """);
+        var env = new Dictionary<string, string?>
+        {
+            ["ZDT_BASE_URL"] = "",
+        };
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options(env));
+
+        s.LiteLLM.BaseUrl.Should().Be("http://settings-baseurl:4000");
+    }
+
+    [Fact]
+    public void Env_only_setup_works_without_any_settings_file()
+    {
+        // The "no settings.json at all" path — env vars alone produce a fully usable
+        // LiteLLMSettings (baseUrl + apiKey + a tier model) so the wizard is bypassed.
+        var env = new Dictionary<string, string?>
+        {
+            ["ZDT_BASE_URL"]              = "http://proxy:4000",
+            ["ZDT_API_KEY"]               = "sk-x",
+            ["ZDT_DEFAULT_MEDIUM_MODEL"]  = "qwen-mid",
+        };
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options(env));
+
+        s.LiteLLM.BaseUrl.Should().Be("http://proxy:4000");
+        s.LiteLLM.ApiKey.Should().Be("sk-x");
+        s.LiteLLM.Models.Should().ContainKey("medium").WhoseValue.Should().Be("qwen-mid");
+    }
+
+    [Fact]
     public void Env_small_fast_model_populates_litellm_smallFastModel()
     {
         var env = new Dictionary<string, string?>

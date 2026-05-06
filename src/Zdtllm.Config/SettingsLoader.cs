@@ -46,12 +46,15 @@ public static class SettingsLoader
 
     /// <summary>
     /// Build a synthetic <see cref="EffectiveSettings"/> layer from the ZDT_* env vars.
-    /// Same role as claude-cli's <c>ANTHROPIC_DEFAULT_*_MODEL</c> / <c>ANTHROPIC_SMALL_FAST_MODEL</c>,
-    /// but the var names use the project's canonical tier vocabulary
-    /// (<c>light</c>/<c>medium</c>/<c>heavy</c>) instead of claude tier names — one naming
-    /// convention across settings.json, CLI flags, and env:
+    /// Same role as claude-cli's <c>ANTHROPIC_BASE_URL</c> / <c>ANTHROPIC_AUTH_TOKEN</c> /
+    /// <c>ANTHROPIC_DEFAULT_*_MODEL</c> / <c>ANTHROPIC_SMALL_FAST_MODEL</c>, but the var
+    /// names use the project's canonical tier vocabulary
+    /// (<c>light</c>/<c>medium</c>/<c>heavy</c>) so one naming convention covers
+    /// settings.json, CLI flags, and env:
     ///
     /// <list type="bullet">
+    ///   <item><c>ZDT_BASE_URL</c>             → <c>litellm.baseUrl</c></item>
+    ///   <item><c>ZDT_API_KEY</c>              → <c>litellm.apiKey</c></item>
     ///   <item><c>ZDT_DEFAULT_HEAVY_MODEL</c>  → <c>litellm.models["heavy"]</c></item>
     ///   <item><c>ZDT_DEFAULT_MEDIUM_MODEL</c> → <c>litellm.models["medium"]</c></item>
     ///   <item><c>ZDT_DEFAULT_LIGHT_MODEL</c>  → <c>litellm.models["light"]</c></item>
@@ -69,12 +72,19 @@ public static class SettingsLoader
         AddIfPresent(envRead, "ZDT_DEFAULT_LIGHT_MODEL",  "light",  modelsBuilder);
 
         var smallFast = envRead("ZDT_SMALL_FAST_MODEL");
+        var baseUrl   = envRead("ZDT_BASE_URL");
+        var apiKey    = envRead("ZDT_API_KEY");
 
-        var anyChange = modelsBuilder.Count > 0 || !string.IsNullOrEmpty(smallFast);
+        var anyChange = modelsBuilder.Count > 0
+            || !string.IsNullOrEmpty(smallFast)
+            || !string.IsNullOrEmpty(baseUrl)
+            || !string.IsNullOrEmpty(apiKey);
         if (!anyChange) return EffectiveSettings.Empty;
 
         var litellm = LiteLLMSettings.Empty with
         {
+            BaseUrl = string.IsNullOrEmpty(baseUrl) ? null : baseUrl,
+            ApiKey = string.IsNullOrEmpty(apiKey) ? null : apiKey,
             Models = modelsBuilder.ToImmutable(),
             SmallFastModel = string.IsNullOrEmpty(smallFast) ? null : smallFast,
         };

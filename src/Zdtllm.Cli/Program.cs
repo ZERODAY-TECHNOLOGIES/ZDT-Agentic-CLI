@@ -745,6 +745,8 @@ internal static class Program
         Console.WriteLine("  -h, --help                     show this help");
         Console.WriteLine();
         Console.WriteLine("ENV:");
+        Console.WriteLine("  ZDT_BASE_URL                   LiteLLM proxy URL (overrides litellm.baseUrl)");
+        Console.WriteLine("  ZDT_API_KEY                    LiteLLM proxy API key (overrides litellm.apiKey)");
         Console.WriteLine("  ZDT_DEFAULT_HEAVY_MODEL        model id for the 'heavy' tier (overrides litellm.models.heavy)");
         Console.WriteLine("  ZDT_DEFAULT_MEDIUM_MODEL       model id for the 'medium' tier (overrides litellm.models.medium)");
         Console.WriteLine("  ZDT_DEFAULT_LIGHT_MODEL        model id for the 'light' tier (overrides litellm.models.light)");

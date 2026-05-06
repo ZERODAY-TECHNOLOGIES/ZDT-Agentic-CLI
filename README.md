@@ -90,21 +90,25 @@ from `models` or with a literal model id.
 
 ### Env vars
 
-Four env vars override settings.json at runtime — same role as claude-cli's
-`ANTHROPIC_*_MODEL` knobs, but the var names use zdt's canonical tier vocabulary
-(`light`/`medium`/`heavy`) so there's one naming convention across settings, CLI flags,
-and env:
+Six env vars override settings.json at runtime — same roles as claude-cli's
+`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_*_MODEL` knobs, but the var
+names use zdt's canonical vocabulary (`light`/`medium`/`heavy`) so there's one naming
+convention across settings, CLI flags, and env:
 
 | env var                    | effect                                                                         |
 | -------------------------- | ------------------------------------------------------------------------------ |
+| `ZDT_BASE_URL`             | overrides `litellm.baseUrl` (the LiteLLM proxy URL)                             |
+| `ZDT_API_KEY`              | overrides `litellm.apiKey` (the LiteLLM proxy bearer token)                     |
 | `ZDT_DEFAULT_HEAVY_MODEL`  | overrides `litellm.models.heavy`                                                |
 | `ZDT_DEFAULT_MEDIUM_MODEL` | overrides `litellm.models.medium`                                               |
 | `ZDT_DEFAULT_LIGHT_MODEL`  | overrides `litellm.models.light`                                                |
 | `ZDT_SMALL_FAST_MODEL`     | default model for read-only subagents (`code-reviewer`, `explore`)              |
 
 The env layer wins over committed settings.json so a runtime `export` always pins the
-model. `ZDT_SMALL_FAST_MODEL` only applies when `subagentModels` hasn't already pinned
-the relevant subagent type explicitly.
+value. With `ZDT_BASE_URL` + `ZDT_API_KEY` set you can run zdt without a settings file
+at all — the first-run wizard is skipped because `baseUrl` is already populated.
+`ZDT_SMALL_FAST_MODEL` only applies when `subagentModels` hasn't already pinned the
+relevant subagent type explicitly.
 
 ## Run
 
