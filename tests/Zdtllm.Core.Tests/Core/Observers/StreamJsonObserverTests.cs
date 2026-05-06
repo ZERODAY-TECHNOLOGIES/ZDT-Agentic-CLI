@@ -127,10 +127,21 @@ public sealed class StreamJsonObserverTests
         ev.GetProperty("num_turns").GetInt32().Should().Be(4);
         ev.GetProperty("stop_reason").GetString().Should().Be("end_turn");
         ev.GetProperty("result").GetString().Should().Be("all done");
+        // Flat-token fields kept for back-compat with previously released zdt builds.
         ev.GetProperty("input_tokens").GetInt32().Should().Be(8000);
         ev.GetProperty("output_tokens").GetInt32().Should().Be(250);
         // total_cost_usd is always emitted but always null — LiteLLM doesn't surface it.
         ev.GetProperty("total_cost_usd").ValueKind.Should().Be(JsonValueKind.Null);
+
+        // Nested usage object mirrors claude-cli — the path the official @anthropic-ai/claude-code
+        // SDK walks. cache_* default to 0 because LiteLLM doesn't surface prompt caching on the
+        // OpenAI-compatible chat endpoint, but the keys are still present so consumers that
+        // require all four don't branch on missing.
+        var usage = ev.GetProperty("usage");
+        usage.GetProperty("input_tokens").GetInt32().Should().Be(8000);
+        usage.GetProperty("output_tokens").GetInt32().Should().Be(250);
+        usage.GetProperty("cache_creation_input_tokens").GetInt32().Should().Be(0);
+        usage.GetProperty("cache_read_input_tokens").GetInt32().Should().Be(0);
     }
 
     [Fact]

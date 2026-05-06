@@ -73,7 +73,8 @@ public sealed record LiteLLMSettings(
     int? TimeoutSeconds,
     string? ToolCallingMode,
     ImmutableDictionary<string, string> Models,
-    ImmutableDictionary<string, int> ContextWindows)
+    ImmutableDictionary<string, int> ContextWindows,
+    ImmutableDictionary<string, string> SubagentModels)
 {
     public static LiteLLMSettings Empty { get; } = new(
         BaseUrl: null,
@@ -81,7 +82,8 @@ public sealed record LiteLLMSettings(
         TimeoutSeconds: null,
         ToolCallingMode: null,
         Models: ImmutableDictionary<string, string>.Empty,
-        ContextWindows: ImmutableDictionary<string, int>.Empty);
+        ContextWindows: ImmutableDictionary<string, int>.Empty,
+        SubagentModels: ImmutableDictionary<string, string>.Empty);
 
     public LiteLLMSettings Merge(LiteLLMSettings higher) => new(
         BaseUrl: higher.BaseUrl ?? BaseUrl,
@@ -89,5 +91,6 @@ public sealed record LiteLLMSettings(
         TimeoutSeconds: higher.TimeoutSeconds ?? TimeoutSeconds,
         ToolCallingMode: higher.ToolCallingMode ?? ToolCallingMode,
         Models: EffectiveSettings.MergeOverride(Models, higher.Models),
-        ContextWindows: EffectiveSettings.MergeOverride(ContextWindows, higher.ContextWindows));
+        ContextWindows: EffectiveSettings.MergeOverride(ContextWindows, higher.ContextWindows),
+        SubagentModels: EffectiveSettings.MergeOverride(SubagentModels, higher.SubagentModels));
 }

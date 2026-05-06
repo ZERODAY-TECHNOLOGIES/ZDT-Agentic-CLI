@@ -73,10 +73,20 @@ the environment at load time.
       "light":  "qwen3-coder-flash",
       "medium": "qwen3-coder",
       "heavy":  "qwen3-max"
+    },
+    "subagentModels": {
+      "code-reviewer": "light",
+      "explore":       "light"
     }
   }
 }
 ```
+
+`subagentModels` is optional — it routes a given `subagent_type` (the one passed to the
+Agent tool) to a different model than the parent. The defaults are `code-reviewer` →
+`light` and `explore` → `light` (read-only profiles run on the cheap tier); other types,
+including `general-purpose`, inherit the parent's current model. Override with an alias
+from `models` or with a literal model id.
 
 ## Run
 

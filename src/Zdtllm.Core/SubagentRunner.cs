@@ -124,15 +124,20 @@ public sealed class SubagentRunner : ISubagentRunner
     {
         var subRegistry = BuildRegistryForType(request.Type, _parent.Tools);
         // Resolve which model the subagent runs on. Priority:
-        //   1. request.ParentModel — TaskTool plumbs the parent's CURRENT session model
+        //   1. request.OverrideModel — set by TaskTool when SubagentModelResolver picked a
+        //      tiered model for the requested subagent_type (e.g. code-reviewer → light tier).
+        //      This is how the user's litellm.subagentModels config reaches the AgentLoop.
+        //   2. request.ParentModel — TaskTool plumbs the parent's CURRENT session model
         //      (i.e. whatever /model last set), so a mid-conversation model switch reaches
-        //      subagents. This is the path real callers always take.
-        //   2. _parent.Options.Model — the agent's startup-frozen option, used as fallback
-        //      when the request didn't specify (e.g. tests that build a SubagentRequest
-        //      directly without a TaskTool / ToolContext in front).
-        var resolvedModel = !string.IsNullOrEmpty(request.ParentModel)
-            ? request.ParentModel
-            : _parent.Options.Model;
+        //      subagents that don't have a tier override.
+        //   3. _parent.Options.Model — the agent's startup-frozen option, used as fallback
+        //      when the request didn't specify either of the above (e.g. tests that build a
+        //      SubagentRequest directly without a TaskTool / ToolContext in front).
+        var resolvedModel = !string.IsNullOrEmpty(request.OverrideModel)
+            ? request.OverrideModel
+            : !string.IsNullOrEmpty(request.ParentModel)
+                ? request.ParentModel
+                : _parent.Options.Model;
         var subOptions = _parent.Options with
         {
             Model = resolvedModel,
@@ -177,7 +182,8 @@ public sealed class SubagentRunner : ISubagentRunner
             FinalText: result.FinalText,
             Turns: result.Turns,
             PromptTokens: result.PromptTokens,
-            CompletionTokens: result.CompletionTokens);
+            CompletionTokens: result.CompletionTokens,
+            Model: resolvedModel);
     }
 
     /// <summary>

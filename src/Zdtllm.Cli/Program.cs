@@ -149,6 +149,7 @@ internal static class Program
         registry.Register(new ReadTool());
         registry.Register(new WriteTool());
         registry.Register(new EditTool());
+        registry.Register(new NotebookEditTool());
         registry.Register(new BashTool(cwd));
         registry.Register(new GlobTool());
         registry.Register(new GrepTool());
@@ -210,8 +211,17 @@ internal static class Program
         // Task tool needs the parent agent to spawn subagents from. Register it AFTER the
         // agent is built — the registry holds a live reference, so the parent agent will see
         // Task on subsequent turns.
+        //
+        // The model resolver lets per-subagent_type tiering (litellm.subagentModels) apply
+        // at dispatch time. The captured snapshot of Models / SubagentModels is fine because
+        // settings are read once at startup and never mutate at runtime; if that ever changes,
+        // this delegate would need to read live state instead.
         var subagentRunner = new SubagentRunner(agent);
-        registry.Register(new TaskTool(subagentRunner));
+        var modelAliases = settings.LiteLLM.Models;
+        var subagentOverrides = settings.LiteLLM.SubagentModels;
+        Func<string, string?, string?> tieredModelResolver = (subagentType, _parent) =>
+            SubagentModelResolver.Resolve(subagentType, modelAliases, subagentOverrides);
+        registry.Register(new TaskTool(subagentRunner, tieredModelResolver));
 
         // --tools filter: applied last so it can drop builtins, MCP tools, and Task uniformly.
         if (parsed.AllowedTools.Count > 0)
@@ -707,6 +717,8 @@ internal static class Program
         Console.WriteLine("FLAGS:");
         Console.WriteLine("  -p, --print                    print mode (one-shot, exit)");
         Console.WriteLine("  --model <alias|name>           model alias (light/medium/heavy) or full name");
+        Console.WriteLine("                                 subagents inherit this unless litellm.subagentModels remaps them");
+        Console.WriteLine("                                 (e.g. {\"code-reviewer\": \"light\"} routes the read-only profile to the cheap tier)");
         Console.WriteLine("  --max-turns <n>                cap agent loop iterations (default 30)");
         Console.WriteLine("  --max-parallel <n>             cap concurrent tool calls in a parallel batch (0 = unlimited)");
         Console.WriteLine("  --dangerously-skip-permissions auto-allow tools that would otherwise prompt");

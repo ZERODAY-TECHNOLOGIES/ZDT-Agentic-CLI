@@ -207,6 +207,73 @@ public sealed class SettingsLoaderTests : IDisposable
     }
 
     [Fact]
+    public void Subagent_models_load_from_litellm_section()
+    {
+        WriteUser("""
+        {
+          "litellm": {
+            "models": { "light": "qwen-fast", "medium": "qwen-mid" },
+            "subagentModels": {
+              "code-reviewer": "light",
+              "explore": "qwen-fast"
+            }
+          }
+        }
+        """);
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options());
+
+        s.LiteLLM.SubagentModels.Should().BeEquivalentTo(new Dictionary<string, string>
+        {
+            ["code-reviewer"] = "light",
+            ["explore"] = "qwen-fast",
+        });
+    }
+
+    [Fact]
+    public void Subagent_models_default_to_empty_when_unset()
+    {
+        WriteUser("""
+        {
+          "litellm": {
+            "models": { "medium": "qwen-mid" }
+          }
+        }
+        """);
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options());
+
+        s.LiteLLM.SubagentModels.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Subagent_models_merge_per_key_with_higher_layer_winning()
+    {
+        WriteUser("""
+        {
+          "litellm": {
+            "subagentModels": { "code-reviewer": "light", "explore": "light" }
+          }
+        }
+        """);
+        WriteProject("""
+        {
+          "litellm": {
+            "subagentModels": { "code-reviewer": "heavy" }
+          }
+        }
+        """);
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options());
+
+        s.LiteLLM.SubagentModels.Should().BeEquivalentTo(new Dictionary<string, string>
+        {
+            ["code-reviewer"] = "heavy",
+            ["explore"] = "light",
+        });
+    }
+
+    [Fact]
     public void Allows_trailing_commas_and_comments()
     {
         WriteProject("""

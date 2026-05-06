@@ -297,6 +297,49 @@ public sealed class SubagentRunnerTests
     }
 
     [Fact]
+    public async Task RunAsync_OverrideModel_takes_precedence_over_ParentModel()
+    {
+        // The tier-routing contract: when the resolver picks a tier-specific model for a
+        // subagent_type (e.g. code-reviewer → light), TaskTool plumbs it as OverrideModel
+        // and the runner must use it instead of the parent's model. Without this, the
+        // litellm.subagentModels config never reaches the actual HTTP request.
+        var handler = new StubHandler(Sse(SimpleResponseSse("ok")));
+        var registry = new ToolRegistry();
+        var parent = BuildParentAgent(handler, registry, model: "parent-default");
+        var runner = new SubagentRunner(parent);
+
+        var result = await runner.RunAsync(
+            new SubagentRequest(
+                "x", "do x",
+                ParentModel: "parent-default",
+                OverrideModel: "qwen-fast-tier"),
+            CancellationToken.None);
+
+        var body = handler.RequestBodies.Single();
+        body.Should().Contain("\"model\":\"qwen-fast-tier\"");
+        body.Should().NotContain("parent-default");
+        result.Model.Should().Be("qwen-fast-tier");
+    }
+
+    [Fact]
+    public async Task RunAsync_returns_resolved_model_in_SubagentResult_for_visibility()
+    {
+        // The CLI surfaces the subagent's actual model in the "[subagent type — N turn(s),
+        // model: X]" preamble so users can verify tier routing. The runner has to populate
+        // that field even when no override was set (then it equals ParentModel).
+        var handler = new StubHandler(Sse(SimpleResponseSse("ok")));
+        var registry = new ToolRegistry();
+        var parent = BuildParentAgent(handler, registry, model: "parent-startup");
+        var runner = new SubagentRunner(parent);
+
+        var result = await runner.RunAsync(
+            new SubagentRequest("x", "do x", ParentModel: "current-parent-model"),
+            CancellationToken.None);
+
+        result.Model.Should().Be("current-parent-model");
+    }
+
+    [Fact]
     public async Task Parallel_subagents_share_the_same_handler_without_deadlocking()
     {
         // Pre-3W: AgentLoop's parallel batch path ran multiple TaskTool calls in parallel,

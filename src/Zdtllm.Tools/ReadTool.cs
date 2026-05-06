@@ -15,24 +15,22 @@ public sealed class ReadTool : ITool
             type = "object",
             properties = new
             {
-                path = new { type = "string", description = "Absolute or relative path to the file." },
+                file_path = new { type = "string", description = "Absolute or relative path to the file." },
                 offset = new { type = "integer", description = "Line number to start reading from (1-indexed)." },
                 limit = new { type = "integer", description = "Maximum number of lines to read." },
             },
-            required = new[] { "path" },
+            required = new[] { "file_path" },
         }));
 
     public string? GetSpecifierForPermissions(JsonElement args) =>
-        args.TryGetProperty("path", out var p) && p.ValueKind == JsonValueKind.String
-            ? p.GetString()
-            : null;
+        TryGetPath(args);
 
     public async Task<ToolResult> ExecuteAsync(JsonElement args, ToolContext ctx, CancellationToken ct)
     {
-        if (!args.TryGetProperty("path", out var pathProp) || pathProp.ValueKind != JsonValueKind.String)
-            return ToolResult.Error("Read: missing or invalid 'path' parameter.");
+        var path = TryGetPath(args);
+        if (string.IsNullOrEmpty(path))
+            return ToolResult.Error("Read: missing or invalid 'file_path' parameter.");
 
-        var path = pathProp.GetString()!;
         var fullPath = Path.IsPathRooted(path) ? path : Path.GetFullPath(Path.Combine(ctx.Cwd, path));
 
         if (!File.Exists(fullPath))
@@ -66,6 +64,21 @@ public sealed class ReadTool : ITool
         {
             return ToolResult.Error($"Read: failed to read '{path}': {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Accept both <c>file_path</c> (claude-cli canonical, matches Write/Edit) and the legacy
+    /// <c>path</c> name. Native-mode tool calls follow the schema and use <c>file_path</c>;
+    /// xml-mode prompts and older sessions still emit <c>path</c>, so we keep it as an alias
+    /// instead of breaking on a mid-conversation /tool-calling switch.
+    /// </summary>
+    private static string? TryGetPath(JsonElement args)
+    {
+        if (args.TryGetProperty("file_path", out var fp) && fp.ValueKind == JsonValueKind.String)
+            return fp.GetString();
+        if (args.TryGetProperty("path", out var p) && p.ValueKind == JsonValueKind.String)
+            return p.GetString();
+        return null;
     }
 
     private static int TryGetInt(JsonElement args, string name, int fallback)

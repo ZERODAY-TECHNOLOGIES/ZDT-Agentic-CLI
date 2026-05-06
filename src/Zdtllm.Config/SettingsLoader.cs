@@ -125,13 +125,23 @@ internal sealed class RawLiteLLM
     public Dictionary<string, string>? Models { get; set; }
     public Dictionary<string, int>? ContextWindows { get; set; }
 
+    /// <summary>
+    /// Optional subagent-type → tier-alias OR model-id map. Lets the user assign a different
+    /// model per subagent profile (e.g. <c>"code-reviewer": "light"</c> so the read-only
+    /// reviewer runs on the cheap tier while the parent stays on medium / heavy). The value
+    /// can be either an alias from <see cref="LiteLLMSettings.Models"/> or a model id directly.
+    /// When unset, sensible defaults apply (see <c>SubagentModelResolver</c>).
+    /// </summary>
+    public Dictionary<string, string>? SubagentModels { get; set; }
+
     public LiteLLMSettings ToEffective(Func<string, string?> envRead) => new(
         BaseUrl: EnvironmentExpander.ExpandNullable(BaseUrl, envRead),
         ApiKey: EnvironmentExpander.ExpandNullable(ApiKey, envRead),
         TimeoutSeconds: TimeoutSeconds,
         ToolCallingMode: EnvironmentExpander.ExpandNullable(ToolCallingMode, envRead),
         Models: ToStringDict(Models, envRead),
-        ContextWindows: ToIntDict(ContextWindows));
+        ContextWindows: ToIntDict(ContextWindows),
+        SubagentModels: ToStringDict(SubagentModels, envRead));
 
     private static ImmutableDictionary<string, string> ToStringDict(
         Dictionary<string, string>? src,

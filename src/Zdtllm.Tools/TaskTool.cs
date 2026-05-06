@@ -23,11 +23,24 @@ public sealed class TaskTool : ITool
     public const string ToolName = "Agent";
 
     private readonly ISubagentRunner _runner;
+    private readonly Func<string, string?, string?>? _modelResolver;
 
     public TaskTool(ISubagentRunner runner)
+        : this(runner, modelResolver: null)
+    {
+    }
+
+    /// <summary>
+    /// Construct with a tiered model resolver. The delegate is called per subagent dispatch
+    /// with <c>(subagent_type, parentModel)</c> and returns either the override model id
+    /// for that type or null to inherit the parent. Wired up in CLI from
+    /// <c>SubagentModelResolver.Resolve(...)</c> so <c>litellm.subagentModels</c> takes effect.
+    /// </summary>
+    public TaskTool(ISubagentRunner runner, Func<string, string?, string?>? modelResolver)
     {
         ArgumentNullException.ThrowIfNull(runner);
         _runner = runner;
+        _modelResolver = modelResolver;
     }
 
     public ToolSchema Schema { get; } = new(
@@ -83,12 +96,20 @@ public sealed class TaskTool : ITool
             // reaches the subagent. ParentModel is null when the caller didn't set ctx.Model
             // (e.g. unit tests building a ToolContext directly) — runner falls back to its
             // own AgentLoop options in that case.
+            //
+            // OverrideModel comes from the tiered resolver (SubagentModelResolver) which the
+            // CLI wires up at startup. When the user mapped this subagent_type to a different
+            // tier in litellm.subagentModels, the override wins over ParentModel. When no
+            // mapping exists, the resolver returns null and the runner falls through to
+            // ParentModel — preserving the pre-tier behaviour.
+            var overrideModel = _modelResolver?.Invoke(type, ctx.Model);
             var request = new SubagentRequest(
                 Description: description!,
                 Prompt: prompt!,
                 Type: type,
                 MaxTurns: maxTurns,
-                ParentModel: ctx.Model);
+                ParentModel: ctx.Model,
+                OverrideModel: overrideModel);
 
             // Deliberately NOT wrapping the call in AnsiConsole.Status(): when several Agent
             // tool calls dispatch in parallel (the parent's parallel-batch path), each parallel
@@ -103,6 +124,8 @@ public sealed class TaskTool : ITool
             var sb = new StringBuilder();
             sb.Append("[subagent ").Append(type)
               .Append(" — ").Append(result.Turns).Append(" turn(s)");
+            if (!string.IsNullOrEmpty(result.Model))
+                sb.Append(", model: ").Append(result.Model);
             if (result.PromptTokens is int p) sb.Append(", ").Append(p).Append(" prompt tokens");
             if (result.CompletionTokens is int c) sb.Append(", ").Append(c).Append(" completion tokens");
             sb.AppendLine("]");

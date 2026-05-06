@@ -19,7 +19,13 @@ namespace Zdtllm.Core.Observers;
 ///   <code>{"type":"result","subtype":"success|error_max_turns|error_during_execution",
 ///       "is_error":bool,"num_turns":N,"stop_reason":"end_turn|max_turns|...",
 ///       "total_cost_usd":null,"result":"final text",
-///       "input_tokens":N,"output_tokens":N}</code>
+///       "input_tokens":N,"output_tokens":N,
+///       "usage":{"input_tokens":N,"output_tokens":N,
+///                "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}</code>
+/// The flat <c>input_tokens</c>/<c>output_tokens</c> at the top level are kept for back-compat
+/// with consumers built against earlier zdt builds; the nested <c>usage</c> object mirrors
+/// the claude-cli shape so consumers that walk <c>$event['usage']['input_tokens']</c> (the
+/// path the official @anthropic-ai/claude-code SDK reads) parse zdt's output unmodified.
 ///
 /// Per-delta <c>text_delta</c> / <c>tool_call</c> / <c>tool_result</c> events from earlier zdt
 /// builds are intentionally gone — claude doesn't emit them either, and consumers built
@@ -111,8 +117,21 @@ public sealed class StreamJsonObserver : IAgentObserver
             // let the consumer either ignore the field or compute its own from input/output.
             total_cost_usd = (double?)null,
             result = resultText,
+            // Flat fields kept for back-compat with consumers that read tokens off the result
+            // root (every released zdt build emitted them this way).
             input_tokens = totalInputTokens,
             output_tokens = totalOutputTokens,
+            // Nested usage object mirrors the claude-cli shape; cache_* are always 0 because
+            // LiteLLM /v1/chat/completions doesn't expose Anthropic-style prompt-cache totals
+            // on non-Anthropic backends. Emitting them as 0 (instead of omitting) lets a
+            // strict consumer that expects four keys still parse without a missing-field branch.
+            usage = new
+            {
+                input_tokens = totalInputTokens,
+                output_tokens = totalOutputTokens,
+                cache_creation_input_tokens = 0,
+                cache_read_input_tokens = 0,
+            },
         }, ct).ConfigureAwait(false);
 
     private async Task EmitAsync(object payload, CancellationToken ct)

@@ -35,13 +35,26 @@ public sealed record SubagentRequest(
     /// it through the request rather than reading parent.Options statically lets a /model
     /// change in the REPL take effect for the next subagent dispatch, not just the parent.
     /// </summary>
-    string? ParentModel = null);
+    string? ParentModel = null,
+    /// <summary>
+    /// Optional override that takes precedence over <see cref="ParentModel"/>. Set by
+    /// <c>TaskTool</c> when <c>SubagentModelResolver</c> picks a tiered model for the
+    /// requested <see cref="Type"/> (e.g. <c>code-reviewer</c> → light tier). When null
+    /// the runner falls through to <see cref="ParentModel"/> as before.
+    /// </summary>
+    string? OverrideModel = null);
 
 public sealed record SubagentResult(
     string FinalText,
     int Turns,
     int? PromptTokens,
-    int? CompletionTokens);
+    int? CompletionTokens,
+    /// <summary>
+    /// The model id the subagent actually ran on — useful for verifying that tiered routing
+    /// (litellm.subagentModels) took effect. Surfaced in TaskTool's result preamble so the
+    /// caller can see e.g. <c>[subagent code-reviewer — 3 turn(s), model: glm-fast]</c>.
+    /// </summary>
+    string? Model = null);
 
 /// <summary>
 /// What /agents and the Task-tool error messages need to know about a profile.
