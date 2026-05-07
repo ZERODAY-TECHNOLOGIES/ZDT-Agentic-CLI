@@ -193,7 +193,9 @@ internal static class Program
             new AgentLoopOptions
             {
                 Model = session.Model,
-                MaxTurns = parsed.MaxTurns ?? 30,
+                // No default cap — matches claude-cli. Pass --max-turns to enforce a
+                // ceiling (CI / scripts that want a hard guard against runaway loops).
+                MaxTurns = parsed.MaxTurns ?? int.MaxValue,
                 MaxParallel = parsed.MaxParallel ?? 0,
                 SkipPermissions = parsed.DangerouslySkipPermissions,
                 ToolCallingMode = session.Mode,
@@ -762,7 +764,7 @@ internal static class Program
         Console.WriteLine("  --model <alias|name>           model alias (light/medium/heavy) or full name");
         Console.WriteLine("                                 subagents inherit this unless litellm.subagentModels remaps them");
         Console.WriteLine("                                 (e.g. {\"code-reviewer\": \"light\"} routes the read-only profile to the cheap tier)");
-        Console.WriteLine("  --max-turns <n>                cap agent loop iterations (default 30)");
+        Console.WriteLine("  --max-turns <n>                cap agent loop iterations (no limit by default)");
         Console.WriteLine("  --max-parallel <n>             cap concurrent tool calls in a parallel batch (0 = unlimited)");
         Console.WriteLine("  --dangerously-skip-permissions auto-allow tools that would otherwise prompt");
         Console.WriteLine("  --no-wizard                    skip the first-run setup wizard");

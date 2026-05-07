@@ -17,7 +17,12 @@ public sealed record AgentLoopOptions
         "Be concise and prefer concrete answers over speculation.";
 
     public required string Model { get; init; }
-    public int MaxTurns { get; init; } = 30;
+    /// <summary>
+    /// Cap on agent loop iterations. Defaults to <see cref="int.MaxValue"/> — effectively
+    /// no limit, matching claude-cli's "no default cap" behaviour. Tests and CI scripts
+    /// that need a hard ceiling pass an explicit value (the CLI flag is <c>--max-turns</c>).
+    /// </summary>
+    public int MaxTurns { get; init; } = int.MaxValue;
     public bool SkipPermissions { get; init; }
     public ToolCallingMode ToolCallingMode { get; init; } = ToolCallingMode.Native;
     public string SystemPrompt { get; init; } = DefaultSystemPrompt;
