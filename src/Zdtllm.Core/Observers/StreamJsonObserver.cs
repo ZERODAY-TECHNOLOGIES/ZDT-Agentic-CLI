@@ -105,7 +105,8 @@ public sealed class StreamJsonObserver : IAgentObserver
         string? resultText,
         int totalInputTokens,
         int totalOutputTokens,
-        CancellationToken ct) =>
+        CancellationToken ct,
+        bool formatBreakdown = false) =>
         await EmitAsync(new
         {
             type = "result",
@@ -121,6 +122,11 @@ public sealed class StreamJsonObserver : IAgentObserver
             // root (every released zdt build emitted them this way).
             input_tokens = totalInputTokens,
             output_tokens = totalOutputTokens,
+            // Distinguishes "model deliberately ended with text only" from "model emitted XML
+            // tool-call markup but an upstream layer corrupted the open tag, so the parser saw
+            // no calls and we ended the turn as if there were none". The flag lets consumers
+            // skip pattern-matching on result.text to reach the same conclusion.
+            format_breakdown = formatBreakdown,
             // Nested usage object mirrors the claude-cli shape; cache_* are always 0 because
             // LiteLLM /v1/chat/completions doesn't expose Anthropic-style prompt-cache totals
             // on non-Anthropic backends. Emitting them as 0 (instead of omitting) lets a
@@ -132,6 +138,14 @@ public sealed class StreamJsonObserver : IAgentObserver
                 cache_creation_input_tokens = 0,
                 cache_read_input_tokens = 0,
             },
+        }, ct).ConfigureAwait(false);
+
+    public async Task OnFormatBreakdownAsync(string details, CancellationToken ct) =>
+        await EmitAsync(new
+        {
+            type = "warning",
+            subtype = "format_breakdown",
+            details,
         }, ct).ConfigureAwait(false);
 
     private async Task EmitAsync(object payload, CancellationToken ct)

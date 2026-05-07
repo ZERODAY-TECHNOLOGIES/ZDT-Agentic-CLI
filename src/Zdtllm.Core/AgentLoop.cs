@@ -149,6 +149,11 @@ public sealed class AgentLoop
         // claude-shaped result event can publish summed billed tokens for the whole exchange.
         int totalInputTokens = 0;
         int totalOutputTokens = 0;
+        // Flips on the first turn where xmlMode is active, no calls got extracted, and the
+        // assistant text contains XML markup that looks corrupted (close tag without open,
+        // stray invoke/function markers). Surfaced via observer hooks so consumers like
+        // AppSec-Automator can branch on it without grepping result.text.
+        bool formatBreakdownDetected = false;
 
         try
         {
@@ -308,6 +313,28 @@ public sealed class AgentLoop
                 ? XmlToolCallParser.ExtractCalls(assistantText.ToString())
                 : [];
 
+            // Format-breakdown detection: model produced XML-shaped markup but the strict
+            // parser found 0 calls and the recovery path also failed. Almost always means an
+            // upstream proxy/chat template chewed the open tag (we still see </function_calls>
+            // but no <function_calls> or its corruption). Fire the warning hook so stream-json
+            // consumers see it immediately, set the flag for the eventual result event, and
+            // print a one-time stderr note for human users on this run.
+            if (xmlMode && xmlCalls.Count == 0
+                && !formatBreakdownDetected
+                && XmlToolCallParser.LooksLikeBrokenXml(assistantText.ToString()))
+            {
+                formatBreakdownDetected = true;
+                var breakdownDetails =
+                    "assistant emitted XML tool-call markup but the open tag was malformed " +
+                    "(close tag with no matching open, or stray <invoke>/<function=> marker). " +
+                    "Upstream proxy/chat template likely stripped bytes; check LiteLLM config " +
+                    "or try --tool-calling native if the model supports it.";
+                await status.WriteLineAsync(Palette.Red("  ⚠ format breakdown:") + " " + Palette.Mute(breakdownDetails))
+                    .ConfigureAwait(false);
+                await SafeNotifyAsync(_observer?.OnFormatBreakdownAsync(breakdownDetails, ct))
+                    .ConfigureAwait(false);
+            }
+
             // Surface XML-extracted calls as ToolCall items in the assistant event so
             // stream-json consumers (AppSec-Automator) get the same {type:"tool_use",...}
             // blocks they would for native mode. The id format must match what
@@ -395,7 +422,8 @@ public sealed class AgentLoop
                     resultText: displayText,
                     totalInputTokens: totalInputTokens,
                     totalOutputTokens: totalOutputTokens,
-                    ct: ct)).ConfigureAwait(false);
+                    ct: ct,
+                    formatBreakdown: formatBreakdownDetected)).ConfigureAwait(false);
                 return new AgentResult(displayText, turn, lastPromptTokens, lastCompletionTokens);
             }
 
@@ -451,7 +479,8 @@ public sealed class AgentLoop
             resultText: null,
             totalInputTokens: totalInputTokens,
             totalOutputTokens: totalOutputTokens,
-            ct: CancellationToken.None)).ConfigureAwait(false);
+            ct: CancellationToken.None,
+            formatBreakdown: formatBreakdownDetected)).ConfigureAwait(false);
 
         throw new InvalidOperationException(
             $"Agent exceeded max turns ({_options.MaxTurns}) without completing.");
@@ -474,7 +503,8 @@ public sealed class AgentLoop
                 resultText: rl.Message,
                 totalInputTokens: totalInputTokens,
                 totalOutputTokens: totalOutputTokens,
-                ct: CancellationToken.None)).ConfigureAwait(false);
+                ct: CancellationToken.None,
+                formatBreakdown: formatBreakdownDetected)).ConfigureAwait(false);
             throw;
         }
         catch (OperationCanceledException)
@@ -490,7 +520,8 @@ public sealed class AgentLoop
                 resultText: null,
                 totalInputTokens: totalInputTokens,
                 totalOutputTokens: totalOutputTokens,
-                ct: CancellationToken.None)).ConfigureAwait(false);
+                ct: CancellationToken.None,
+                formatBreakdown: formatBreakdownDetected)).ConfigureAwait(false);
             throw;
         }
         catch (Exception)
@@ -506,7 +537,8 @@ public sealed class AgentLoop
                 resultText: null,
                 totalInputTokens: totalInputTokens,
                 totalOutputTokens: totalOutputTokens,
-                ct: CancellationToken.None)).ConfigureAwait(false);
+                ct: CancellationToken.None,
+                formatBreakdown: formatBreakdownDetected)).ConfigureAwait(false);
             throw;
         }
     }

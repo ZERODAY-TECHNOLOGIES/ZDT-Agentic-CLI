@@ -110,6 +110,33 @@ at all — the first-run wizard is skipped because `baseUrl` is already populate
 `ZDT_SMALL_FAST_MODEL` only applies when `subagentModels` hasn't already pinned the
 relevant subagent type explicitly.
 
+### Tool-calling mode
+
+zdt supports two transports for tool calls:
+
+- `native` — OpenAI-shaped `tool_calls` array on the chat completion. Best for proprietary
+  models (GPT-4, Claude, Gemini) and any model whose chat template renders `tools` natively.
+- `xml` — embeds calls as `<function_calls><invoke name="...">...</invoke></function_calls>`
+  inside the assistant text. Required for most open-weights chat templates (Qwen3, GLM,
+  DeepSeek-V3, Hermes, Kimi, Yi, Mistral-Nemo) — they don't reliably wire up native
+  tool-calling on LiteLLM.
+
+When neither `--tool-calling` nor `litellm.toolCallingMode` is set, zdt auto-selects `xml`
+for any model whose name matches a known XML-only family and prints a one-line stderr note;
+otherwise it defaults to `native`. Override anytime with `--tool-calling native` or by
+setting `toolCallingMode` in settings.json — the explicit choice always wins.
+
+When XML mode is active and the upstream proxy / chat template corrupts the open tag
+(close tag without matching open, stray `<invoke>` markers), zdt's parser runs a recovery
+pass to extract calls anyway, prints a stderr warning, and emits a structured signal in
+`stream-json`:
+
+- a `{"type":"warning","subtype":"format_breakdown","details":"..."}` event the moment it's
+  detected;
+- a `format_breakdown: true` flag on the terminal `result` event.
+
+That lets downstream consumers detect the case without pattern-matching on `result.text`.
+
 ## Run
 
 After install:

@@ -448,10 +448,12 @@ internal static class Program
         { foreach (var o in _inner) await o.OnAssistantTurnAsync(text, toolCalls, model, inputTokens, outputTokens, ct).ConfigureAwait(false); }
         public async Task OnResultAsync(
             string subtype, bool isError, int numTurns, string? stopReason, string? resultText,
-            int totalInputTokens, int totalOutputTokens, CancellationToken ct)
-        { foreach (var o in _inner) await o.OnResultAsync(subtype, isError, numTurns, stopReason, resultText, totalInputTokens, totalOutputTokens, ct).ConfigureAwait(false); }
+            int totalInputTokens, int totalOutputTokens, CancellationToken ct, bool formatBreakdown = false)
+        { foreach (var o in _inner) await o.OnResultAsync(subtype, isError, numTurns, stopReason, resultText, totalInputTokens, totalOutputTokens, ct, formatBreakdown).ConfigureAwait(false); }
         public async Task OnRateLimitedAsync(string status, long? resetsAtUnix, CancellationToken ct)
         { foreach (var o in _inner) await o.OnRateLimitedAsync(status, resetsAtUnix, ct).ConfigureAwait(false); }
+        public async Task OnFormatBreakdownAsync(string details, CancellationToken ct)
+        { foreach (var o in _inner) await o.OnFormatBreakdownAsync(details, ct).ConfigureAwait(false); }
     }
 
     /// <summary>
@@ -678,7 +680,7 @@ internal static class Program
         return Session.NewEphemeral(m, mo);
     }
 
-    private static (string Model, ToolCallingMode Mode) ResolveModelAndMode(
+    internal static (string Model, ToolCallingMode Mode) ResolveModelAndMode(
         ParsedArgs parsed,
         EffectiveSettings settings)
     {
@@ -691,11 +693,51 @@ internal static class Program
             ? resolved
             : modelAlias;
 
-        var mode = ToolCallingModeParse.FromString(
-            parsed.ToolCallingMode ?? settings.LiteLLM.ToolCallingMode,
-            fallback: ToolCallingMode.Native);
+        // Mode resolution prioritises an explicit choice (CLI flag, then settings.json). When
+        // neither is set, infer from the model name: open-weights chat templates (qwen / glm /
+        // deepseek / hermes / kimi / yi / mistral-nemo) generally don't expose OpenAI-shaped
+        // function-calling on LiteLLM and fall back to text — which means Native mode would
+        // silently drop tool calls every turn. Auto-switching to XML and emitting a one-line
+        // stderr note keeps these models working out of the box without forcing every user to
+        // discover the toolCallingMode setting.
+        var explicitMode = parsed.ToolCallingMode ?? settings.LiteLLM.ToolCallingMode;
+        ToolCallingMode mode;
+        if (string.IsNullOrEmpty(explicitMode) && LooksLikeXmlOnlyModel(modelName))
+        {
+            Console.Error.WriteLine(
+                $"zdt: auto-selecting --tool-calling xml for model '{modelName}' " +
+                "(set 'toolCallingMode' in settings.json or pass --tool-calling native to override).");
+            mode = ToolCallingMode.Xml;
+        }
+        else
+        {
+            mode = ToolCallingModeParse.FromString(explicitMode, fallback: ToolCallingMode.Native);
+        }
 
         return (modelName, mode);
+    }
+
+    /// <summary>
+    /// Heuristic: does <paramref name="modelName"/> look like an open-weights model that
+    /// doesn't reliably support OpenAI-shaped native tool-calling on LiteLLM? Matched against
+    /// substrings (case-insensitive) so versioned ids like
+    /// <c>Qwen/Qwen3-Coder-30B-A3B-Instruct</c> or <c>glm-5.1:cloud</c> still trigger.
+    /// Wrong matches just push a model that supports both modes onto XML — slightly more
+    /// verbose tool calls, no functional regression. Missed matches leave the existing
+    /// "explicit-or-native" behaviour, which is the conservative default.
+    /// </summary>
+    internal static bool LooksLikeXmlOnlyModel(string modelName)
+    {
+        if (string.IsNullOrEmpty(modelName)) return false;
+        ReadOnlySpan<string> markers =
+        [
+            "qwen", "glm", "deepseek", "hermes", "kimi", "yi-", "nemo",
+        ];
+        foreach (var m in markers)
+        {
+            if (modelName.Contains(m, StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return false;
     }
 
     private static void PrintVersion()

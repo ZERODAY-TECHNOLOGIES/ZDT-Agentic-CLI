@@ -145,6 +145,57 @@ public sealed class StreamJsonObserverTests
     }
 
     [Fact]
+    public async Task Result_event_carries_format_breakdown_flag_when_set()
+    {
+        var sw = new StringWriter();
+        IAgentObserver obs = new StreamJsonObserver(sw);
+
+        await obs.OnResultAsync(
+            subtype: "success", isError: false, numTurns: 2,
+            stopReason: "end_turn", resultText: "raw markup leaked",
+            totalInputTokens: 100, totalOutputTokens: 10,
+            ct: CancellationToken.None,
+            formatBreakdown: true);
+
+        var ev = ParseNdjson(sw.ToString())[0];
+        ev.GetProperty("format_breakdown").GetBoolean().Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Result_event_format_breakdown_defaults_to_false()
+    {
+        var sw = new StringWriter();
+        IAgentObserver obs = new StreamJsonObserver(sw);
+
+        // Don't pass formatBreakdown — should default to false on the wire so consumers can
+        // always read the field without branching on missing.
+        await obs.OnResultAsync(
+            subtype: "success", isError: false, numTurns: 1,
+            stopReason: "end_turn", resultText: "ok",
+            totalInputTokens: 10, totalOutputTokens: 1,
+            ct: CancellationToken.None);
+
+        var ev = ParseNdjson(sw.ToString())[0];
+        ev.GetProperty("format_breakdown").GetBoolean().Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Format_breakdown_warning_event_emits_distinct_type()
+    {
+        var sw = new StringWriter();
+        IAgentObserver obs = new StreamJsonObserver(sw);
+
+        await obs.OnFormatBreakdownAsync(
+            "assistant emitted XML markup but the open tag was malformed",
+            CancellationToken.None);
+
+        var ev = ParseNdjson(sw.ToString())[0];
+        ev.GetProperty("type").GetString().Should().Be("warning");
+        ev.GetProperty("subtype").GetString().Should().Be("format_breakdown");
+        ev.GetProperty("details").GetString().Should().Contain("malformed");
+    }
+
+    [Fact]
     public async Task Result_event_can_carry_error_max_turns_subtype()
     {
         var sw = new StringWriter();
