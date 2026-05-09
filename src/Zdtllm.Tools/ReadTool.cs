@@ -7,6 +7,25 @@ public sealed class ReadTool : ITool
 {
     private const int DefaultLimit = 2000;
 
+    /// <summary>
+    /// Hard cap on file size before <see cref="ExecuteAsync"/> bails out. Defense-in-depth
+    /// against the agent reading multi-MB / multi-GB blobs (assets, dumps, parquet, wasm) —
+    /// <see cref="File.ReadAllLinesAsync(string, CancellationToken)"/> materialises the
+    /// whole file as a <c>string[]</c>, so a 200 MB pg_dump.sql would OOM the process and
+    /// burn the entire context window in one tool call. Permission rules remain the
+    /// primary line of defense; this cap catches the case where perms are open
+    /// (--dangerously-skip-permissions, or a path the user didn't anticipate denying).
+    ///
+    /// 5 MiB is generous enough that real source files (including auto-generated
+    /// TypeScript / SQL migrations / large JSON fixtures) pass through, while still
+    /// stopping the worst offenders. Above this, the user is told what happened and
+    /// pointed at Glob with extension filters as the proper way to find text sources.
+    /// Binary detection is intentionally NOT done — NUL-byte heuristics false-positive on
+    /// UTF-16-LE files (PowerShell scripts, .resx) and the cost of letting an occasional
+    /// small binary through is bounded by the cap above.
+    /// </summary>
+    private const long MaxBytesForRead = 5L * 1024 * 1024;
+
     public ToolSchema Schema { get; } = new(
         Name: "Read",
         Description: "Read a file from the local filesystem and return its contents with line numbers (1-indexed). Supports an optional offset and limit (in lines).",
@@ -35,6 +54,15 @@ public sealed class ReadTool : ITool
 
         if (!File.Exists(fullPath))
             return ToolResult.Error($"Read: file not found: {path}");
+
+        // Size cap fires before we hit ReadAllLinesAsync — see MaxBytesForRead doc-comment
+        // for the why. FileInfo.Length is a metadata read, not a stream open, so it's cheap.
+        var fileInfo = new FileInfo(fullPath);
+        if (fileInfo.Length > MaxBytesForRead)
+            return ToolResult.Error(
+                $"Read: file too large ({fileInfo.Length / 1024} KiB > {MaxBytesForRead / 1024} KiB cap). " +
+                "Likely an asset, binary, or dump file. Use Glob with extension filters " +
+                "(e.g. **/*.cs, **/*.ts) to target text source files instead.");
 
         var offset = TryGetInt(args, "offset", 1);
         var limit = TryGetInt(args, "limit", DefaultLimit);

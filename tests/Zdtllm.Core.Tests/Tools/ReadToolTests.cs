@@ -114,6 +114,27 @@ public sealed class ReadToolTests : IDisposable
     }
 
     [Fact]
+    public async Task Refuses_files_above_size_cap_with_diagnostic_message()
+    {
+        // Defense-in-depth: even if perms allow it, ReadTool must refuse multi-MB files
+        // before File.ReadAllLinesAsync materialises the whole content as string[]. The
+        // cap is 5 MiB; we write 6 MiB of safe ASCII to make sure the gate fires on size
+        // alone, not on any binary-content heuristic (which the tool intentionally doesn't have).
+        var bigPath = Path.Combine(_tempDir, "big.txt");
+        const int sixMib = 6 * 1024 * 1024;
+        await File.WriteAllBytesAsync(bigPath, Enumerable.Repeat((byte)'A', sixMib).ToArray());
+
+        var result = await ReadAsync("big.txt");
+
+        result.IsError.Should().BeTrue();
+        result.Content.Should().Contain("too large");
+        result.Content.Should().Contain("KiB");
+        // Hint pointing at Glob is the actionable next step — assert it's there so a
+        // future refactor doesn't accidentally drop it.
+        result.Content.Should().Contain("Glob");
+    }
+
+    [Fact]
     public async Task File_path_takes_precedence_when_both_aliases_provided()
     {
         await File.WriteAllTextAsync(Path.Combine(_tempDir, "win.txt"), "winner\n");
