@@ -162,6 +162,47 @@ public sealed class StreamJsonObserverTests
     }
 
     [Fact]
+    public async Task Result_event_carries_tool_error_count_and_had_tool_errors_flag()
+    {
+        var sw = new StringWriter();
+        IAgentObserver obs = new StreamJsonObserver(sw);
+
+        await obs.OnResultAsync(
+            subtype: "success", isError: false, numTurns: 3,
+            stopReason: "end_turn", resultText: "done",
+            totalInputTokens: 100, totalOutputTokens: 10,
+            ct: CancellationToken.None,
+            formatBreakdown: false,
+            toolErrorCount: 4);
+
+        var ev = ParseNdjson(sw.ToString())[0];
+        // subtype intentionally stays "success" — non-breaking signal. Consumers that
+        // care about "the run actually did something useful" branch on these fields.
+        ev.GetProperty("subtype").GetString().Should().Be("success");
+        ev.GetProperty("tool_error_count").GetInt32().Should().Be(4);
+        ev.GetProperty("had_tool_errors").GetBoolean().Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Result_event_tool_error_fields_default_to_zero_and_false()
+    {
+        var sw = new StringWriter();
+        IAgentObserver obs = new StreamJsonObserver(sw);
+
+        // No toolErrorCount passed — should default to zero on the wire so consumers can
+        // always read the fields without a missing-key branch.
+        await obs.OnResultAsync(
+            subtype: "success", isError: false, numTurns: 1,
+            stopReason: "end_turn", resultText: "ok",
+            totalInputTokens: 10, totalOutputTokens: 1,
+            ct: CancellationToken.None);
+
+        var ev = ParseNdjson(sw.ToString())[0];
+        ev.GetProperty("tool_error_count").GetInt32().Should().Be(0);
+        ev.GetProperty("had_tool_errors").GetBoolean().Should().BeFalse();
+    }
+
+    [Fact]
     public async Task Result_event_format_breakdown_defaults_to_false()
     {
         var sw = new StringWriter();

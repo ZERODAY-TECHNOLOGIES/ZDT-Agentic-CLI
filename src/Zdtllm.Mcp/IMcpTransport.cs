@@ -12,4 +12,12 @@ public interface IMcpTransport : IAsyncDisposable
 
     /// <summary>Returns the next complete message, or null at end of stream.</summary>
     Task<string?> ReceiveAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Best-effort snapshot of the last few KB the subprocess wrote to stderr. Used to
+    /// enrich error messages when the handshake / init times out — without this, callers
+    /// see only "A task was canceled." with no hint at what the server actually logged.
+    /// In-memory transports may return empty.
+    /// </summary>
+    string StderrTail() => string.Empty;
 }

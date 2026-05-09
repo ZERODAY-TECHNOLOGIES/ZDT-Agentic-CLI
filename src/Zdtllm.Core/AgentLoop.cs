@@ -55,6 +55,19 @@ public sealed class AgentLoop
     private readonly IAnsiConsole? _richConsole;
     private readonly IAgentObserver? _observer;
 
+    /// <summary>
+    /// Per-turn count of tool calls that returned <c>isError=true</c> (unknown tool,
+    /// permission denied, JSON parse failure, tool's own thrown exception, etc.). Reset
+    /// at the top of every <see cref="RunTurnAsync"/> call and surfaced via
+    /// <see cref="IAgentObserver.OnResultAsync"/> so consumers can distinguish
+    /// "model deliberately ended after a clean run" from "model ended after every tool
+    /// call failed and it gave up." Subagents have their own <see cref="AgentLoop"/>
+    /// instance, so their counter is independent from the parent's.
+    /// Mutated under <see cref="Interlocked"/> because parallel tool batches run on
+    /// the thread pool.
+    /// </summary>
+    private int _turnToolErrorCount;
+
     public AgentLoop(
         LiteLLMClient client,
         ToolRegistry tools,
@@ -122,6 +135,12 @@ public sealed class AgentLoop
         ArgumentNullException.ThrowIfNull(status);
 
         var xmlMode = session.Mode == ToolCallingMode.Xml;
+
+        // Reset the per-turn tool-error counter so a previous turn's failures don't bleed
+        // into this one's result event. Subagents have their own AgentLoop instance, so
+        // this only resets for "this" agent — the parent's counter is untouched while a
+        // subagent runs.
+        Interlocked.Exchange(ref _turnToolErrorCount, 0);
 
         // Bootstrap system prompt the first time the session is touched.
         if (session.Messages.Count == 0)
@@ -428,7 +447,8 @@ public sealed class AgentLoop
                     totalInputTokens: totalInputTokens,
                     totalOutputTokens: totalOutputTokens,
                     ct: ct,
-                    formatBreakdown: formatBreakdownDetected)).ConfigureAwait(false);
+                    formatBreakdown: formatBreakdownDetected,
+                    toolErrorCount: Volatile.Read(ref _turnToolErrorCount))).ConfigureAwait(false);
                 return new AgentResult(displayText, turn, lastPromptTokens, lastCompletionTokens);
             }
 
@@ -485,7 +505,8 @@ public sealed class AgentLoop
             totalInputTokens: totalInputTokens,
             totalOutputTokens: totalOutputTokens,
             ct: CancellationToken.None,
-            formatBreakdown: formatBreakdownDetected)).ConfigureAwait(false);
+            formatBreakdown: formatBreakdownDetected,
+            toolErrorCount: Volatile.Read(ref _turnToolErrorCount))).ConfigureAwait(false);
 
         throw new InvalidOperationException(
             $"Agent exceeded max turns ({_options.MaxTurns}) without completing.");
@@ -509,7 +530,8 @@ public sealed class AgentLoop
                 totalInputTokens: totalInputTokens,
                 totalOutputTokens: totalOutputTokens,
                 ct: CancellationToken.None,
-                formatBreakdown: formatBreakdownDetected)).ConfigureAwait(false);
+                formatBreakdown: formatBreakdownDetected,
+                toolErrorCount: Volatile.Read(ref _turnToolErrorCount))).ConfigureAwait(false);
             throw;
         }
         catch (OperationCanceledException)
@@ -526,7 +548,8 @@ public sealed class AgentLoop
                 totalInputTokens: totalInputTokens,
                 totalOutputTokens: totalOutputTokens,
                 ct: CancellationToken.None,
-                formatBreakdown: formatBreakdownDetected)).ConfigureAwait(false);
+                formatBreakdown: formatBreakdownDetected,
+                toolErrorCount: Volatile.Read(ref _turnToolErrorCount))).ConfigureAwait(false);
             throw;
         }
         catch (Exception)
@@ -543,7 +566,8 @@ public sealed class AgentLoop
                 totalInputTokens: totalInputTokens,
                 totalOutputTokens: totalOutputTokens,
                 ct: CancellationToken.None,
-                formatBreakdown: formatBreakdownDetected)).ConfigureAwait(false);
+                formatBreakdown: formatBreakdownDetected,
+                toolErrorCount: Volatile.Read(ref _turnToolErrorCount))).ConfigureAwait(false);
             throw;
         }
     }
@@ -751,6 +775,7 @@ public sealed class AgentLoop
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var (content, isError) = await ExecuteToolCoreAsync(call, ctx, ct).ConfigureAwait(false);
         sw.Stop();
+        if (isError) Interlocked.Increment(ref _turnToolErrorCount);
         await SafeNotifyAsync(_observer?.OnToolResultAsync(call.FunctionName, content, isError, sw.Elapsed, ct))
             .ConfigureAwait(false);
         return content;
@@ -760,7 +785,7 @@ public sealed class AgentLoop
     {
         var tool = _tools.Get(call.FunctionName);
         if (tool is null)
-            return ($"[Unknown tool: {call.FunctionName}]", true);
+            return (BuildUnknownToolMessage(call.FunctionName), true);
 
         JsonDocument argsDoc;
         try
@@ -790,6 +815,29 @@ public sealed class AgentLoop
             var res = await tool.ExecuteAsync(args, ctx, ct).ConfigureAwait(false);
             return (res.Content, res.IsError);
         }
+    }
+
+    /// <summary>
+    /// Build the body returned to the model when it calls a tool that isn't in the registry.
+    /// The historical "[Unknown tool: X]" was a single line and weak models (especially in
+    /// XML mode) silently gave up on it; emitting the available alternatives + the reason
+    /// the tool might be missing lets the model report something useful to the operator
+    /// instead of fabricating a plausible-looking but empty completion. Capped at 32 names
+    /// so a registry of dozens (Read/Glob/Grep + many MCP tools) doesn't blow the per-message
+    /// budget that some chat templates enforce.
+    /// </summary>
+    private string BuildUnknownToolMessage(string requested)
+    {
+        var available = _tools.Schemas.Select(s => s.Name).OrderBy(n => n, StringComparer.Ordinal).ToList();
+        const int cap = 32;
+        var shown = available.Count <= cap
+            ? string.Join(", ", available)
+            : string.Join(", ", available.Take(cap)) + $", … (+{available.Count - cap} more)";
+        return $"[Unknown tool: {requested}]\n" +
+               $"Available tools: {shown}.\n" +
+               "Hint: this tool may have been filtered by --allowed-tools, " +
+               "or its MCP server failed to start. Do not retry the same name; " +
+               "use one of the available tools or report the missing tool to the operator.";
     }
 
     /// <summary>

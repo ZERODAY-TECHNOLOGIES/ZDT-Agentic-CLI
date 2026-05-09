@@ -68,18 +68,45 @@ public sealed class McpManager : IAsyncDisposable
                     ServerInfo: $"{client.ServerInfoName ?? "?"}/{client.ServerInfoVersion ?? "?"}",
                     ErrorMessage: null));
             }
-            catch (Exception ex)
+            catch (OperationCanceledException) when (
+                perServerCts.IsCancellationRequested && !ct.IsCancellationRequested)
             {
+                // Per-server timeout fired (the linked-token CTS cancelled itself via CancelAfter)
+                // — distinguish it from caller cancellation so the operator gets a concrete,
+                // actionable message instead of the .NET default "A task was canceled." Include
+                // the last bit of stderr the subprocess produced if any: a Python traceback or
+                // PHP fatal usually identifies the real problem in one line.
+                var tail = transport?.StderrTail() ?? string.Empty;
                 if (client is not null)
                     await client.DisposeAsync().ConfigureAwait(false);
                 else if (transport is not null)
                     await transport.DisposeAsync().ConfigureAwait(false);
+                var seconds = (int)Math.Round(handshakeTimeout.TotalSeconds);
+                var msg = $"init timed out after {seconds}s (handshake never completed). " +
+                          $"Increase --mcp-init-timeout-seconds or mcp.initTimeoutSeconds for slow-booting servers.";
+                if (tail.Length > 0) msg += "\n  last stderr:\n    " + tail.Replace("\n", "\n    ");
                 _statuses.Add(new McpServerStatus(
                     Name: server.Name,
                     Connected: false,
                     ToolCount: 0,
                     ServerInfo: null,
-                    ErrorMessage: ex.Message));
+                    ErrorMessage: msg));
+            }
+            catch (Exception ex)
+            {
+                var tail = transport?.StderrTail() ?? string.Empty;
+                if (client is not null)
+                    await client.DisposeAsync().ConfigureAwait(false);
+                else if (transport is not null)
+                    await transport.DisposeAsync().ConfigureAwait(false);
+                var msg = ex.Message;
+                if (tail.Length > 0) msg += "\n  last stderr:\n    " + tail.Replace("\n", "\n    ");
+                _statuses.Add(new McpServerStatus(
+                    Name: server.Name,
+                    Connected: false,
+                    ToolCount: 0,
+                    ServerInfo: null,
+                    ErrorMessage: msg));
             }
         }
     }

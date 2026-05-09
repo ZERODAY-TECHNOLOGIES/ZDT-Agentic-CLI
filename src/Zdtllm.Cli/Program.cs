@@ -163,7 +163,31 @@ internal static class Program
         // for the same server name), spawn each as a stdio subprocess, register its tools as
         // mcp__<server>__<tool>, and keep the manager around so we can DisposeAsync on shutdown.
         var mcpManager = new McpManager(diagnostics: Console.Error);
-        await BootMcpServersAsync(parsed.McpConfigs, registry, mcpManager).ConfigureAwait(false);
+        var mcpInitTimeoutSeconds =
+            parsed.McpInitTimeoutSeconds
+            ?? settings.Mcp.InitTimeoutSeconds
+            ?? 15;
+        await BootMcpServersAsync(parsed.McpConfigs, registry, mcpManager, mcpInitTimeoutSeconds)
+            .ConfigureAwait(false);
+
+        // --require-mcp: opt-in fail-fast. Without it, a misbehaving MCP server reports a
+        // warning to stderr and the run continues — historical behaviour, kept default-on so
+        // existing scripts don't suddenly start exiting non-zero. With it, any failed server
+        // aborts the launch BEFORE we burn LiteLLM tokens on a model that won't have the tools
+        // it was prompted to use.
+        if (parsed.RequireMcp && mcpManager.Statuses.Any(s => !s.Connected))
+        {
+            var failed = mcpManager.Statuses
+                .Where(s => !s.Connected)
+                .Select(s => s.Name);
+            await Console.Error.WriteLineAsync(
+                "zdt: --require-mcp set but the following MCP server(s) failed to start: "
+                + string.Join(", ", failed)
+                + ". Aborting (see prior error messages for details).")
+                .ConfigureAwait(false);
+            await mcpManager.DisposeAsync().ConfigureAwait(false);
+            return 1;
+        }
 
         var sessionsDir = Path.Combine(cwd, ".zdtllm", "sessions");
         var recent = RecentTracker.ForUserHome();
@@ -229,7 +253,20 @@ internal static class Program
         // --tools filter: applied last so it can drop builtins, MCP tools, and Task uniformly.
         if (parsed.AllowedTools.Count > 0)
         {
-            ApplyToolsAllowlist(registry, parsed.AllowedTools);
+            ApplyToolsAllowlist(registry, parsed.AllowedTools, mcpManager.Statuses);
+
+            // Empty-registry guard: if the allowlist filtered everything away (typically because
+            // every name referred to a failed MCP server), the model has no tools to dispatch and
+            // the run is guaranteed to be useless. Exit before spending LiteLLM tokens on it.
+            if (registry.All.Length == 0)
+            {
+                await Console.Error.WriteLineAsync(
+                    "zdt: --tools allowlist filtered every tool from the registry — nothing left to dispatch. "
+                    + "Common cause: the listed tools all belong to MCP servers that failed to start. Aborting.")
+                    .ConfigureAwait(false);
+                await mcpManager.DisposeAsync().ConfigureAwait(false);
+                return 1;
+            }
         }
 
         // Single CTS feeds program-wide cancellation: a second Ctrl+C exits the process,
@@ -405,17 +442,40 @@ internal static class Program
     /// <summary>
     /// Drop every tool whose name isn't in <paramref name="allowed"/>. Logs which tools
     /// got removed (helpful when a typo silently strips a feature) and warns if the
-    /// allowlist mentions a tool that isn't registered.
+    /// allowlist mentions a tool that isn't registered. <paramref name="mcpStatuses"/>
+    /// lets the warning distinguish a real typo from "the MCP server that owns this
+    /// tool failed to start" — without that, an operator sees "typo? case mismatch?"
+    /// and burns time double-checking spelling when the actual cause is upstream.
     /// </summary>
-    private static void ApplyToolsAllowlist(ToolRegistry registry, IReadOnlyList<string> allowed)
+    private static void ApplyToolsAllowlist(
+        ToolRegistry registry,
+        IReadOnlyList<string> allowed,
+        IReadOnlyList<McpServerStatus> mcpStatuses)
     {
         var keep = new HashSet<string>(allowed, StringComparer.Ordinal);
         var present = registry.All.Select(t => t.Schema.Name).ToHashSet(StringComparer.Ordinal);
+        var failedMcpServers = new HashSet<string>(
+            mcpStatuses.Where(s => !s.Connected).Select(s => s.Name),
+            StringComparer.Ordinal);
 
         foreach (var requested in allowed)
         {
-            if (!present.Contains(requested))
-                Console.Error.WriteLine($"zdt: --tools: '{requested}' is not a registered tool (typo? case mismatch?).");
+            if (present.Contains(requested)) continue;
+
+            // mcp__<server>__<tool>: if <server> failed to start, the misleading "typo?
+            // case mismatch?" hint sends operators down the wrong rabbit hole.
+            if (TryExtractMcpServerName(requested, out var serverName)
+                && failedMcpServers.Contains(serverName))
+            {
+                Console.Error.WriteLine(
+                    $"zdt: --tools: '{requested}' unavailable because MCP server '{serverName}' "
+                    + "failed to start (see prior error).");
+            }
+            else
+            {
+                Console.Error.WriteLine(
+                    $"zdt: --tools: '{requested}' is not a registered tool (typo? case mismatch?).");
+            }
         }
 
         var toRemove = present.Where(n => !keep.Contains(n)).ToList();
@@ -423,6 +483,23 @@ internal static class Program
 
         if (toRemove.Count > 0)
             Console.Error.WriteLine($"zdt: --tools allowlist active — kept {registry.All.Length}, dropped {toRemove.Count}.");
+    }
+
+    /// <summary>
+    /// Parse <c>mcp__&lt;server&gt;__&lt;tool&gt;</c> into the server segment. Returns false
+    /// for any non-MCP name or a malformed prefix so callers don't accidentally surface a
+    /// "server failed" message for a vanilla tool typo.
+    /// </summary>
+    private static bool TryExtractMcpServerName(string toolName, out string server)
+    {
+        server = string.Empty;
+        const string prefix = "mcp__";
+        if (!toolName.StartsWith(prefix, StringComparison.Ordinal)) return false;
+        var rest = toolName.AsSpan(prefix.Length);
+        var sep = rest.IndexOf("__", StringComparison.Ordinal);
+        if (sep <= 0) return false;
+        server = rest[..sep].ToString();
+        return true;
     }
 
     /// <summary>
@@ -450,8 +527,9 @@ internal static class Program
         { foreach (var o in _inner) await o.OnAssistantTurnAsync(text, toolCalls, model, inputTokens, outputTokens, ct).ConfigureAwait(false); }
         public async Task OnResultAsync(
             string subtype, bool isError, int numTurns, string? stopReason, string? resultText,
-            int totalInputTokens, int totalOutputTokens, CancellationToken ct, bool formatBreakdown = false)
-        { foreach (var o in _inner) await o.OnResultAsync(subtype, isError, numTurns, stopReason, resultText, totalInputTokens, totalOutputTokens, ct, formatBreakdown).ConfigureAwait(false); }
+            int totalInputTokens, int totalOutputTokens, CancellationToken ct,
+            bool formatBreakdown = false, int toolErrorCount = 0)
+        { foreach (var o in _inner) await o.OnResultAsync(subtype, isError, numTurns, stopReason, resultText, totalInputTokens, totalOutputTokens, ct, formatBreakdown, toolErrorCount).ConfigureAwait(false); }
         public async Task OnRateLimitedAsync(string status, long? resetsAtUnix, CancellationToken ct)
         { foreach (var o in _inner) await o.OnRateLimitedAsync(status, resetsAtUnix, ct).ConfigureAwait(false); }
         public async Task OnFormatBreakdownAsync(string details, CancellationToken ct)
@@ -466,7 +544,8 @@ internal static class Program
     private static async Task BootMcpServersAsync(
         IReadOnlyList<string> configPaths,
         ToolRegistry registry,
-        McpManager manager)
+        McpManager manager,
+        int initTimeoutSeconds)
     {
         if (configPaths.Count == 0) return;
 
@@ -489,7 +568,7 @@ internal static class Program
         await manager.StartAndRegisterAsync(
             merged,
             registry,
-            handshakeTimeout: TimeSpan.FromSeconds(15),
+            handshakeTimeout: TimeSpan.FromSeconds(initTimeoutSeconds),
             ct: CancellationToken.None).ConfigureAwait(false);
 
         foreach (var status in manager.Statuses)
@@ -776,6 +855,8 @@ internal static class Program
         Console.WriteLine("  --append-system-prompt-file <p>  append file contents after the default/replaced prompt");
         Console.WriteLine("  --add-dir <path>               add an extra accessible directory (repeatable)");
         Console.WriteLine("  --mcp-config <path>            load MCP server config from a JSON file (repeatable, last wins per server)");
+        Console.WriteLine("  --mcp-init-timeout-seconds <n> per-server MCP handshake timeout (default 15; raise for slow-booting servers)");
+        Console.WriteLine("  --require-mcp                  exit non-zero if any MCP server fails to start (off by default)");
         Console.WriteLine("  --verbose                      trace tool calls + results to stderr (durations, args/preview)");
         Console.WriteLine("  --output-format <fmt>          text (default) | json | stream-json — only honoured with -p");
         Console.WriteLine("  --tools <names...>             allowlist of tool names (space- or comma-separated, e.g. Read Glob Grep)");

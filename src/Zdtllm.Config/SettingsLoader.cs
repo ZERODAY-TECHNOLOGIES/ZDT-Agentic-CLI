@@ -136,11 +136,15 @@ internal sealed class RawSettings
     [JsonPropertyName("litellm")]
     public RawLiteLLM? LiteLLM { get; set; }
 
+    [JsonPropertyName("mcp")]
+    public RawMcp? Mcp { get; set; }
+
     public EffectiveSettings ToEffective(Func<string, string?> envRead) => new(
         Model: EnvironmentExpander.ExpandNullable(Model, envRead),
         Permissions: Permissions?.ToEffective(envRead) ?? PermissionsSettings.Empty,
         Env: ToEnvDict(Env, envRead),
-        LiteLLM: LiteLLM?.ToEffective(envRead) ?? LiteLLMSettings.Empty);
+        LiteLLM: LiteLLM?.ToEffective(envRead) ?? LiteLLMSettings.Empty,
+        Mcp: Mcp?.ToEffective() ?? McpSettings.Empty);
 
     private static ImmutableDictionary<string, string> ToEnvDict(
         Dictionary<string, string>? src,
@@ -228,4 +232,18 @@ internal sealed class RawLiteLLM
         foreach (var kv in src) b[kv.Key] = kv.Value;
         return b.ToImmutable();
     }
+}
+
+internal sealed class RawMcp
+{
+    /// <summary>
+    /// Per-server initialise/handshake timeout in seconds. Replaces the previous hard-coded
+    /// 15 s — slow-booting MCP servers (Laravel/Django on Windows + Herd, cold caches, DB-
+    /// dependent auth) routinely need more. CLI flag <c>--mcp-init-timeout-seconds</c> wins
+    /// over this; both fall back to 15 s if neither is set.
+    /// </summary>
+    public int? InitTimeoutSeconds { get; set; }
+
+    public McpSettings ToEffective() => new(
+        InitTimeoutSeconds: InitTimeoutSeconds);
 }

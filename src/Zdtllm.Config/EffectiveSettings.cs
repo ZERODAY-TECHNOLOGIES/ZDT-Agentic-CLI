@@ -6,19 +6,22 @@ public sealed record EffectiveSettings(
     string? Model,
     PermissionsSettings Permissions,
     ImmutableDictionary<string, string> Env,
-    LiteLLMSettings LiteLLM)
+    LiteLLMSettings LiteLLM,
+    McpSettings Mcp)
 {
     public static EffectiveSettings Empty { get; } = new(
         Model: null,
         Permissions: PermissionsSettings.Empty,
         Env: ImmutableDictionary<string, string>.Empty,
-        LiteLLM: LiteLLMSettings.Empty);
+        LiteLLM: LiteLLMSettings.Empty,
+        Mcp: McpSettings.Empty);
 
     public EffectiveSettings Merge(EffectiveSettings higher) => new(
         Model: higher.Model ?? Model,
         Permissions: Permissions.Merge(higher.Permissions),
         Env: MergeOverride(Env, higher.Env),
-        LiteLLM: LiteLLM.Merge(higher.LiteLLM));
+        LiteLLM: LiteLLM.Merge(higher.LiteLLM),
+        Mcp: Mcp.Merge(higher.Mcp));
 
     internal static ImmutableDictionary<string, T> MergeOverride<T>(
         ImmutableDictionary<string, T> lower,
@@ -103,4 +106,17 @@ public sealed record LiteLLMSettings(
         ContextWindows: EffectiveSettings.MergeOverride(ContextWindows, higher.ContextWindows),
         SubagentModels: EffectiveSettings.MergeOverride(SubagentModels, higher.SubagentModels),
         SmallFastModel: higher.SmallFastModel ?? SmallFastModel);
+}
+
+/// <summary>
+/// Top-level <c>"mcp"</c> section of settings.json. Currently carries only the per-server
+/// initialise/handshake timeout; lives in its own record so future MCP-wide knobs (default
+/// env vars, log directory, etc.) have an obvious home without bloating LiteLLMSettings.
+/// </summary>
+public sealed record McpSettings(int? InitTimeoutSeconds)
+{
+    public static McpSettings Empty { get; } = new(InitTimeoutSeconds: null);
+
+    public McpSettings Merge(McpSettings higher) => new(
+        InitTimeoutSeconds: higher.InitTimeoutSeconds ?? InitTimeoutSeconds);
 }

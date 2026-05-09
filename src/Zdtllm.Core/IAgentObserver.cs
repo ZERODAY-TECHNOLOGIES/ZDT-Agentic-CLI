@@ -52,6 +52,15 @@ public interface IAgentObserver
     /// invoke/function markers, etc.). The flag lets stream-json consumers distinguish
     /// "model deliberately ended with text" from "model emitted tool calls but the wire layer
     /// truncated the open tag" without pattern-matching on result.text.
+    ///
+    /// <paramref name="toolErrorCount"/> is the number of tool calls that returned
+    /// <c>isError=true</c> over the whole run (unknown tool, permission denied, tool threw,
+    /// MCP server unavailable, JSON parse failure of args, etc.). The wire shape stays
+    /// non-breaking — <c>subtype</c> is still <c>"success"</c> when the model itself ended
+    /// cleanly with no pending tool calls — but consumers that gate on "the run actually
+    /// did something useful" can branch on <c>tool_error_count &gt; 0</c> /
+    /// <c>had_tool_errors</c> instead of relying on stop_reason alone. This was added after
+    /// a run that fired only unknown-tool dispatches and reported success/end_turn.
     /// </summary>
     Task OnResultAsync(
         string subtype,
@@ -62,7 +71,8 @@ public interface IAgentObserver
         int totalInputTokens,
         int totalOutputTokens,
         CancellationToken ct,
-        bool formatBreakdown = false) => Task.CompletedTask;
+        bool formatBreakdown = false,
+        int toolErrorCount = 0) => Task.CompletedTask;
 
     /// <summary>
     /// Fired immediately when AgentLoop detects an XML-markup format breakdown mid-turn (so a

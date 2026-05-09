@@ -163,6 +163,44 @@ public sealed class ArgumentParserTests
     }
 
     [Fact]
+    public void Mcp_init_timeout_seconds_is_parsed_as_int()
+    {
+        var parsed = ArgumentParser.Parse([
+            "--mcp-config", "dast.json",
+            "--mcp-init-timeout-seconds", "60",
+        ]);
+
+        parsed.McpInitTimeoutSeconds.Should().Be(60);
+    }
+
+    [Fact]
+    public void Mcp_init_timeout_seconds_defaults_to_null_when_unset()
+    {
+        var parsed = ArgumentParser.Parse(["--mcp-config", "dast.json"]);
+
+        parsed.McpInitTimeoutSeconds.Should().BeNull();
+    }
+
+    [Fact]
+    public void Require_mcp_is_a_boolean_flag()
+    {
+        var parsed = ArgumentParser.Parse(["--mcp-config", "dast.json", "--require-mcp"]);
+
+        parsed.RequireMcp.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Require_mcp_defaults_to_false_so_legacy_invocations_keep_warning_only_behaviour()
+    {
+        // Historical behaviour: a misbehaving MCP server reports a warning and the run
+        // continues. --require-mcp is opt-in, so existing scripts must NOT start exiting
+        // non-zero on the upgrade.
+        var parsed = ArgumentParser.Parse(["--mcp-config", "dast.json"]);
+
+        parsed.RequireMcp.Should().BeFalse();
+    }
+
+    [Fact]
     public void Dast_invocation_with_mcp_config_and_allowed_tools()
     {
         // DastAgentService::run form.

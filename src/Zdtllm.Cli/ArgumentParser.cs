@@ -59,6 +59,12 @@ internal static class ArgumentParser
                 case "--mcp-config":
                     result.McpConfigs.Add(NextValue(args, ref i, "--mcp-config"));
                     break;
+                case "--mcp-init-timeout-seconds":
+                    result.McpInitTimeoutSeconds = int.Parse(NextValue(args, ref i, "--mcp-init-timeout-seconds"));
+                    break;
+                case "--require-mcp":
+                    result.RequireMcp = true;
+                    break;
                 case "--verbose":
                     result.Verbose = true;
                     break;
@@ -160,6 +166,18 @@ internal sealed class ParsedArgs
     public string? AppendSystemPromptFile { get; set; }
     public List<string> AddDirs { get; } = new();
     public List<string> McpConfigs { get; } = new();
+    /// <summary>
+    /// Per-server MCP initialise/handshake timeout. Wins over <c>mcp.initTimeoutSeconds</c>
+    /// in settings.json; both fall back to 15 s when neither is set. Slow-booting servers
+    /// (Laravel/Django on Windows + Herd, cold caches, DB-dependent auth) routinely need 30–60 s.
+    /// </summary>
+    public int? McpInitTimeoutSeconds { get; set; }
+    /// <summary>
+    /// When set, zdt exits non-zero if any MCP server in the merged config fails to boot.
+    /// Off by default so a misbehaving server doesn't block the rest of the agent (the
+    /// historical behaviour); flip on in CI / production runs that depend on MCP-provided tools.
+    /// </summary>
+    public bool RequireMcp { get; set; }
     public bool Verbose { get; set; }
     public string? OutputFormat { get; set; }
     public List<string> AllowedTools { get; } = new();

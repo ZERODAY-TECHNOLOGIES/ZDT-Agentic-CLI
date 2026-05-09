@@ -106,7 +106,8 @@ public sealed class StreamJsonObserver : IAgentObserver
         int totalInputTokens,
         int totalOutputTokens,
         CancellationToken ct,
-        bool formatBreakdown = false) =>
+        bool formatBreakdown = false,
+        int toolErrorCount = 0) =>
         await EmitAsync(new
         {
             type = "result",
@@ -127,6 +128,13 @@ public sealed class StreamJsonObserver : IAgentObserver
             // no calls and we ended the turn as if there were none". The flag lets consumers
             // skip pattern-matching on result.text to reach the same conclusion.
             format_breakdown = formatBreakdown,
+            // Tool-error telemetry — non-breaking addition. subtype stays "success" when the
+            // model itself ended cleanly so existing consumers that branch on subtype keep
+            // working; consumers that need to distinguish "ran cleanly" from "every tool call
+            // failed" gate on these fields instead. had_tool_errors is the boolean form for
+            // consumers that don't want to compare ints; tool_error_count is the scalar.
+            had_tool_errors = toolErrorCount > 0,
+            tool_error_count = toolErrorCount,
             // Nested usage object mirrors the claude-cli shape; cache_* are always 0 because
             // LiteLLM /v1/chat/completions doesn't expose Anthropic-style prompt-cache totals
             // on non-Anthropic backends. Emitting them as 0 (instead of omitting) lets a
