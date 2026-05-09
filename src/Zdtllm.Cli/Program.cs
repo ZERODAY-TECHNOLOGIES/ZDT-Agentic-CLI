@@ -856,7 +856,8 @@ internal static class Program
         Console.WriteLine("  --add-dir <path>               add an extra accessible directory (repeatable)");
         Console.WriteLine("  --mcp-config <path>            load MCP server config from a JSON file (repeatable, last wins per server)");
         Console.WriteLine("  --mcp-init-timeout-seconds <n> per-server MCP handshake timeout (default 15; raise for slow-booting servers)");
-        Console.WriteLine("  --require-mcp                  exit non-zero if any MCP server fails to start (off by default)");
+        Console.WriteLine("  --require-mcp                  exit non-zero if any --mcp-config server fails to start (off by default;");
+        Console.WriteLine("                                 no-op when --mcp-config wasn't passed — see docs)");
         Console.WriteLine("  --verbose                      trace tool calls + results to stderr (durations, args/preview)");
         Console.WriteLine("  --output-format <fmt>          text (default) | json | stream-json — only honoured with -p");
         Console.WriteLine("  --tools <names...>             allowlist of tool names (space- or comma-separated, e.g. Read Glob Grep)");

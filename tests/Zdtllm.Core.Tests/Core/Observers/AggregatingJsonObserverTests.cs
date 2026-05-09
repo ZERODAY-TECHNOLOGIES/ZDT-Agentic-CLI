@@ -38,6 +38,52 @@ public sealed class AggregatingJsonObserverTests
     }
 
     [Fact]
+    public async Task Result_payload_carries_tool_error_count_and_had_tool_errors_in_sync_with_stream_json()
+    {
+        // Symmetry with StreamJsonObserver: --output-format json consumers shouldn't
+        // have to switch formats to read the same tool-error telemetry.
+        var agg = new AggregatingJsonObserver();
+        IAgentObserver obs = agg;
+
+        await obs.OnToolCallAsync("start_step", "{}", CancellationToken.None);
+        await obs.OnToolResultAsync("start_step", "[Unknown tool: start_step]", true,
+            TimeSpan.FromMilliseconds(1), CancellationToken.None);
+        await obs.OnFinalAsync("gave up", turns: 1, promptTokens: 100, completionTokens: 5, CancellationToken.None);
+        await obs.OnResultAsync(
+            subtype: "success", isError: false, numTurns: 1,
+            stopReason: "end_turn", resultText: "gave up",
+            totalInputTokens: 100, totalOutputTokens: 5,
+            ct: CancellationToken.None,
+            formatBreakdown: false,
+            toolErrorCount: 1);
+
+        var sw = new StringWriter();
+        await agg.EmitAsync(sw, CancellationToken.None);
+
+        using var doc = JsonDocument.Parse(sw.ToString());
+        var root = doc.RootElement;
+        root.GetProperty("tool_error_count").GetInt32().Should().Be(1);
+        root.GetProperty("had_tool_errors").GetBoolean().Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Tool_error_fields_default_to_zero_and_false_when_OnResult_is_never_called()
+    {
+        // Earlier tests (and live runs that crash before OnResultAsync fires) must keep
+        // working — the defaults give consumers stable fields to read.
+        var agg = new AggregatingJsonObserver();
+        IAgentObserver obs = agg;
+        await obs.OnFinalAsync("ok", 1, 10, 1, CancellationToken.None);
+
+        var sw = new StringWriter();
+        await agg.EmitAsync(sw, CancellationToken.None);
+
+        using var doc = JsonDocument.Parse(sw.ToString());
+        doc.RootElement.GetProperty("tool_error_count").GetInt32().Should().Be(0);
+        doc.RootElement.GetProperty("had_tool_errors").GetBoolean().Should().BeFalse();
+    }
+
+    [Fact]
     public async Task Result_field_falls_back_to_streamed_text_when_OnFinal_is_never_called()
     {
         // Defensive: if the agent crashes before OnFinal, we should still produce a

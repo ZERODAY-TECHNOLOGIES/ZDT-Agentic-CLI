@@ -173,9 +173,19 @@ internal sealed class ParsedArgs
     /// </summary>
     public int? McpInitTimeoutSeconds { get; set; }
     /// <summary>
-    /// When set, zdt exits non-zero if any MCP server in the merged config fails to boot.
-    /// Off by default so a misbehaving server doesn't block the rest of the agent (the
-    /// historical behaviour); flip on in CI / production runs that depend on MCP-provided tools.
+    /// When set, zdt exits non-zero if any MCP server in the merged <c>--mcp-config</c> set
+    /// fails to boot. Off by default so a misbehaving server doesn't block the rest of the
+    /// agent (the historical behaviour); flip on in CI / production runs that depend on
+    /// MCP-provided tools.
+    ///
+    /// <para>
+    /// <b>Scope:</b> the check is over the <i>declared</i> servers — i.e. those parsed from
+    /// <c>--mcp-config</c>. It is therefore a no-op when no <c>--mcp-config</c> was passed
+    /// at all (no servers were declared, so by definition none failed). Use it as
+    /// "if I declared MCP servers, none of them is allowed to fail," not as
+    /// "ensure MCP is configured at all" — for the latter the caller should validate its
+    /// own argv.
+    /// </para>
     /// </summary>
     public bool RequireMcp { get; set; }
     public bool Verbose { get; set; }

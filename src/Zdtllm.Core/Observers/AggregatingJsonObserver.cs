@@ -21,6 +21,11 @@ public sealed class AggregatingJsonObserver : IAgentObserver
     private int _turns;
     private int? _promptTokens;
     private int? _completionTokens;
+    // Mirror of the stream-json result-event tool-error telemetry. Captured via
+    // OnResultAsync so consumers of --output-format json can branch on the same signal
+    // (a clean run vs. one where every tool call failed) without having to switch
+    // formats. See StreamJsonObserver for the wire-shape rationale.
+    private int _toolErrorCount;
 
     private readonly object _gate = new();
 
@@ -91,6 +96,23 @@ public sealed class AggregatingJsonObserver : IAgentObserver
         return Task.CompletedTask;
     }
 
+    public Task OnResultAsync(
+        string subtype, bool isError, int numTurns, string? stopReason, string? resultText,
+        int totalInputTokens, int totalOutputTokens, CancellationToken ct,
+        bool formatBreakdown = false, int toolErrorCount = 0)
+    {
+        // Only the tool-error totals are pulled in here — stream-json owns the full
+        // result-event shape (subtype, is_error, stop_reason, format_breakdown). The
+        // aggregating json format is a different artifact (single self-describing
+        // payload of result + tool_calls) and we intentionally don't bloat it with
+        // every wire field. _toolEvents already carries per-call is_error.
+        lock (_gate)
+        {
+            _toolErrorCount = toolErrorCount;
+        }
+        return Task.CompletedTask;
+    }
+
     /// <summary>
     /// Render the buffered events as a single pretty JSON object and flush to <paramref name="sink"/>.
     /// Call once after RunTurnAsync returns. Idempotent isn't a concern — the typical caller is the
@@ -109,6 +131,11 @@ public sealed class AggregatingJsonObserver : IAgentObserver
                 turns = _turns,
                 prompt_tokens = _promptTokens,
                 completion_tokens = _completionTokens,
+                // Mirror of stream-json's tool-error telemetry — non-breaking addition so
+                // consumers of --output-format json can detect "every tool call failed"
+                // without having to switch to stream-json or walk every tool_calls entry.
+                had_tool_errors = _toolErrorCount > 0,
+                tool_error_count = _toolErrorCount,
                 tool_calls = _toolEvents.Select(e => new
                 {
                     name = e.Name,
