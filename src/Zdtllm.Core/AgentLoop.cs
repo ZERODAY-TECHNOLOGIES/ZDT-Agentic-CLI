@@ -1,6 +1,8 @@
 using System.Collections.Immutable;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Spectre.Console;
 using Zdtllm.Core.Sessions;
 using Zdtllm.LiteLLM;
@@ -67,6 +69,82 @@ public sealed class AgentLoop
     /// the thread pool.
     /// </summary>
     private int _turnToolErrorCount;
+
+    /// <summary>
+    /// Rolling window of recent tool-call fingerprints used by the loop detector.
+    /// Sized so 2-3 productive calls naturally evict any one entry, but a model stuck
+    /// in a 5-pattern rotation still triggers detection. Reset per <see cref="RunTurnAsync"/> —
+    /// loops don't span turns because each turn gets a fresh REPL prompt anyway.
+    /// All access goes through <see cref="_recentToolCallsLock"/>: tool dispatch can be
+    /// parallel (<c>MaxParallel &gt; 1</c>) and <see cref="Queue{T}"/> isn't thread-safe.
+    /// </summary>
+    private readonly Queue<ToolCallTrace> _recentToolCalls = new();
+    private readonly object _recentToolCallsLock = new();
+
+    /// <summary>
+    /// Counts loop-break warnings the model has received without changing strategy.
+    /// Resets the moment a tool call returns a result genuinely different from recent
+    /// same-tool calls. Once it reaches <see cref="MaxConsecutiveBreaks"/>, every
+    /// subsequent break message is suffixed with a stronger "stop calling tools, write
+    /// your final response" directive — there's no hard enforcement layer (the model
+    /// CAN still emit tool calls), but the message escalates from advisory to
+    /// imperative. This is a known limitation: a stubborn model will get the same
+    /// final message printed repeatedly until <c>MaxTurns</c> kicks in.
+    /// </summary>
+    private int _consecutiveLoopBreaks;
+
+    /// <summary>Window size for the rolling buffer of tool-call fingerprints.</summary>
+    private const int LoopWindowSize = 10;
+
+    /// <summary>
+    /// Number of identical-args + identical-result calls in the window before pre-execute
+    /// short-circuit fires. Threshold of 3 (block on the 3rd call) gives the model a free
+    /// retry — calling the same tool twice with the same args is plausible (verify-after-edit
+    /// path); calling it three times is loopy.
+    /// </summary>
+    private const int ExactRepeatThreshold = 3;
+
+    /// <summary>
+    /// Number of same-tool + same-result-hash calls (with permuted args) before the
+    /// post-execute warning fires on a search tool. Threshold of 3 matches the canonical
+    /// "Grep three different patterns, all return (no matches)" loop.
+    /// </summary>
+    private const int SameResultThreshold = 3;
+
+    /// <summary>
+    /// Once <see cref="_consecutiveLoopBreaks"/> reaches this, subsequent break messages
+    /// include the stronger "stop calling tools" directive.
+    /// </summary>
+    private const int MaxConsecutiveBreaks = 3;
+
+    /// <summary>
+    /// Permutation detection (same tool, same result, different args) only fires for
+    /// search tools where "tried 3 patterns, all return identical (no matches)" is a
+    /// genuine diagnostic signal. For Read/Bash/WebFetch/Edit/Write, legitimate same-result
+    /// patterns happen (reading 8 stub Migration_*.cs files all return similar headers,
+    /// `git status` returns the same string twice when nothing changed) and a permutation
+    /// warning would block productive work. Add new tools here only after confirming
+    /// "different args, same result" is a loop indicator and not a normal pattern.
+    /// </summary>
+    private static readonly HashSet<string> SearchToolsForPermutationCheck = new(StringComparer.Ordinal)
+    {
+        "Grep",
+        "Glob",
+        "WebSearch",
+    };
+
+    /// <summary>
+    /// Fingerprint of a recent tool call. <see cref="ResultHash"/> is the literal string
+    /// <c>"loop-break"</c> for short-circuited calls so the buffer slot still occupies
+    /// space (preventing the model from oscillating between two patterns and never
+    /// triggering threshold) but doesn't collide with any real result hash.
+    /// </summary>
+    private readonly record struct ToolCallTrace(string Tool, string ArgsHash, string ResultHash);
+
+    private const string ShortCircuitedResultMarker = "loop-break";
+
+    /// <summary>Compiled once — used by <see cref="HashResult"/> to collapse cosmetic whitespace differences.</summary>
+    private static readonly Regex WhitespaceRun = new(@"\s+", RegexOptions.Compiled);
 
     public AgentLoop(
         LiteLLMClient client,
@@ -141,6 +219,12 @@ public sealed class AgentLoop
         // this only resets for "this" agent — the parent's counter is untouched while a
         // subagent runs.
         Interlocked.Exchange(ref _turnToolErrorCount, 0);
+
+        // Loop detector also resets per-turn — a fresh REPL prompt represents a fresh
+        // intent and shouldn't inherit a previous turn's "stuck" state. The buffer is
+        // local to this AgentLoop instance, so subagents have their own.
+        Interlocked.Exchange(ref _consecutiveLoopBreaks, 0);
+        lock (_recentToolCallsLock) _recentToolCalls.Clear();
 
         // Bootstrap system prompt the first time the session is touched.
         if (session.Messages.Count == 0)
@@ -773,12 +857,274 @@ public sealed class AgentLoop
     {
         await SafeNotifyAsync(_observer?.OnToolCallAsync(call.FunctionName, call.Arguments, ct)).ConfigureAwait(false);
         var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        var argsHash = HashArgs(call.Arguments);
+
+        // Pre-execute exact-repeat short-circuit. Fires only when the same (tool, args)
+        // appeared at least ExactRepeatThreshold times in the window AND every prior
+        // occurrence returned the same result hash — i.e. results that legitimately differ
+        // (Read-after-Write, Bash with side effects, WebFetch on a moving page) are NOT
+        // short-circuited, the model is allowed to retry. Running cost: zero, the tool
+        // doesn't execute.
+        var exactBreak = CheckExactRepeat(call.FunctionName, argsHash);
+        if (exactBreak is not null)
+        {
+            sw.Stop();
+            Interlocked.Increment(ref _turnToolErrorCount);
+            var msg = Volatile.Read(ref _consecutiveLoopBreaks) >= MaxConsecutiveBreaks
+                ? exactBreak + "\n\n" + BuildFinalLoopExitMessage(call.FunctionName)
+                : exactBreak;
+
+            // Record the SHORT-CIRCUITED call too, with a sentinel result hash. Without
+            // this, the model could oscillate between two patterns A and B (each blocked
+            // once, then evicted, then blocked again) and never trip the threshold.
+            // Keeping every attempt in the buffer means the threshold counts attempts,
+            // not executions.
+            EnqueueTrace(new ToolCallTrace(call.FunctionName, argsHash, ShortCircuitedResultMarker));
+
+            await SafeNotifyAsync(_observer?.OnToolResultAsync(call.FunctionName, msg, true, sw.Elapsed, ct))
+                .ConfigureAwait(false);
+            return msg;
+        }
+
         var (content, isError) = await ExecuteToolCoreAsync(call, ctx, ct).ConfigureAwait(false);
         sw.Stop();
         if (isError) Interlocked.Increment(ref _turnToolErrorCount);
-        await SafeNotifyAsync(_observer?.OnToolResultAsync(call.FunctionName, content, isError, sw.Elapsed, ct))
+
+        var resultHash = HashResult(content);
+        EnqueueTrace(new ToolCallTrace(call.FunctionName, argsHash, resultHash));
+
+        // Post-execute permutation-loop check. Scoped to search tools (Grep/Glob/WebSearch)
+        // where "different args, same result" is genuinely diagnostic — for Read/Bash/etc.
+        // it's a normal pattern (reading multiple stub files, running `git status` twice).
+        // We've already paid for the call; appending the warning is the best we can do.
+        var permutationBreak = CheckPermutationLoop(call.FunctionName, resultHash);
+        var finalContent = content;
+        var finalIsError = isError;
+        if (permutationBreak is not null)
+        {
+            Interlocked.Increment(ref _turnToolErrorCount);
+            finalContent = content + "\n\n" + permutationBreak;
+            if (Volatile.Read(ref _consecutiveLoopBreaks) >= MaxConsecutiveBreaks)
+                finalContent += "\n\n" + BuildFinalLoopExitMessage(call.FunctionName);
+            finalIsError = true;
+        }
+        else
+        {
+            // Productive call (different result than recent same-tool calls) — reset the
+            // consecutive-break counter. A single bad streak shouldn't doom the rest of
+            // the run if the model finally finds something useful.
+            Volatile.Write(ref _consecutiveLoopBreaks, 0);
+        }
+
+        await SafeNotifyAsync(_observer?.OnToolResultAsync(call.FunctionName, finalContent, finalIsError, sw.Elapsed, ct))
             .ConfigureAwait(false);
-        return content;
+        return finalContent;
+    }
+
+    private void EnqueueTrace(ToolCallTrace trace)
+    {
+        lock (_recentToolCallsLock)
+        {
+            _recentToolCalls.Enqueue(trace);
+            while (_recentToolCalls.Count > LoopWindowSize) _recentToolCalls.Dequeue();
+        }
+    }
+
+    /// <summary>
+    /// Pre-execute check: count trailing-consecutive entries in the buffer whose
+    /// (tool, args, result) match each other. If at least
+    /// <see cref="ExactRepeatThreshold"/> - 1 trailing entries share the same result hash
+    /// for these (tool, args), block the next call (it would be the Nth identical one).
+    /// Earlier entries in the buffer with different result hashes are deliberately
+    /// ignored — they represent genuine state transitions (Read-after-Write, Edit-then-
+    /// verify) and the model is allowed to continue retrying once the state has changed.
+    /// </summary>
+    private string? CheckExactRepeat(string tool, string argsHash)
+    {
+        List<ToolCallTrace> matches;
+        lock (_recentToolCallsLock)
+        {
+            matches = _recentToolCalls.Where(c => c.Tool == tool && c.ArgsHash == argsHash).ToList();
+        }
+        if (matches.Count == 0) return null;
+
+        // Hammering past a previous break: if the most recent match for (tool, args)
+        // was already a short-circuited call, the model is re-emitting the same call
+        // immediately after being told to stop. Block again unconditionally — the
+        // trailing-same scan below would let it through (a single loop-break sentinel
+        // doesn't satisfy ExactRepeatThreshold-1).
+        if (matches[^1].ResultHash == ShortCircuitedResultMarker)
+        {
+            Interlocked.Increment(ref _consecutiveLoopBreaks);
+            return BuildLoopBreakMessage(tool, "identical_args_same_result", matches.Count + 1);
+        }
+
+        // Otherwise: walk matches from the most recent backwards, counting how many
+        // consecutive entries share the same result hash. The first entry whose hash
+        // differs breaks the run — that's a "state changed" point and we trust the
+        // model to be allowed to act on the new state.
+        var trailingHash = matches[^1].ResultHash;
+        var trailingSame = 0;
+        for (var i = matches.Count - 1; i >= 0; i--)
+        {
+            if (matches[i].ResultHash != trailingHash) break;
+            trailingSame++;
+        }
+        if (trailingSame < ExactRepeatThreshold - 1) return null;
+
+        Interlocked.Increment(ref _consecutiveLoopBreaks);
+        return BuildLoopBreakMessage(tool, "identical_args_same_result", trailingSame + 1);
+    }
+
+    /// <summary>
+    /// Post-execute check: have we seen this (tool, resultHash) combination
+    /// <see cref="SameResultThreshold"/>+ times in the window? Used to detect the
+    /// "Grep 5 different patterns, all return (no matches)" pattern. Scoped to
+    /// <see cref="SearchToolsForPermutationCheck"/>; everything else returns null.
+    /// </summary>
+    private string? CheckPermutationLoop(string tool, string resultHash)
+    {
+        if (!SearchToolsForPermutationCheck.Contains(tool)) return null;
+
+        int sameToolSameResult;
+        lock (_recentToolCallsLock)
+        {
+            sameToolSameResult = _recentToolCalls.Count(c => c.Tool == tool && c.ResultHash == resultHash);
+        }
+        if (sameToolSameResult < SameResultThreshold) return null;
+
+        Interlocked.Increment(ref _consecutiveLoopBreaks);
+        return BuildLoopBreakMessage(tool, "permuted_args_same_result", sameToolSameResult);
+    }
+
+    /// <summary>
+    /// Stable 16-hex-char fingerprint of a tool's argument JSON. Keys are sorted before
+    /// hashing so {"a":1,"b":2} fingerprints identically to {"b":2,"a":1} — open-source
+    /// models rotate key order between native and XML mode, and an earlier prototype
+    /// missed half the loop cases without normalisation. Garbage in (un-parseable JSON)
+    /// → fingerprint of the literal bytes; still works as a stable identifier.
+    /// </summary>
+    private static string HashArgs(string argsJson)
+    {
+        string normalized;
+        try
+        {
+            using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
+            normalized = JsonNormaliser.SortKeys(doc.RootElement);
+        }
+        catch (JsonException)
+        {
+            normalized = argsJson;
+        }
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)))[..16];
+    }
+
+    /// <summary>
+    /// Hash of a tool result. We hash the first 128 + last 128 chars (joined with a
+    /// separator) and collapse whitespace — defeats trivial cosmetic diffs while
+    /// catching cases where two outputs share a long prefix (filename + headers) but
+    /// differ in the tail (the actual data). Truncating to a head slice alone, as the
+    /// initial prototype did, would treat distinct outputs with the same metadata
+    /// header as identical.
+    /// </summary>
+    private static string HashResult(string content)
+    {
+        const int sliceLen = 128;
+        ReadOnlySpan<char> span = content;
+        string joined;
+        if (span.Length <= sliceLen * 2)
+        {
+            joined = content;
+        }
+        else
+        {
+            var head = span[..sliceLen].ToString();
+            var tail = span[^sliceLen..].ToString();
+            joined = head + "|" + tail;
+        }
+        var collapsed = WhitespaceRun.Replace(joined, " ").Trim();
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(collapsed)))[..16];
+    }
+
+    private static string BuildLoopBreakMessage(string tool, string kind, int count) => kind switch
+    {
+        "identical_args_same_result" =>
+            $"[loop-break] You called `{tool}` with identical arguments {count} times in the last " +
+            $"{LoopWindowSize} tool calls and the result was identical every time. " +
+            "Stop repeating — change tools, change arguments meaningfully, or accept the current " +
+            "state and proceed with what you already know.",
+        "permuted_args_same_result" =>
+            $"[loop-break] You called `{tool}` {count} times in the last {LoopWindowSize} tool calls " +
+            "with different arguments but got the same result every time. This usually means " +
+            "the codebase doesn't contain what you're searching for. Stop permuting the arguments " +
+            "— accept the absence of matches and proceed with the analysis you can perform " +
+            "based on what you've already read.",
+        _ => $"[loop-break] {tool}: detected unproductive loop pattern; change strategy.",
+    };
+
+    private static string BuildFinalLoopExitMessage(string tool) =>
+        $"[loop-break-final] You have ignored {MaxConsecutiveBreaks} consecutive loop-break warnings. " +
+        "Stop calling tools and write your final response based on the information you've already " +
+        "gathered. Do not call any more tools this turn.";
+
+    /// <summary>
+    /// Recursive JSON normaliser: sorts object keys lexicographically, preserves array
+    /// order (arrays are positional), and writes primitives unchanged. Used by
+    /// <see cref="HashArgs"/> so semantically-equivalent argument blobs collide on the
+    /// same fingerprint regardless of key ordering choices the model makes.
+    /// </summary>
+    private static class JsonNormaliser
+    {
+        public static string SortKeys(JsonElement root)
+        {
+            using var ms = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(ms))
+            {
+                Write(writer, root);
+            }
+            return Encoding.UTF8.GetString(ms.ToArray());
+        }
+
+        private static void Write(Utf8JsonWriter w, JsonElement el)
+        {
+            switch (el.ValueKind)
+            {
+                case JsonValueKind.Object:
+                    w.WriteStartObject();
+                    foreach (var p in el.EnumerateObject().OrderBy(p => p.Name, StringComparer.Ordinal))
+                    {
+                        w.WritePropertyName(p.Name);
+                        Write(w, p.Value);
+                    }
+                    w.WriteEndObject();
+                    break;
+                case JsonValueKind.Array:
+                    w.WriteStartArray();
+                    foreach (var item in el.EnumerateArray()) Write(w, item);
+                    w.WriteEndArray();
+                    break;
+                case JsonValueKind.String:
+                    w.WriteStringValue(el.GetString());
+                    break;
+                case JsonValueKind.Number:
+                    // RawText preserves the exact textual form (integer vs decimal).
+                    w.WriteRawValue(el.GetRawText(), skipInputValidation: true);
+                    break;
+                case JsonValueKind.True:
+                    w.WriteBooleanValue(true);
+                    break;
+                case JsonValueKind.False:
+                    w.WriteBooleanValue(false);
+                    break;
+                case JsonValueKind.Null:
+                    w.WriteNullValue();
+                    break;
+                default:
+                    w.WriteNullValue();
+                    break;
+            }
+        }
     }
 
     private async Task<(string Content, bool IsError)> ExecuteToolCoreAsync(ToolCall call, ToolContext ctx, CancellationToken ct)
