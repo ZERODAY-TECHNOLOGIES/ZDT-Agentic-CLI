@@ -70,6 +70,77 @@ public sealed class ReplQueueTests : IDisposable
     }
 
     [Fact]
+    public async Task Persistent_session_farewell_shows_resume_command_on_exit()
+    {
+        var http = new HttpClient(new StubHandler());
+        var client = new LiteLLMClient(http, new LiteLLMClientOptions
+        {
+            BaseUrl = "http://stub", ApiKey = "k", MaxRetries = 0, InitialBackoff = TimeSpan.FromMilliseconds(1),
+        });
+        var agent = new AgentLoop(client, new ToolRegistry(), PermissionRuleSet.Empty,
+            new AgentLoopOptions { Model = "test-model" });
+
+        using var store = SessionStore.Create(_tempDir);
+        var session = Session.NewPersistent(store, "test-model");
+        var output = new StringWriter();
+        var repl = new Zdtllm.Core.Repl.Repl(
+            session, agent, new StringReader("/exit\n"), output, new StringWriter(), _tempDir);
+
+        await repl.RunAsync();
+
+        var text = output.ToString();
+        text.Should().Contain("closed");
+        text.Should().Contain($"zdt -r {session.Id}");
+    }
+
+    [Fact]
+    public async Task Ephemeral_session_farewell_says_nothing_saved()
+    {
+        var http = new HttpClient(new StubHandler());
+        var client = new LiteLLMClient(http, new LiteLLMClientOptions
+        {
+            BaseUrl = "http://stub", ApiKey = "k", MaxRetries = 0, InitialBackoff = TimeSpan.FromMilliseconds(1),
+        });
+        var agent = new AgentLoop(client, new ToolRegistry(), PermissionRuleSet.Empty,
+            new AgentLoopOptions { Model = "test-model" });
+
+        var session = Session.NewEphemeral("test-model");
+        var output = new StringWriter();
+        var repl = new Zdtllm.Core.Repl.Repl(
+            session, agent, new StringReader("/exit\n"), output, new StringWriter(), _tempDir);
+
+        await repl.RunAsync();
+
+        output.ToString().Should().Contain("ephemeral");
+    }
+
+    [Fact]
+    public async Task Slash_plan_toggles_plan_mode_on_and_off()
+    {
+        var http = new HttpClient(new StubHandler());
+        var client = new LiteLLMClient(http, new LiteLLMClientOptions
+        {
+            BaseUrl = "http://stub", ApiKey = "k", MaxRetries = 0, InitialBackoff = TimeSpan.FromMilliseconds(1),
+        });
+        var agent = new AgentLoop(client, new ToolRegistry(), PermissionRuleSet.Empty,
+            new AgentLoopOptions { Model = "test-model" });
+
+        var plan = new Zdtllm.Tools.PlanModeState(active: false);
+        var session = Session.NewEphemeral("test-model");
+        var output = new StringWriter();
+        var repl = new Zdtllm.Core.Repl.Repl(
+            session, agent, new StringReader("/plan\n/plan\n/exit\n"),
+            output, new StringWriter(), _tempDir, planMode: plan);
+
+        await repl.RunAsync();
+
+        // Toggled on then off → ends off. Output shows both transitions.
+        plan.InPlanMode.Should().BeFalse();
+        output.ToString().Should().Contain("Plan mode ON");
+        output.ToString().Should().Contain("Plan mode OFF");
+    }
+
+    [Fact]
     public async Task No_queue_configured_behaves_exactly_like_before()
     {
         var handler = new StubHandler(Sse(FinalText("only-answer")));

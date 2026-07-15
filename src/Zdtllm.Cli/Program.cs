@@ -4,6 +4,7 @@ using Spectre.Console;
 using Zdtllm.Config;
 using Zdtllm.Core;
 using Zdtllm.Core.Observers;
+using Zdtllm.Cli.Input;
 using Zdtllm.Core.Repl;
 using Zdtllm.Core.Sessions;
 using Zdtllm.Core.Setup;
@@ -154,9 +155,22 @@ internal static class Program
             && !Console.IsInputRedirected
             && !Console.IsOutputRedirected;
         UserInputQueue? inputQueue = interactive ? new UserInputQueue() : null;
-        ConsoleTurnInput? turnInput = interactive
-            ? new ConsoleTurnInput(inputQueue!, AnsiConsole.Console)
+        ConsoleInput? turnInput = interactive
+            ? new ConsoleInput(inputQueue!, AnsiConsole.Console)
             : null;
+        // The rich line editor (multi-line paste, drag & drop, in-line editing) needs an ANSI
+        // terminal and can be turned off with ZDT_BASIC_INPUT for anyone whose terminal misbehaves.
+        // Capture + the arrow-key pickers still work without it — only idle line editing falls back
+        // to the classic Console.ReadLine.
+        var basicInput = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ZDT_BASIC_INPUT"));
+        var richInputSource = turnInput is not null
+            && !basicInput
+            && AnsiConsole.Console.Profile.Capabilities.Ansi
+            ? turnInput
+            : null;
+        // Plan mode: read-only research + plan-for-approval. Interactive-only (ExitPlanMode needs
+        // a human to approve). Starts on when --plan is passed; toggled at runtime with /plan.
+        PlanModeState? planMode = interactive ? new PlanModeState(parsed.Plan) : null;
 
         var registry = new ToolRegistry();
         registry.Register(new ReadTool());
@@ -173,6 +187,8 @@ internal static class Program
             registry.Register(new SkillTool(skills));
         if (turnInput is not null)
             registry.Register(new AskUserQuestionTool(turnInput));
+        if (turnInput is not null && planMode is not null)
+            registry.Register(new ExitPlanModeTool(planMode, turnInput));
 
         // MCP servers — parse every --mcp-config in order (later entries override earlier ones
         // for the same server name), spawn each as a stdio subprocess, register its tools as
@@ -268,7 +284,8 @@ internal static class Program
             context: contextManager,
             richConsole: formatOwnsStdout ? null : richConsole,
             observer: observer,
-            inputQueue: inputQueue);
+            inputQueue: inputQueue,
+            planMode: planMode);
 
         // Task tool needs the parent agent to spawn subagents from. Register it AFTER the
         // agent is built — the registry holds a live reference, so the parent agent will see
@@ -378,6 +395,11 @@ internal static class Program
         var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0";
         var sessionDisplay = session.IsPersistent ? session.Id : $"{session.Id} (ephemeral)";
         Branding.PrintStartupBanner(AnsiConsole.Console, version, session.Model, session.Mode, sessionDisplay);
+        if (planMode?.InPlanMode == true)
+            AnsiConsole.MarkupLine(
+                $"[bold {Branding.Hex(Branding.BrandGold)}]◆ plan mode[/] " +
+                $"[{Branding.Hex(Branding.MutedText)}]— read-only; the agent proposes a plan for your approval. " +
+                "Toggle with [/]" + $"[bold {Branding.Hex(Branding.BodyText)}]/plan[/][{Branding.Hex(Branding.MutedText)}].[/]");
 
         var repl = new Repl(
             session,
@@ -389,29 +411,46 @@ internal static class Program
             richConsole: richConsole,
             subagentRunner: subagentRunner,
             inputQueue: inputQueue,
-            inputCapture: turnInput);
+            inputCapture: turnInput,
+            planMode: planMode,
+            richInput: richInputSource);
 
-        var ctrlCCount = 0;
-        // Single reusable timer instead of allocating a new Task.Delay+ContinueWith on every
-        // Ctrl+C. A user mashing Ctrl+C couldn't accumulate orphaned tasks anymore — the
-        // timer just resets its "due time" each press.
+        // Ctrl+C behaviour, matching claude-cli:
+        //   • During a turn  → first press interrupts the turn (keeps the REPL alive) and clears
+        //     any pending exit-arm; the turn's cancellation prints "(turn cancelled)".
+        //   • At the prompt  → first press arms "press again to exit" (a hint is shown); a second
+        //     idle press within the window exits. The arm auto-disarms after 2 s.
+        // Interlocked exchange on the arm flag keeps the two Ctrl+C presses from racing.
+        var exitArmed = 0;
         using var ctrlCResetTimer = new System.Threading.Timer(
-            _ => Interlocked.Exchange(ref ctrlCCount, 0), null, Timeout.Infinite, Timeout.Infinite);
+            _ => Interlocked.Exchange(ref exitArmed, 0), null, Timeout.Infinite, Timeout.Infinite);
         Console.CancelKeyPress += (_, e) =>
         {
-            // First Ctrl+C: cancel the active turn (kills agent + every subagent it spawned via
-            // the linked CT chain) but keep the REPL alive. Second Ctrl+C in a row: exit hard.
-            if (Interlocked.Increment(ref ctrlCCount) >= 2)
+            if (repl.IsTurnActive)
             {
+                // Interrupt the running turn; never exit mid-turn (return to the prompt first).
+                Interlocked.Exchange(ref exitArmed, 0);
+                e.Cancel = true;
+                repl.CancelCurrentTurn();
+                return;
+            }
+
+            // Idle: two presses to exit.
+            if (Interlocked.Exchange(ref exitArmed, 1) == 1)
+            {
+                // Console reads don't reliably unblock on cancellation (Windows), so print the
+                // farewell here (idempotent — the RunAsync finally won't double it) and let the
+                // runtime tear us down.
+                repl.PrintFarewell();
                 e.Cancel = false;
                 programCts.Cancel();
                 return;
             }
+
             e.Cancel = true;
-            repl.CancelCurrentTurn();
-            // (Re)arm the reset timer for 1.5 s out so a slow second Ctrl+C doesn't accidentally
-            // exit. Re-Change just shifts the due time — no new allocation.
-            ctrlCResetTimer.Change(1500, Timeout.Infinite);
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("  (press Ctrl+C again to exit)");
+            ctrlCResetTimer.Change(2000, Timeout.Infinite);
         };
 
         return await repl.RunAsync(parsed.Query, programCts.Token).ConfigureAwait(false);
@@ -962,6 +1001,7 @@ internal static class Program
         Console.WriteLine("  --dangerously-skip-permissions auto-allow tools that would otherwise prompt");
         Console.WriteLine("  --no-wizard                    skip the first-run setup wizard");
         Console.WriteLine("  --bare                         skip auto-discovery of skills");
+        Console.WriteLine("  --plan                         start in plan mode (read-only; propose a plan before changes)");
         Console.WriteLine("  --tool-calling <native|xml>    transport for tool calls (default: native)");
         Console.WriteLine("  --system-prompt <text>         replace the default system prompt with <text>");
         Console.WriteLine("  --system-prompt-file <path>    replace the default system prompt with file contents");

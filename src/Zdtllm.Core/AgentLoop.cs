@@ -66,6 +66,13 @@ public sealed class AgentLoop
     private readonly IUserInputQueue? _inputQueue;
 
     /// <summary>
+    /// Optional plan-mode switch. When on, mutating tools are blocked and each user prompt is
+    /// grounded with a plan-mode reminder, so the agent researches + drafts a plan (and calls
+    /// ExitPlanMode) instead of changing the workspace. Null (the common case) disables all of it.
+    /// </summary>
+    private readonly IPlanModeSwitch? _planMode;
+
+    /// <summary>
     /// Per-turn count of tool calls that returned <c>isError=true</c> (unknown tool,
     /// permission denied, JSON parse failure, tool's own thrown exception, etc.). Reset
     /// at the top of every <see cref="RunTurnAsync"/> call and surfaced via
@@ -162,7 +169,8 @@ public sealed class AgentLoop
         ContextManager? context = null,
         IAnsiConsole? richConsole = null,
         IAgentObserver? observer = null,
-        IUserInputQueue? inputQueue = null)
+        IUserInputQueue? inputQueue = null,
+        IPlanModeSwitch? planMode = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(tools);
@@ -176,6 +184,7 @@ public sealed class AgentLoop
         _richConsole = richConsole;
         _observer = observer;
         _inputQueue = inputQueue;
+        _planMode = planMode;
     }
 
     public PermissionRuleSet Permissions => _perms;
@@ -245,7 +254,13 @@ public sealed class AgentLoop
             session.AddSystem(systemPrompt);
         }
 
-        session.AddUser(userPrompt);
+        // Plan mode grounding: fold a reminder into the user turn so any model — however long the
+        // context has grown — keeps behaving read-only until the user approves a plan. The
+        // hard guarantee is the tool-dispatch block below; this just keeps the model cooperative.
+        var effectivePrompt = _planMode?.InPlanMode == true
+            ? userPrompt + "\n\n" + PlanModeState.Reminder
+            : userPrompt;
+        session.AddUser(effectivePrompt);
 
         IReadOnlyList<ToolDef>? toolDefList = null;
         if (!xmlMode)
@@ -1187,6 +1202,13 @@ public sealed class AgentLoop
         var tool = _tools.Get(call.FunctionName);
         if (tool is null)
             return (BuildUnknownToolMessage(call.FunctionName), true);
+
+        // Plan-mode hard guard: refuse the mutating tools regardless of permission rules. The
+        // model is told (via the reminder + this message) to draft a plan and call ExitPlanMode.
+        if (_planMode?.InPlanMode == true && PlanModeState.BlockedTools.Contains(call.FunctionName))
+            return ($"[blocked: plan mode is ON] `{call.FunctionName}` modifies the workspace and is " +
+                    "not allowed while planning. Finish investigating with read-only tools, then call " +
+                    "ExitPlanMode with your plan to get the user's approval before making changes.", true);
 
         JsonDocument argsDoc;
         try

@@ -201,6 +201,13 @@ public sealed class ArgumentParserTests
     }
 
     [Fact]
+    public void Plan_flag_is_parsed()
+    {
+        ArgumentParser.Parse(["--plan"]).Plan.Should().BeTrue();
+        ArgumentParser.Parse([]).Plan.Should().BeFalse();
+    }
+
+    [Fact]
     public void Resume_with_uuid_sets_resume_id_and_no_picker()
     {
         var parsed = ArgumentParser.Parse(["--resume", "abc-123"]);

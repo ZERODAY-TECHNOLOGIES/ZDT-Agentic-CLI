@@ -29,6 +29,8 @@ public sealed class Repl
     private readonly ISubagentRunner? _subagentRunner;
     private readonly IUserInputQueue? _inputQueue;
     private readonly ITurnInputCapture? _inputCapture;
+    private readonly IPlanModeSwitch? _planMode;
+    private IReplInputSource? _richInput;
     private CancellationTokenSource? _currentTurnCts;
 
     public Repl(
@@ -42,7 +44,9 @@ public sealed class Repl
         IAnsiConsole? richConsole = null,
         ISubagentRunner? subagentRunner = null,
         IUserInputQueue? inputQueue = null,
-        ITurnInputCapture? inputCapture = null)
+        ITurnInputCapture? inputCapture = null,
+        IPlanModeSwitch? planMode = null,
+        IReplInputSource? richInput = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(agent);
@@ -62,6 +66,8 @@ public sealed class Repl
         _subagentRunner = subagentRunner;
         _inputQueue = inputQueue;
         _inputCapture = inputCapture;
+        _planMode = planMode;
+        _richInput = richInput;
     }
 
     /// <summary>
@@ -70,6 +76,12 @@ public sealed class Repl
     /// (and any subagents it spawned, since they share this token chain) but
     /// keeps the REPL alive for the next prompt.
     /// </summary>
+    /// <summary>
+    /// True while a turn is executing (used by the Ctrl+C handler to decide between
+    /// "interrupt the running turn" and "arm the press-again-to-exit hint").
+    /// </summary>
+    public bool IsTurnActive => _currentTurnCts is not null;
+
     public void CancelCurrentTurn()
     {
         // The CTS is owned by the per-turn `using` in ProcessUserTurnAsync. CancelKeyPress
@@ -82,40 +94,103 @@ public sealed class Repl
 
     public async Task<int> RunAsync(string? initialPrompt = null, CancellationToken ct = default)
     {
-        if (!string.IsNullOrWhiteSpace(initialPrompt))
+        try
         {
-            await RunTurnAndFollowupsAsync(initialPrompt, ct).ConfigureAwait(false);
-        }
-
-        while (!ct.IsCancellationRequested)
-        {
-            await _output.WriteAsync(Palette.Cyan("> ")).ConfigureAwait(false);
-            await _output.FlushAsync(ct).ConfigureAwait(false);
-
-            string? line;
-            try { line = await _input.ReadLineAsync(ct).ConfigureAwait(false); }
-            catch (OperationCanceledException) { return 0; }
-
-            if (line is null) // EOF
+            if (!string.IsNullOrWhiteSpace(initialPrompt))
             {
-                await _output.WriteLineAsync().ConfigureAwait(false);
-                return 0;
+                await RunTurnAndFollowupsAsync(initialPrompt, ct).ConfigureAwait(false);
             }
 
-            var trimmed = line.Trim();
-            if (trimmed.Length == 0) continue;
-
-            if (trimmed.StartsWith('/'))
+            while (!ct.IsCancellationRequested)
             {
-                var slashResult = await HandleSlashAsync(trimmed, ct).ConfigureAwait(false);
-                if (slashResult == SlashOutcome.Exit) return 0;
-                continue;
+                string? line;
+                try { line = await ReadInputLineAsync(ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return 0; }
+
+                if (line is null) // EOF (Ctrl+D) / exit request
+                {
+                    await _output.WriteLineAsync().ConfigureAwait(false);
+                    return 0;
+                }
+
+                var trimmed = line.Trim();
+                if (trimmed.Length == 0) continue;
+
+                if (trimmed.StartsWith('/'))
+                {
+                    var slashResult = await HandleSlashAsync(trimmed, ct).ConfigureAwait(false);
+                    if (slashResult == SlashOutcome.Exit) return 0;
+                    continue;
+                }
+
+                await RunTurnAndFollowupsAsync(trimmed, ct).ConfigureAwait(false);
             }
 
-            await RunTurnAndFollowupsAsync(trimmed, ct).ConfigureAwait(false);
+            return 0;
+        }
+        finally
+        {
+            // Print the closed-session farewell on EVERY exit path — /exit, EOF, or Ctrl+C
+            // (which cancels ct and drops us out of the loop) — exactly like claude-cli.
+            PrintFarewell();
+        }
+    }
+
+    /// <summary>
+    /// On the way out, tell the user which session just closed and how to pick it back up —
+    /// so a resume is one paste away. Ephemeral sessions have nothing to resume; say so.
+    /// Idempotent: safe to call from both the RunAsync finally and the Ctrl+C exit handler
+    /// (a double Ctrl+C hard-exits before the finally can run reliably), it prints only once.
+    /// Synchronous so it completes even on the abrupt Ctrl+C teardown path.
+    /// </summary>
+    public void PrintFarewell()
+    {
+        if (Interlocked.Exchange(ref _farewellShown, 1) == 1) return;
+        _output.WriteLine();
+        if (_session.IsPersistent)
+        {
+            _output.WriteLine(
+                Palette.Mute("Session ") + Palette.Body(_session.Id) + Palette.Mute(" closed. Resume it with  ") +
+                Palette.Cyan($"zdt -r {_session.Id}"));
+            _output.WriteLine(
+                Palette.Mute("or pick from recent conversations with  ") + Palette.Cyan("zdt -r"));
+        }
+        else
+        {
+            _output.WriteLine(Palette.Mute("Session ended (ephemeral — nothing was saved)."));
+        }
+        _output.Flush();
+    }
+
+    private int _farewellShown;
+
+    /// <summary>
+    /// Read one line of input. Uses the rich line editor (multi-line paste, drag & drop) when one
+    /// is wired in; if it ever throws, that path is disabled for the rest of the session and we
+    /// fall back to the classic prompt + <c>ReadLine</c> — so a terminal quirk can never brick
+    /// input. The classic path prints its own "> " prompt; the rich editor draws its own.
+    /// </summary>
+    private async Task<string?> ReadInputLineAsync(CancellationToken ct)
+    {
+        if (_richInput is not null)
+        {
+            try
+            {
+                return await _richInput.ReadLineAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _richInput = null; // fall back permanently for this session
+                await _error.WriteLineAsync(
+                    Palette.Mute($"(rich input disabled: {ex.Message}; using basic line input)"))
+                    .ConfigureAwait(false);
+            }
         }
 
-        return 0;
+        await _output.WriteAsync(Palette.Cyan("> ")).ConfigureAwait(false);
+        await _output.FlushAsync(ct).ConfigureAwait(false);
+        return await _input.ReadLineAsync(ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -267,6 +342,10 @@ public sealed class Repl
                 await HandleContextCommandAsync().ConfigureAwait(false);
                 return SlashOutcome.Continue;
 
+            case "/plan":
+                await HandlePlanCommandAsync().ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
             default:
                 await _output.WriteLineAsync(
                         Palette.Red($"Unknown command: {cmd}.") + " " +
@@ -296,6 +375,7 @@ public sealed class Repl
         await WriteCommandRowAsync("/permissions", "show the current permission rule set").ConfigureAwait(false);
         await WriteCommandRowAsync("/init", "create ZDTLLM.md (project memory file) in the cwd").ConfigureAwait(false);
         await WriteCommandRowAsync("/compact", "summarize older turns to free context").ConfigureAwait(false);
+        await WriteCommandRowAsync("/plan", "toggle plan mode (read-only; propose a plan before changes)").ConfigureAwait(false);
         await WriteCommandRowAsync("/agents", "list available subagent types and their tool sets").ConfigureAwait(false);
     }
 
@@ -369,6 +449,8 @@ public sealed class Repl
         await _output.WriteLineAsync($"  {Palette.Mute("session:")} {Palette.Body(SessionDisplay())}").ConfigureAwait(false);
         await _output.WriteLineAsync($"  {Palette.Mute("model:")} {Palette.GoldBold(_session.Model)}").ConfigureAwait(false);
         await _output.WriteLineAsync($"  {Palette.Mute("mode:")} {Palette.Body(_session.Mode.ToString().ToLowerInvariant())}").ConfigureAwait(false);
+        if (_planMode?.InPlanMode == true)
+            await _output.WriteLineAsync($"  {Palette.Mute("plan:")} {Palette.Gold("ON (read-only)")}").ConfigureAwait(false);
         await _output.WriteLineAsync($"  {Palette.Mute("messages:")} {Palette.Body(_session.Messages.Count.ToString())}").ConfigureAwait(false);
         await _output.WriteLineAsync($"  {Palette.Mute("cwd:")} {Palette.Body(_cwd)}").ConfigureAwait(false);
 
@@ -546,6 +628,35 @@ public sealed class Repl
     }
 
     private static string Hex(Spectre.Console.Color c) => $"#{c.R:X2}{c.G:X2}{c.B:X2}";
+
+    private async Task HandlePlanCommandAsync()
+    {
+        if (_planMode is null)
+        {
+            await _output.WriteLineAsync(
+                Palette.Mute("/plan needs interactive mode (it's not available in -p / non-TTY runs)."))
+                .ConfigureAwait(false);
+            return;
+        }
+
+        if (_planMode.InPlanMode)
+        {
+            _planMode.Approve();
+            await _output.WriteLineAsync(
+                Palette.Cyan("✓") + " " + Palette.Body("Plan mode OFF") + " " +
+                Palette.Mute("— edits and commands are allowed again."))
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            _planMode.Enter();
+            await _output.WriteLineAsync(
+                Palette.Gold("◆ Plan mode ON") + " " +
+                Palette.Mute("— read-only. The agent will research and propose a plan; " +
+                             "approve it (or run /plan again) to make changes."))
+                .ConfigureAwait(false);
+        }
+    }
 
     private async Task HandleContextCommandAsync()
     {

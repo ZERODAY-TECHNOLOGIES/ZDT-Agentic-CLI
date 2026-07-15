@@ -183,6 +183,24 @@ a short list of options; you pick with ↑/↓ and Enter (Space toggles for mult
 registered only in interactive mode, so in `-p` / subagent runs the model is told to decide
 for itself instead of blocking on input that will never arrive.
 
+**Plan mode.** Start with `--plan`, or toggle it any time with `/plan`. In plan mode the agent
+is read-only — `Write`, `Edit`, `NotebookEdit` and `Bash` are blocked — so it investigates and
+drafts a step-by-step plan, then calls `ExitPlanMode` to show it to you. Approve it (arrow keys)
+and edits unlock on the next turn; decline and it keeps refining. Great for "look before you leap"
+on unfamiliar code.
+
+**Multi-line paste & drag-and-drop.** The interactive prompt is a real line editor: pasting a
+multi-line block no longer submits at the first newline — the whole thing lands as one message
+(large pastes collapse to a compact `[pasted N lines]` chip). Dragging a file onto the terminal
+drops its path into the prompt, cleaned up (quotes / `file://` stripped) so the agent can read it.
+Editing keys — cursor moves, Home/End, Backspace/Delete, Ctrl+A/E/U/K, Ctrl+D to exit on an empty
+line — all work. Set `ZDT_BASIC_INPUT=1` to fall back to plain line input on a terminal where the
+editor misbehaves.
+
+**Graceful exit.** On `/exit`, EOF, or Ctrl+C, zdt tells you which session just closed and how to
+resume it (`zdt -r <id>`). During a turn, one Ctrl+C interrupts just that turn; at the prompt, one
+Ctrl+C shows "press again to exit" and a second one exits — exactly like claude-cli.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

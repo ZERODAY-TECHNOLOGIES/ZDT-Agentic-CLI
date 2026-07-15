@@ -36,6 +36,17 @@ public interface IUserInputQueue
 }
 
 /// <summary>
+/// The REPL's idle line reader. The plain path wraps a <see cref="System.IO.TextReader"/>
+/// (tests, non-TTY); the interactive path is a full line editor that draws its own prompt and
+/// supports multi-line paste and drag-and-drop. Returns null on EOF / exit request.
+/// </summary>
+public interface IReplInputSource
+{
+    /// <summary>Read one submitted line (pastes resolved to real text). Null = EOF / exit.</summary>
+    Task<string?> ReadLineAsync(CancellationToken ct);
+}
+
+/// <summary>
 /// Controls the background console reader that captures keystrokes into the
 /// <see cref="IUserInputQueue"/> while a turn is running. The REPL flips it on for the duration
 /// of each turn and off once the turn (and its queued follow-ups) are done. Kept as a tiny

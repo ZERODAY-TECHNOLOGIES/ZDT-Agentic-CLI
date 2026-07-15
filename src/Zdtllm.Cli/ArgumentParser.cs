@@ -38,6 +38,9 @@ internal static class ArgumentParser
                 case "--bare":
                     result.Bare = true;
                     break;
+                case "--plan":
+                    result.Plan = true;
+                    break;
                 case "--tool-calling":
                     result.ToolCallingMode = NextValue(args, ref i, "--tool-calling");
                     break;
@@ -173,6 +176,8 @@ internal sealed class ParsedArgs
     public bool DangerouslySkipPermissions { get; set; }
     public bool NoWizard { get; set; }
     public bool Bare { get; set; }
+    /// <summary>Start the interactive session in plan mode (read-only; drafts a plan for approval).</summary>
+    public bool Plan { get; set; }
     public string? ToolCallingMode { get; set; }
     public string? SessionId { get; set; }
     public bool Continue { get; set; }
