@@ -201,6 +201,44 @@ public sealed class ArgumentParserTests
     }
 
     [Fact]
+    public void Resume_with_uuid_sets_resume_id_and_no_picker()
+    {
+        var parsed = ArgumentParser.Parse(["--resume", "abc-123"]);
+
+        parsed.Resume.Should().Be("abc-123");
+        parsed.ResumePicker.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Resume_short_flag_with_uuid_sets_resume_id()
+    {
+        var parsed = ArgumentParser.Parse(["-r", "abc-123"]);
+
+        parsed.Resume.Should().Be("abc-123");
+        parsed.ResumePicker.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Resume_with_no_value_at_end_of_argv_triggers_picker()
+    {
+        var parsed = ArgumentParser.Parse(["-r"]);
+
+        parsed.Resume.Should().BeNull();
+        parsed.ResumePicker.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Resume_followed_by_another_flag_triggers_picker_and_leaves_that_flag_intact()
+    {
+        // `zdt --resume --model heavy` → picker + model, not "--model" consumed as the id.
+        var parsed = ArgumentParser.Parse(["--resume", "--model", "heavy"]);
+
+        parsed.ResumePicker.Should().BeTrue();
+        parsed.Resume.Should().BeNull();
+        parsed.Model.Should().Be("heavy");
+    }
+
+    [Fact]
     public void Dast_invocation_with_mcp_config_and_allowed_tools()
     {
         // DastAgentService::run form.

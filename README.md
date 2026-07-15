@@ -154,6 +154,35 @@ dotnet build
 dotnet run --project src/Zdtllm.Cli -- -p "Read README.md and tell me what it contains"
 ```
 
+### Interactive features
+
+These three claude-cli behaviours work with **any** LiteLLM-served model — nothing here is
+Anthropic-specific, and they degrade gracefully to a no-op when there's no real terminal
+(print mode, piped stdin, subagents).
+
+**Resume a past conversation with a picker.** `-r` / `--resume` now takes an *optional*
+session id:
+
+```bash
+zdt -r                # arrow-key list of this project's recent conversations, newest first
+zdt -r <uuid>         # resume a specific session directly (unchanged)
+```
+
+The picker shows each session's first message, how long ago it was touched, its turn count,
+and its model. Sessions live under `.zdtllm/sessions/`. When stdin is redirected it falls
+back to the most-recent session instead of prompting.
+
+**Queue messages while the model works.** You no longer have to wait for a turn to finish
+before typing the next thing. Keep typing while the model streams / calls tools; each line
+you enter is queued and folded into the *same* task at the next tool-round boundary (or run
+as a follow-up turn if the model already finished). zdt prints `↳ picked up your queued
+message` when it consumes one.
+
+**Let the model offer you choices.** The model can call the `AskUserQuestion` tool to present
+a short list of options; you pick with ↑/↓ and Enter (Space toggles for multi-select). It's
+registered only in interactive mode, so in `-p` / subagent runs the model is told to decide
+for itself instead of blocking on input that will never arrive.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

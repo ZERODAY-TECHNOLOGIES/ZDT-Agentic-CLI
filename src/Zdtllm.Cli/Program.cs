@@ -145,6 +145,19 @@ internal static class Program
 
         var memoryFile = TryReadMemoryFile(cwd);
 
+        // Interactive-only input plumbing: the message queue (type while the model works) and the
+        // console driver that captures those keystrokes AND powers AskUserQuestion's arrow-key
+        // picker. Requires a real TTY on both ends — print mode and redirected stdio get neither
+        // (the queue stays off; AskUserQuestion isn't registered so the model won't try to ask a
+        // human who isn't there).
+        var interactive = !parsed.PrintMode
+            && !Console.IsInputRedirected
+            && !Console.IsOutputRedirected;
+        UserInputQueue? inputQueue = interactive ? new UserInputQueue() : null;
+        ConsoleTurnInput? turnInput = interactive
+            ? new ConsoleTurnInput(inputQueue!, AnsiConsole.Console)
+            : null;
+
         var registry = new ToolRegistry();
         registry.Register(new ReadTool());
         registry.Register(new WriteTool());
@@ -158,6 +171,8 @@ internal static class Program
         registry.Register(new WebSearchTool());
         if (skills.Count > 0)
             registry.Register(new SkillTool(skills));
+        if (turnInput is not null)
+            registry.Register(new AskUserQuestionTool(turnInput));
 
         // MCP servers — parse every --mcp-config in order (later entries override earlier ones
         // for the same server name), spawn each as a stdio subprocess, register its tools as
@@ -191,6 +206,26 @@ internal static class Program
 
         var sessionsDir = Path.Combine(cwd, ".zdtllm", "sessions");
         var recent = RecentTracker.ForUserHome();
+
+        // --resume with no id: present the interactive picker (or, when stdin is redirected,
+        // fall back to the most-recent session). Resolves to a concrete Resume id so the
+        // ResolveSession switch below takes its existing "resume by id" path.
+        if (parsed.ResumePicker)
+        {
+            if (parsed.PrintMode)
+            {
+                await Console.Error.WriteLineAsync(
+                    "zdt: --resume with no session id needs interactive mode. In -p mode pass an " +
+                    "explicit id (--resume <uuid>) or use -c to continue the most recent session.")
+                    .ConfigureAwait(false);
+                return 2;
+            }
+
+            var pickedId = ResolveResumePickerId(sessionsDir, recent, cwd);
+            if (pickedId is null) return 0; // no sessions, or user cancelled — nothing to resume
+            parsed.Resume = pickedId;
+            parsed.ResumePicker = false;
+        }
 
         using var session = ResolveSession(parsed, settings, sessionsDir, recent, cwd, defaultPersistent: !parsed.PrintMode);
 
@@ -232,7 +267,8 @@ internal static class Program
             },
             context: contextManager,
             richConsole: formatOwnsStdout ? null : richConsole,
-            observer: observer);
+            observer: observer,
+            inputQueue: inputQueue);
 
         // Task tool needs the parent agent to spawn subagents from. Register it AFTER the
         // agent is built — the registry holds a live reference, so the parent agent will see
@@ -351,7 +387,9 @@ internal static class Program
             Console.Error,
             cwd,
             richConsole: richConsole,
-            subagentRunner: subagentRunner);
+            subagentRunner: subagentRunner,
+            inputQueue: inputQueue,
+            inputCapture: turnInput);
 
         var ctrlCCount = 0;
         // Single reusable timer instead of allocating a new Task.Delay+ContinueWith on every
@@ -380,6 +418,7 @@ internal static class Program
         }
         finally
         {
+            turnInput?.Dispose();
             await mcpManager.DisposeAsync().ConfigureAwait(false);
         }
     }
@@ -705,6 +744,80 @@ internal static class Program
         return SettingsLoader.LoadEffectiveSettings(cwd);
     }
 
+    /// <summary>
+    /// Resolve which session id the user wants to resume when <c>--resume</c> was passed with
+    /// no id. Presents an arrow-key Spectre picker of the most recent conversations for this
+    /// project. Returns the chosen id, or null when there's nothing to resume / the user
+    /// cancelled. When stdin is redirected (can't drive an interactive prompt) it falls back
+    /// to the most-recent session for the cwd so scripts still get sensible behaviour.
+    /// </summary>
+    private static string? ResolveResumePickerId(string sessionsDir, RecentTracker recent, string cwd)
+    {
+        var summaries = new SessionCatalog(sessionsDir).List(limit: 25);
+        if (summaries.Count == 0)
+        {
+            AnsiConsole.MarkupLine(
+                $"[{Branding.Hex(Branding.MutedText)}]No saved conversations for this project yet. " +
+                "Start one with [/]" + $"[bold {Branding.Hex(Branding.BodyText)}]zdt[/]" +
+                $"[{Branding.Hex(Branding.MutedText)}].[/]");
+            return null;
+        }
+
+        // Non-interactive stdin (piped / redirected) can't drive SelectionPrompt. Fall back to
+        // the recent-tracker's most-recent id, or the newest file if the tracker is empty.
+        if (Console.IsInputRedirected)
+            return recent.GetMostRecentForCwd(cwd) ?? summaries[0].Id;
+
+        var choices = summaries.ToList();
+        var prompt = new SelectionPrompt<SessionSummary>()
+            .Title($"[bold {Branding.Hex(Branding.BrandCyan)}]Resume a conversation[/] " +
+                   $"[{Branding.Hex(Branding.MutedText)}](↑/↓ to move, Enter to select, Esc/Ctrl+C to cancel)[/]")
+            .PageSize(12)
+            .HighlightStyle(new Style(Branding.BrandCyan))
+            .UseConverter(FormatSessionChoice)
+            .AddChoices(choices);
+
+        SessionSummary selected;
+        try
+        {
+            selected = AnsiConsole.Prompt(prompt);
+        }
+        catch (Exception)
+        {
+            // SelectionPrompt throws if the terminal can't support interaction after all
+            // (e.g. NO_COLOR dumb terminals). Degrade to most-recent rather than crashing.
+            return recent.GetMostRecentForCwd(cwd) ?? summaries[0].Id;
+        }
+
+        return selected.Id;
+    }
+
+    /// <summary>Render one session row for the resume picker: title · relative age · model.</summary>
+    private static string FormatSessionChoice(SessionSummary s)
+    {
+        var title = string.IsNullOrWhiteSpace(s.Name) ? s.Title : s.Name;
+        title = string.IsNullOrWhiteSpace(title) ? "(no messages)" : title;
+        const int cap = 64;
+        if (title!.Length > cap) title = string.Concat(title.AsSpan(0, cap), "…");
+
+        var age = FormatRelativeAge(s.LastModified);
+        var turns = s.AssistantTurns == 1 ? "1 turn" : $"{s.AssistantTurns} turns";
+        return
+            $"[{Branding.Hex(Branding.BodyText)}]{Markup.Escape(title)}[/]  " +
+            $"[{Branding.Hex(Branding.MutedText)}]· {age} · {turns} · {Markup.Escape(s.Model)}[/]";
+    }
+
+    private static string FormatRelativeAge(DateTimeOffset when)
+    {
+        var delta = DateTimeOffset.UtcNow - when;
+        if (delta < TimeSpan.Zero) delta = TimeSpan.Zero;
+        if (delta.TotalMinutes < 1) return "just now";
+        if (delta.TotalMinutes < 60) return $"{(int)delta.TotalMinutes}m ago";
+        if (delta.TotalHours < 24) return $"{(int)delta.TotalHours}h ago";
+        if (delta.TotalDays < 30) return $"{(int)delta.TotalDays}d ago";
+        return when.ToLocalTime().ToString("yyyy-MM-dd");
+    }
+
     private static Session ResolveSession(
         ParsedArgs parsed,
         EffectiveSettings settings,
@@ -836,6 +949,7 @@ internal static class Program
         Console.WriteLine("  zdt \"<query>\"                interactive REPL, kicked off with <query>");
         Console.WriteLine("  zdt -p \"<query>\"              one-shot print mode (ephemeral by default)");
         Console.WriteLine("  zdt -c                         interactive, resume most recent session");
+        Console.WriteLine("  zdt -r                         interactive, pick a recent session to resume");
         Console.WriteLine("  zdt -r <uuid>                  interactive, resume the given session");
         Console.WriteLine();
         Console.WriteLine("FLAGS:");
@@ -864,7 +978,7 @@ internal static class Program
         Console.WriteLine("  --allowed-tools <names...>     alias for --tools (claude-cli compat)");
         Console.WriteLine("  --session-id <uuid>            create or resume a persistent session at this id");
         Console.WriteLine("  -c, --continue                 resume the most recent session for this directory");
-        Console.WriteLine("  -r, --resume <uuid>            resume the specified session");
+        Console.WriteLine("  -r, --resume [uuid]            resume a session; with no uuid, pick from recent ones interactively");
         Console.WriteLine("  --version                      print version and exit");
         Console.WriteLine("  --check-updates                check GitHub for a newer release and exit");
         Console.WriteLine("  --self-update                  download + install the latest release in place");

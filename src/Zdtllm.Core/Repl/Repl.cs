@@ -27,6 +27,8 @@ public sealed class Repl
     private readonly ReplOptions _options;
     private readonly IAnsiConsole? _richConsole;
     private readonly ISubagentRunner? _subagentRunner;
+    private readonly IUserInputQueue? _inputQueue;
+    private readonly ITurnInputCapture? _inputCapture;
     private CancellationTokenSource? _currentTurnCts;
 
     public Repl(
@@ -38,7 +40,9 @@ public sealed class Repl
         string cwd,
         ReplOptions? options = null,
         IAnsiConsole? richConsole = null,
-        ISubagentRunner? subagentRunner = null)
+        ISubagentRunner? subagentRunner = null,
+        IUserInputQueue? inputQueue = null,
+        ITurnInputCapture? inputCapture = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(agent);
@@ -56,6 +60,8 @@ public sealed class Repl
         _options = options ?? new ReplOptions();
         _richConsole = richConsole;
         _subagentRunner = subagentRunner;
+        _inputQueue = inputQueue;
+        _inputCapture = inputCapture;
     }
 
     /// <summary>
@@ -78,7 +84,7 @@ public sealed class Repl
     {
         if (!string.IsNullOrWhiteSpace(initialPrompt))
         {
-            await ProcessUserTurnAsync(initialPrompt, ct).ConfigureAwait(false);
+            await RunTurnAndFollowupsAsync(initialPrompt, ct).ConfigureAwait(false);
         }
 
         while (!ct.IsCancellationRequested)
@@ -106,10 +112,44 @@ public sealed class Repl
                 continue;
             }
 
-            await ProcessUserTurnAsync(trimmed, ct).ConfigureAwait(false);
+            await RunTurnAndFollowupsAsync(trimmed, ct).ConfigureAwait(false);
         }
 
         return 0;
+    }
+
+    /// <summary>
+    /// Runs <paramref name="prompt"/> as a turn, then drains any messages the user queued while
+    /// it ran (interactive queueing) and runs each as a follow-up turn — so typing while the
+    /// model works never gets lost, whether the AgentLoop folded it in mid-turn or it arrived
+    /// after the last tool round. With no queue configured (tests, non-interactive) this is a
+    /// single ProcessUserTurnAsync call, unchanged.
+    /// </summary>
+    private async Task RunTurnAndFollowupsAsync(string prompt, CancellationToken ct)
+    {
+        string? next = prompt;
+        while (next is not null && !ct.IsCancellationRequested)
+        {
+            await ProcessUserTurnAsync(next, ct).ConfigureAwait(false);
+
+            if (_inputQueue is not null && _inputQueue.TryDequeue(out var queued))
+            {
+                await _output.WriteLineAsync(
+                    Palette.Cyan("▶ running queued message: ") + Palette.Mute(Truncate(queued, 80)))
+                    .ConfigureAwait(false);
+                next = queued;
+            }
+            else
+            {
+                next = null;
+            }
+        }
+    }
+
+    private static string Truncate(string s, int max)
+    {
+        s = s.ReplaceLineEndings(" ");
+        return s.Length <= max ? s : string.Concat(s.AsSpan(0, max), "…");
     }
 
     private async Task ProcessUserTurnAsync(string prompt, CancellationToken ct)
@@ -126,6 +166,9 @@ public sealed class Repl
         // to AgentLoop / its tool plumbing.
         using var turnCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _currentTurnCts = turnCts;
+        // Start capturing keystrokes into the queue so the user can type follow-ups while the
+        // model works. No-op when no capture driver is wired (tests / non-interactive).
+        _inputCapture?.BeginCapture();
         try
         {
             await _agent.RunTurnAsync(_session, prompt, _output, _error, turnCts.Token).ConfigureAwait(false);
@@ -154,6 +197,10 @@ public sealed class Repl
         }
         finally
         {
+            // Stop the capture reader before we return so the next idle prompt has sole ownership
+            // of stdin (the capture reader and the idle ReadLine must never be active together).
+            if (_inputCapture is not null)
+                await _inputCapture.EndCaptureAsync().ConfigureAwait(false);
             _currentTurnCts = null;
         }
 

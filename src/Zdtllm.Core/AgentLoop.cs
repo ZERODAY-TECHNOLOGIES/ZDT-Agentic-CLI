@@ -58,6 +58,14 @@ public sealed class AgentLoop
     private readonly IAgentObserver? _observer;
 
     /// <summary>
+    /// Optional queue of user messages typed while THIS turn is already running (interactive
+    /// REPL only). Drained between tool rounds so a queued follow-up is folded into the ongoing
+    /// task rather than waiting for the whole turn to finish. Null for print mode, subagents,
+    /// and tests — they never have a live human typing mid-turn.
+    /// </summary>
+    private readonly IUserInputQueue? _inputQueue;
+
+    /// <summary>
     /// Per-turn count of tool calls that returned <c>isError=true</c> (unknown tool,
     /// permission denied, JSON parse failure, tool's own thrown exception, etc.). Reset
     /// at the top of every <see cref="RunTurnAsync"/> call and surfaced via
@@ -153,7 +161,8 @@ public sealed class AgentLoop
         AgentLoopOptions options,
         ContextManager? context = null,
         IAnsiConsole? richConsole = null,
-        IAgentObserver? observer = null)
+        IAgentObserver? observer = null,
+        IUserInputQueue? inputQueue = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(tools);
@@ -166,6 +175,7 @@ public sealed class AgentLoop
         _context = context;
         _richConsole = richConsole;
         _observer = observer;
+        _inputQueue = inputQueue;
     }
 
     public PermissionRuleSet Permissions => _perms;
@@ -686,6 +696,18 @@ public sealed class AgentLoop
         var results = await DispatchToolCallsAsync(calls, ctx, status, ct).ConfigureAwait(false);
         for (var i = 0; i < calls.Length; i++)
             session.AddTool(calls[i].Id, results[i]);
+
+        // Fold in any messages the user queued while this round ran. In native mode the history
+        // now ends with tool messages, and a user message after tool results is valid — so we
+        // add the queued text as its own user turn (all queued items combined into one to keep
+        // strict-alternation templates happy). The model sees it on its very next call.
+        var queued = DrainQueuedInput();
+        if (queued is not null)
+        {
+            await status.WriteLineAsync(Palette.Cyan("  ↳ picked up your queued message") + " " +
+                Palette.Mute(Truncate(queued.Replace('\n', ' '), 80))).ConfigureAwait(false);
+            session.AddUser(queued);
+        }
     }
 
     private async Task ExecuteXmlRoundAsync(
@@ -741,6 +763,19 @@ public sealed class AgentLoop
             sb.Append("EXECUTION RESULT of [").Append(callsArr[i].FunctionName).Append("]:\n");
             sb.Append(results[i]);
         }
+
+        // Fold in any queued user input. XML mode already collapses tool results into a single
+        // synthetic user turn, so we append the queued text to the SAME message rather than a
+        // second user turn — consecutive user messages break Qwen3-style chat templates.
+        var queued = DrainQueuedInput();
+        if (queued is not null)
+        {
+            await status.WriteLineAsync(Palette.Cyan("  ↳ picked up your queued message") + " " +
+                Palette.Mute(Truncate(queued.Replace('\n', ' '), 80))).ConfigureAwait(false);
+            sb.AppendLine().AppendLine().AppendLine("--- The user also sent this message: ---")
+              .AppendLine().Append(queued);
+        }
+
         session.AddUser(sb.ToString());
     }
 
@@ -834,6 +869,13 @@ public sealed class AgentLoop
         bool useSpinner,
         CancellationToken ct)
     {
+        // Interactive tools (AskUserQuestion) render their own prompt and read keystrokes — a
+        // Status spinner around them would seize the console and throw a nested-interactive
+        // error. Run them bare so the prompt owns the terminal.
+        var toolForCall = _tools.Get(call.FunctionName);
+        if (toolForCall?.IsInteractive == true)
+            return await ExecuteToolAsync(call, ctx, ct).ConfigureAwait(false);
+
         if (!useSpinner || _richConsole is null)
             return await ExecuteToolAsync(call, ctx, ct).ConfigureAwait(false);
 
@@ -920,6 +962,19 @@ public sealed class AgentLoop
         await SafeNotifyAsync(_observer?.OnToolResultAsync(call.FunctionName, finalContent, finalIsError, sw.Elapsed, ct))
             .ConfigureAwait(false);
         return finalContent;
+    }
+
+    /// <summary>
+    /// Pull every message the user queued during this round and combine them into one string
+    /// (blank line separated), or null when nothing was queued / there's no queue at all. Called
+    /// at each tool-round boundary so queued follow-ups reach the model mid-turn.
+    /// </summary>
+    private string? DrainQueuedInput()
+    {
+        if (_inputQueue is null || !_inputQueue.HasPending) return null;
+        var parts = new List<string>();
+        while (_inputQueue.TryDequeue(out var msg)) parts.Add(msg);
+        return parts.Count == 0 ? null : string.Join("\n\n", parts);
     }
 
     private void EnqueueTrace(ToolCallTrace trace)

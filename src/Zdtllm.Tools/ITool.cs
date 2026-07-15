@@ -49,4 +49,13 @@ public interface ITool
     /// to <c>this</c>.
     /// </summary>
     ITool CloneForSubagent() => this;
+
+    /// <summary>
+    /// True when the tool drives the interactive console itself (reads keystrokes / renders a
+    /// selectable list). AgentLoop must NOT wrap such a call in a Spectre <c>Status</c> spinner —
+    /// nesting an interactive prompt inside a live status region throws "Trying to run one or
+    /// more interactive functions concurrently". Interactive tools should also return
+    /// <see cref="CanRunInParallel"/> == false. Default: false.
+    /// </summary>
+    bool IsInteractive => false;
 }

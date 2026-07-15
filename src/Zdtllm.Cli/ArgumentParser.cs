@@ -91,7 +91,12 @@ internal static class ArgumentParser
                     break;
                 case "-r":
                 case "--resume":
-                    result.Resume = NextValue(args, ref i, "--resume");
+                    // Anthropic-compat: --resume takes an OPTIONAL session id. With an id it
+                    // resumes that session directly; with no id (next token is another flag or
+                    // absent) it launches the interactive picker of recent conversations.
+                    var resumeId = TryNextValue(args, ref i);
+                    if (resumeId is null) result.ResumePicker = true;
+                    else result.Resume = resumeId;
                     break;
                 case "--version":
                     result.ShowVersion = true;
@@ -120,6 +125,18 @@ internal static class ArgumentParser
     {
         if (i + 1 >= args.Length)
             throw new ArgumentException($"{flag} requires a value.");
+        return args[++i];
+    }
+
+    /// <summary>
+    /// Consume the next token as a value ONLY if it exists and doesn't look like a flag.
+    /// Returns null (leaving the index untouched) otherwise. Used by flags whose value is
+    /// optional — notably <c>--resume</c>, which falls back to an interactive picker when
+    /// no session id is supplied.
+    /// </summary>
+    private static string? TryNextValue(string[] args, ref int i)
+    {
+        if (i + 1 >= args.Length || LooksLikeFlag(args[i + 1])) return null;
         return args[++i];
     }
 
@@ -160,6 +177,12 @@ internal sealed class ParsedArgs
     public string? SessionId { get; set; }
     public bool Continue { get; set; }
     public string? Resume { get; set; }
+    /// <summary>
+    /// Set when <c>-r</c>/<c>--resume</c> was passed WITHOUT a session id. Triggers the
+    /// interactive picker (arrow-key list of recent conversations) in interactive mode.
+    /// Mutually exclusive with <see cref="Resume"/> being non-null.
+    /// </summary>
+    public bool ResumePicker { get; set; }
     public string? SystemPrompt { get; set; }
     public string? SystemPromptFile { get; set; }
     public string? AppendSystemPrompt { get; set; }
