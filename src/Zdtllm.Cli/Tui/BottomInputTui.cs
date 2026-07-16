@@ -70,6 +70,7 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
         RefreshDims();
         lock (_render)
         {
+            Console.Write("\x1b[?7l");          // disable autowrap so clipped lines never wrap-scroll
             ApplyScrollRegion(force: true);
             // Park the output cursor on the last scrollable row.
             Console.Write($"\x1b[{_rows - BoxHeight()};1H");
@@ -272,13 +273,32 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
         {
             if (!_started) { Console.WriteLine(line); return; }
             RefreshDims();
+            ApplyScrollRegion(force: false); // keep the region in sync if the box grew/shrank
+
+            // Append one line at the bottom of the scroll region: write it on the last scrollable
+            // row, clear any leftovers, then LF. LF at the bottom of a DECSTBM region scrolls only
+            // that region up by one — the pinned box below is untouched. Autowrap is off so a
+            // full-width line can't wrap-scroll. Crucially we do NOT redraw the whole box here (that
+            // per-line flood was what garbled the multi-agent output); we only re-park the cursor.
             var outRow = _rows - BoxHeight();
-            // Write the line on the last scrollable row, then scroll the region up by one.
-            Console.Write($"\x1b[{outRow};1H\x1b[2K");
-            Console.Write(Clip(line, _cols));
-            Console.Write($"\x1b[{outRow};1H\x1b[1S"); // scroll region up 1
-            RedrawBoxLocked();
+            Console.Write($"\x1b[{outRow};1H");
+            Console.Write(Clip(line, _cols - 1));
+            Console.Write("\x1b[K\n");
+            ParkCursorInInputLocked();
         }
+    }
+
+    // Holds _render. Move the visible cursor back into the input box without repainting the box.
+    private void ParkCursorInInputLocked()
+    {
+        var boxH = BoxHeight();
+        var top = _rows - boxH + 1;
+        var lines = _editor.Lines;
+        var inputRows = Math.Clamp(lines.Count, 1, MaxInputRows);
+        var firstLine = Math.Max(0, Math.Min(_editor.CursorRow - (inputRows - 1), lines.Count - inputRows));
+        var curScreenRow = top + 1 + (_editor.CursorRow - firstLine);
+        var curCol = 2 + Math.Min(_editor.CursorCol, _cols - 4) + 1;
+        Console.Write($"\x1b[{curScreenRow};{curCol}H");
     }
 
     private void EchoQueuedLine(string text) =>
@@ -405,6 +425,7 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
                 lock (_render)
                 {
                     Console.Write("\x1b[r");              // reset scroll region
+                    Console.Write("\x1b[?7h");            // restore autowrap
                     Console.Write($"\x1b[{_rows};1H\x1b[0m\n"); // cursor to bottom
                 }
             }
