@@ -27,7 +27,7 @@ namespace Zdtllm.Cli.Input;
 /// Only built for an ANSI-capable interactive terminal; everything else keeps the classic
 /// <c>Console.ReadLine</c> path.
 /// </summary>
-public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInteractivePrompter, ITypeAheadStatus, IDisposable
+public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInteractivePrompter, ITypeAheadStatus, Zdtllm.Core.AgentFleet.IConsoleExclusive, IDisposable
 {
     private const int PollMs = 6;
     private const string PromptAnsi = "\x1b[38;2;27;234;205m> \x1b[0m"; // brand cyan "> "

@@ -178,9 +178,9 @@ Ctrl+A/E/U/K) whether the model is thinking or idle. Enter sends; `\`+Enter or A
 newline; paste keeps its newlines. Submitting while a turn runs queues the message (folded into the
 run); submitting when idle starts a turn. A status line shows `⏺ thinking (Ns)` during a turn, and
 the footer shows the permission mode — including a clear `⚠ bypass permissions ON` when you passed
-`--dangerously-skip-permissions`. Set `ZDT_NO_TUI=1` (or `ZDT_BASIC_INPUT=1`) to fall back to the
-line-based REPL — which keeps the `/`-autocomplete picker and the arrow-key agent fleet view (those
-aren't in the TUI yet).
+`--dangerously-skip-permissions`. The `/`-autocomplete picker and the navigable agent
+[fleet view](#workflows-multi-agent-orchestration) both work here too. Set `ZDT_NO_TUI=1` (or
+`ZDT_BASIC_INPUT=1`) to fall back to the plain line-based REPL.
 
 **Resume a past conversation with a picker.** `-r` / `--resume` now takes an *optional*
 session id:
@@ -273,13 +273,15 @@ subagents' text is model-driven, so it stays model-agnostic. Drop a JSON file in
   machinery as the `Agent` tool — including retry/fallback. A step that fails is recorded, not fatal.
 
 **Navigate between live agents.** When two or more subagents run at once (a workflow fan-out, or
-parallel `Agent` calls) in the interactive REPL, a live **fleet view** opens: a list of the running
-agents with status/elapsed, and the focused agent's output below. Switch between them with **←/→**
-(or ↑/↓), jump with **1-9**, and **q** to detach — like switching between agents in claude-code.
-Falls back to a tagged stream (each line prefixed with its agent's label, e.g.
-`[Review: a.cs #2] …`) for a single agent, non-interactive `--workflow`/`-p` runs, or any terminal
-where the live view can't render; `ZDT_NO_AGENT_VIEW=1` forces the stream. A plain scripted `-p`
-run stays quiet unless you pass `--verbose`.
+parallel `Agent` calls) in any interactive session — the default TUI *or* the plain REPL — a live
+**fleet view** opens: a list of the running agents with status/elapsed, and the focused agent's
+output below. Switch between them with **←/→** (or ↑/↓), jump with **1-9**, and **q** to detach —
+like switching between agents in claude-code. In the TUI it takes the screen over on the terminal's
+*alternate screen buffer* (like vim/less): the input box and conversation are put aside while you
+watch the agents, then restored exactly when the run finishes. Falls back to a tagged stream (each
+line prefixed with its agent's label, e.g. `[Review: a.cs #2] …`) for a single agent, non-interactive
+`--workflow`/`-p` runs, or any terminal where the live view can't render; `ZDT_NO_AGENT_VIEW=1`
+forces the stream. A plain scripted `-p` run stays quiet unless you pass `--verbose`.
 
 Run it:
 

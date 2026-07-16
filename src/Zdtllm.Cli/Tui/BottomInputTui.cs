@@ -24,7 +24,7 @@ namespace Zdtllm.Cli.Tui;
 /// hook (<see cref="ITurnInputCapture"/>) and output writer, so the REPL's slash-commands / turn /
 /// farewell logic is reused unchanged.
 /// </summary>
-public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInteractivePrompter, IDisposable
+public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInteractivePrompter, Zdtllm.Core.AgentFleet.IConsoleExclusive, IDisposable
 {
     private const string Reset = "\x1b[0m";
     private const string Cyan = "\x1b[38;2;27;234;205m";
@@ -175,25 +175,83 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     private async Task<T> RunExclusiveAsync<T>(Func<Task<T>> action)
     {
         await _readerGate.WaitAsync().ConfigureAwait(false);
-        try
+        LiftForExclusive();
+        try { return await action().ConfigureAwait(false); }
+        finally { RestoreFromExclusive(); _readerGate.Release(); }
+    }
+
+    // ---- IConsoleExclusive (hand the screen to the agent fleet view) ----
+
+    /// <summary>
+    /// Pause the reader and hand the whole terminal to a full-screen renderer (the fleet view) on the
+    /// <b>alternate screen buffer</b> — like vim/less: the view gets a pristine screen, and disposing
+    /// the handle switches back to the main buffer, restoring the conversation + input box exactly as
+    /// they were, then re-asserts the scroll region and resumes the reader. Synchronous counterpart of
+    /// <see cref="RunExclusiveAsync{T}"/> (the fleet view's blocking render loop runs on its own
+    /// thread, so the blocking wait is fine).
+    /// </summary>
+    public IDisposable EnterExclusive()
+    {
+        _readerGate.Wait();
+        lock (_render)
         {
-            lock (_render)
-            {
-                Console.Write("\x1b[r");                       // lift scroll region
-                Console.Write($"\x1b[{_rows};1H\x1b[0m\r\n");  // move below the box
-                _lastBoxHeight = -1;                            // force region re-apply on redraw
-            }
-            return await action().ConfigureAwait(false);
+            Console.Write("\x1b[?1049h");     // enter alternate screen buffer (fresh, isolated)
+            Console.Write("\x1b[r");          // no scroll region on the alt screen
+            Console.Write("\x1b[?7h");        // autowrap on — Spectre expects it
+            Console.Write("\x1b[H\x1b[2J");   // home + clear the alt screen
         }
-        finally
+        return new ExclusiveScope(this);
+    }
+
+    // Leave the alternate screen: the main buffer (conversation + box) comes back verbatim; still
+    // re-assert the region + redraw the box so output resumes correctly regardless of whether the
+    // terminal preserved our DECSTBM margins across the buffer switch.
+    private void RestoreFromAltScreen()
+    {
+        lock (_render)
         {
-            lock (_render)
-            {
-                ApplyScrollRegion(force: true);
-                Console.Write($"\x1b[{_rows - BoxHeight()};1H");
-                RedrawBoxLocked();
-            }
-            _readerGate.Release();
+            Console.Write("\x1b[?7l");        // autowrap off again (our clipping model)
+            Console.Write("\x1b[?1049l");     // back to the main screen buffer
+            _lastBoxHeight = -1;              // force region re-apply
+            ApplyScrollRegion(force: true);
+            Console.Write($"\x1b[{_rows - BoxHeight()};1H");
+            RedrawBoxLocked();
+        }
+    }
+
+    // Holds nothing on entry; takes _render to emit the lift sequence.
+    private void LiftForExclusive()
+    {
+        lock (_render)
+        {
+            Console.Write("\x1b[r");                       // lift scroll region
+            Console.Write("\x1b[?7h");                     // restore autowrap (Spectre expects it)
+            Console.Write($"\x1b[{_rows};1H\x1b[0m\r\n");  // move below the box
+            _lastBoxHeight = -1;                            // force region re-apply on redraw
+        }
+    }
+
+    private void RestoreFromExclusive()
+    {
+        lock (_render)
+        {
+            Console.Write("\x1b[?7l");                      // autowrap off again (our clipping model)
+            ApplyScrollRegion(force: true);
+            Console.Write($"\x1b[{_rows - BoxHeight()};1H");
+            RedrawBoxLocked();
+        }
+    }
+
+    private sealed class ExclusiveScope : IDisposable
+    {
+        private BottomInputTui? _tui;
+        public ExclusiveScope(BottomInputTui tui) => _tui = tui;
+        public void Dispose()
+        {
+            var t = _tui; _tui = null;
+            if (t is null) return;
+            t.RestoreFromAltScreen();
+            t._readerGate.Release();
         }
     }
 
@@ -426,6 +484,7 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
             {
                 lock (_render)
                 {
+                    Console.Write("\x1b[?1049l");         // leave the alt screen if a fleet view raced teardown
                     Console.Write("\x1b[r");              // reset scroll region
                     Console.Write("\x1b[?7h");            // restore autowrap
                     Console.Write($"\x1b[{_rows};1H\x1b[0m\n"); // cursor to bottom

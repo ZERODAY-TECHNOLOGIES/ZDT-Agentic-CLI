@@ -1,6 +1,5 @@
 using Spectre.Console;
 using Spectre.Console.Rendering;
-using Zdtllm.Cli.Input;
 using Zdtllm.Core.AgentFleet;
 
 namespace Zdtllm.Cli;
@@ -12,10 +11,13 @@ namespace Zdtllm.Cli;
 ///
 /// <para>
 /// It only spins up the live display for ≥2 concurrent agents (a single agent just streams its
-/// activity, tagged, to stderr — no display to navigate, and no clash with the parent's spinner).
-/// While the display is up it owns the keyboard (pausing the REPL's queue-capture reader via
-/// <see cref="ConsoleInput.EnterExclusive"/>). Everything is guarded: if Spectre's live display
-/// can't run on this terminal it degrades to the tagged-stderr stream so no activity is ever lost.
+/// activity, tagged, to <see cref="_stream"/> — no display to navigate, and no clash with the
+/// parent's spinner). While the display is up it owns the keyboard and the screen, pausing whichever
+/// input driver hosts it (the REPL line editor or the bottom-input TUI) via
+/// <see cref="IConsoleExclusive.EnterExclusive"/> — that also lifts the TUI's scroll region so the
+/// live display has a clean full screen, and restores it afterwards. Everything is guarded: if
+/// Spectre's live display can't run on this terminal it degrades to the tagged stream so no activity
+/// is ever lost.
 /// </para>
 /// </summary>
 public sealed class AgentFleetView : IAgentFleetMonitor, IDisposable
@@ -27,21 +29,27 @@ public sealed class AgentFleetView : IAgentFleetMonitor, IDisposable
     private const string Mute = "#687B89";
 
     private readonly IAnsiConsole _console;
-    private readonly ConsoleInput? _consoleOwner;
+    private readonly IConsoleExclusive? _consoleOwner;
+    private readonly TextWriter _stream;   // where single-agent / pre-view / fallback activity is echoed
     private readonly AgentFleetModel _model = new();
     private readonly Dictionary<int, string> _labels = new();
     private readonly object _gate = new();
 
     private volatile bool _liveActive;   // the Spectre live display is currently rendering
-    private volatile bool _detached;     // user pressed q — stop rendering, keep streaming to stderr
+    private volatile bool _detached;     // user pressed q — stop rendering, keep streaming
     private bool _started;               // the live display was started (guards double-start)
     private CancellationTokenSource? _cts;
     private Task? _task;
 
-    public AgentFleetView(IAnsiConsole console, ConsoleInput? consoleOwner)
+    /// <param name="consoleOwner">The input driver that owns the terminal (REPL editor or bottom-input
+    /// TUI); the view pauses it and, for the TUI, lifts its scroll region while the display is up.</param>
+    /// <param name="stream">Sink for tagged single-agent / fallback activity. In TUI mode this is the
+    /// TUI's scroll-region writer; otherwise stderr.</param>
+    public AgentFleetView(IAnsiConsole console, IConsoleExclusive? consoleOwner, TextWriter? stream = null)
     {
         _console = console ?? throw new ArgumentNullException(nameof(console));
         _consoleOwner = consoleOwner;
+        _stream = stream ?? Console.Error;
     }
 
     // ---- IAgentFleetMonitor ----
@@ -61,9 +69,11 @@ public sealed class AgentFleetView : IAgentFleetMonitor, IDisposable
         // pre-view / post-detach activity stays visible.
         if (!_liveActive)
         {
-            string label;
-            lock (_gate) label = _labels.TryGetValue(agentId, out var l) ? l : "[agent] ";
-            lock (_gate) Console.Error.WriteLine(label + line);
+            lock (_gate)
+            {
+                var label = _labels.TryGetValue(agentId, out var l) ? l : "[agent] ";
+                _stream.WriteLine(label + line);
+            }
         }
     }
 
@@ -124,8 +134,8 @@ public sealed class AgentFleetView : IAgentFleetMonitor, IDisposable
             // Live display isn't usable on this terminal — degrade to the tagged stream so nothing
             // is lost, and don't try again.
             _detached = true;
-            DumpBufferedToStderr();
-            Console.Error.WriteLine($"(agent view unavailable: {ex.Message} — falling back to stream)");
+            DumpBufferedToStream();
+            _stream.WriteLine($"(agent view unavailable: {ex.Message} — falling back to stream)");
         }
         finally
         {
@@ -206,13 +216,13 @@ public sealed class AgentFleetView : IAgentFleetMonitor, IDisposable
         return new Rows(rows);
     }
 
-    private void DumpBufferedToStderr()
+    private void DumpBufferedToStream()
     {
         foreach (var a in _model.Snapshot())
         {
             var label = a.Label.Trim();
             foreach (var line in a.RecentLines)
-                Console.Error.WriteLine($"[{label}] {line}");
+                _stream.WriteLine($"[{label}] {line}");
         }
     }
 

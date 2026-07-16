@@ -327,22 +327,32 @@ internal static class Program
         // settings are read once at startup and never mutate at runtime; if that ever changes,
         // this delegate would need to read live state instead.
         // How subagent activity is surfaced:
-        //   • interactive TTY → a navigable "fleet view" (arrow-key switch between live agents when
-        //     ≥2 run at once); ZDT_NO_AGENT_VIEW falls back to the tagged stream.
+        //   • interactive TTY (both the bottom-input TUI and the classic REPL) → a navigable "fleet
+        //     view": when ≥2 subagents run at once, a Spectre live display lists them and shows the
+        //     focused agent's output, arrow-key to switch. It takes the screen over via the active
+        //     input driver's IConsoleExclusive (in TUI mode that lifts the scroll region and restores
+        //     it after). ZDT_NO_AGENT_VIEW disables it, falling back to the tagged stream below.
         //   • otherwise → each subagent's activity streamed tagged to stderr (off for a plain
         //     scripted -p run unless --verbose, so automated callers get a clean stderr).
-        // The fleet view (Spectre live) can't share the screen with the TUI's scroll region, so in
-        // TUI mode subagent activity streams (tagged) into the TUI's scroll region instead.
+        // The console owner is whichever input driver holds the terminal — the TUI when present,
+        // else the REPL line editor. Single-agent / pre-view / fallback activity is echoed to the
+        // fleet view's own stream: the TUI's scroll-region writer in TUI mode, else stderr.
+        var viewOwner = (Zdtllm.Core.AgentFleet.IConsoleExclusive?)tui ?? turnInput;
         var agentViewEnabled = interactive
-            && !tuiMode
-            && turnInput is not null
+            && viewOwner is not null
             && AnsiConsole.Console.Profile.Capabilities.Ansi
             && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ZDT_NO_AGENT_VIEW"));
-        AgentFleetView? fleetView = agentViewEnabled ? new AgentFleetView(AnsiConsole.Console, turnInput) : null;
-        TextWriter? subagentSink = tui is not null
-            ? tui.Output
-            : fleetView is not null
-                ? null
+        TextWriter fleetStream = tui is not null ? tui.Output : Console.Error;
+        AgentFleetView? fleetView = agentViewEnabled
+            ? new AgentFleetView(AnsiConsole.Console, viewOwner, fleetStream)
+            : null;
+        // When the fleet view is active it IS the monitor and owns all subagent output (streaming the
+        // single-agent case itself), so the plain sink is null. Without it, fall back to the TUI's
+        // scroll region / stderr per the scripted-run rules.
+        TextWriter? subagentSink = fleetView is not null
+            ? null
+            : tui is not null
+                ? tui.Output
                 : (parsed.PrintMode && !parsed.Verbose ? null : Console.Error);
         var subagentRunner = new SubagentRunner(agent, subagentSink, fleetView);
         var modelAliases = settings.LiteLLM.Models;
