@@ -1,6 +1,7 @@
 using System.Text;
 using Spectre.Console;
 using Zdtllm.Core;
+using Zdtllm.Core.Repl;
 using Zdtllm.Tools;
 
 namespace Zdtllm.Cli.Input;
@@ -37,6 +38,7 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
 
     private readonly IUserInputQueue _queue;
     private readonly IAnsiConsole _console;
+    private readonly IReadOnlyList<SlashCommandInfo> _slashCommands;
     private readonly SemaphoreSlim _consoleLock = new(1, 1);
 
     // Idle line-editor state.
@@ -57,12 +59,16 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
     private CancellationTokenSource? _captureCts;
     private Task? _captureTask;
 
-    public ConsoleInput(IUserInputQueue queue, IAnsiConsole console)
+    public ConsoleInput(
+        IUserInputQueue queue,
+        IAnsiConsole console,
+        IReadOnlyList<SlashCommandInfo>? slashCommands = null)
     {
         ArgumentNullException.ThrowIfNull(queue);
         ArgumentNullException.ThrowIfNull(console);
         _queue = queue;
         _console = console;
+        _slashCommands = slashCommands ?? Array.Empty<SlashCommandInfo>();
     }
 
     public bool IsAvailable => true;
@@ -121,6 +127,11 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
                     Console.Write(Environment.NewLine);
                     return null;
                 }
+                if (outcome == Outcome.OpenCommandMenu)
+                {
+                    await OpenCommandMenuAsync(ct).ConfigureAwait(false);
+                    _lastRenderVisibleLen = 0; // the picker drew its own UI — redraw the prompt clean
+                }
                 Render();
             }
         }
@@ -131,7 +142,7 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
         }
     }
 
-    private enum Outcome { Continue, Submit, Eof }
+    private enum Outcome { Continue, Submit, Eof, OpenCommandMenu }
 
     private List<ConsoleKeyInfo> DrainKeys()
     {
@@ -228,10 +239,59 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
                 return Outcome.Continue; // ignored (no history yet)
         }
 
+        // Typing "/" on an empty prompt opens the slash-command autocomplete picker instead of
+        // inserting the "/" literally — the picker supplies the full "/command".
+        if (k.KeyChar == '/' && _state.IsEmpty && _slashCommands.Count > 0)
+            return Outcome.OpenCommandMenu;
+
         if (k.KeyChar != '\0' && !char.IsControl(k.KeyChar))
             _state.InsertChar(k.KeyChar);
         return Outcome.Continue;
     }
+
+    // ================= slash-command autocomplete =================
+
+    private static readonly SlashCommandInfo CommandCancelSentinel =
+        new("(type it yourself)", "close this menu and type the command by hand");
+
+    private async Task OpenCommandMenuAsync(CancellationToken ct)
+    {
+        // Wipe the prompt line before the picker renders over it.
+        Console.Write("\r" + new string(' ', SafeWindowWidth() - 1) + "\r");
+
+        var chosen = await ShowCommandPickerAsync(ct).ConfigureAwait(false);
+        if (chosen is not null)
+            _state.InsertText(chosen + " ");  // fill the line; user adds args or hits Enter
+        else
+            _state.InsertChar('/');           // cancelled → keep the slash for manual typing
+    }
+
+    private async Task<string?> ShowCommandPickerAsync(CancellationToken ct)
+    {
+        var choices = _slashCommands.Append(CommandCancelSentinel).ToList();
+        var prompt = new SelectionPrompt<SlashCommandInfo>()
+            .Title($"[bold {Hex(BrandCyan)}]/ commands[/]  " +
+                   $"[{Hex(MutedText)}](type to filter · ↑/↓ · Enter to pick)[/]")
+            .PageSize(Math.Clamp(choices.Count + 1, 4, 15))
+            .HighlightStyle(new Style(BrandCyan))
+            .UseConverter(FormatCommand)
+            .EnableSearch()
+            .AddChoices(choices);
+        try
+        {
+            var chosen = await prompt.ShowAsync(_console, ct).ConfigureAwait(false);
+            return ReferenceEquals(chosen, CommandCancelSentinel) ? null : chosen.Name;
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    private static string FormatCommand(SlashCommandInfo c) =>
+        ReferenceEquals(c, CommandCancelSentinel)
+            ? $"[{Hex(MutedText)}]{Markup.Escape(c.Name)}[/]"
+            : $"[bold {Hex(BrandCyan)}]{Markup.Escape(c.Name)}[/]\n    [{Hex(MutedText)}]{Markup.Escape(c.Description)}[/]";
 
     private void Render()
     {

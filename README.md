@@ -197,6 +197,10 @@ option shows a one-line description underneath it, and every question always inc
 registered only in interactive mode, so in `-p` / subagent runs the model is told to decide for
 itself instead of blocking on input that will never arrive.
 
+**Slash-command autocomplete.** Type `/` on an empty prompt and a filterable list of the available
+commands pops up (each with a one-line description) — type to narrow it, ↑/↓ to move, Enter to fill
+the command in. Pick `(type it yourself)` to dismiss it and type the command by hand.
+
 **Plan mode.** Start with `--plan`, or toggle it any time with `/plan`. In plan mode the agent
 is read-only — `Write`, `Edit`, `NotebookEdit` and `Bash` are blocked — so it investigates and
 drafts a step-by-step plan, then calls `ExitPlanMode` to show it to you. Approve it (arrow keys)

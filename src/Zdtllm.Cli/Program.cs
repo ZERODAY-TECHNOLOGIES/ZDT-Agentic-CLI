@@ -156,7 +156,7 @@ internal static class Program
             && !Console.IsOutputRedirected;
         UserInputQueue? inputQueue = interactive ? new UserInputQueue() : null;
         ConsoleInput? turnInput = interactive
-            ? new ConsoleInput(inputQueue!, AnsiConsole.Console)
+            ? new ConsoleInput(inputQueue!, AnsiConsole.Console, SlashCommandCatalog.All)
             : null;
         // The rich line editor (multi-line paste, drag & drop, in-line editing) needs an ANSI
         // terminal and can be turned off with ZDT_BASIC_INPUT for anyone whose terminal misbehaves.
