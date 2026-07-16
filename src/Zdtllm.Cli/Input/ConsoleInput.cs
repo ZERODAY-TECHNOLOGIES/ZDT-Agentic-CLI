@@ -270,47 +270,18 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
 
     // ================= slash-command autocomplete =================
 
-    private static readonly SlashCommandInfo CommandCancelSentinel =
-        new("(type it yourself)", "close this menu and type the command by hand");
-
     private async Task OpenCommandMenuAsync(CancellationToken ct)
     {
         // Wipe the prompt line before the picker renders over it.
         Console.Write("\r" + new string(' ', SafeWindowWidth() - 1) + "\r");
 
-        var chosen = await ShowCommandPickerAsync(ct).ConfigureAwait(false);
+        // Shared with the TUI so both interfaces show the same picker (see SpectreChoice).
+        var chosen = await SpectreChoice.SelectSlashCommandAsync(_console, _slashCommands, ct).ConfigureAwait(false);
         if (chosen is not null)
             _state.InsertText(chosen + " ");  // fill the line; user adds args or hits Enter
         else
             _state.InsertChar('/');           // cancelled → keep the slash for manual typing
     }
-
-    private async Task<string?> ShowCommandPickerAsync(CancellationToken ct)
-    {
-        var choices = _slashCommands.Append(CommandCancelSentinel).ToList();
-        var prompt = new SelectionPrompt<SlashCommandInfo>()
-            .Title($"[bold {Hex(BrandCyan)}]/ commands[/]  " +
-                   $"[{Hex(MutedText)}](type to filter · ↑/↓ · Enter to pick)[/]")
-            .PageSize(Math.Clamp(choices.Count + 1, 4, 15))
-            .HighlightStyle(new Style(BrandCyan))
-            .UseConverter(FormatCommand)
-            .EnableSearch()
-            .AddChoices(choices);
-        try
-        {
-            var chosen = await prompt.ShowAsync(_console, ct).ConfigureAwait(false);
-            return ReferenceEquals(chosen, CommandCancelSentinel) ? null : chosen.Name;
-        }
-        catch (OperationCanceledException)
-        {
-            return null;
-        }
-    }
-
-    private static string FormatCommand(SlashCommandInfo c) =>
-        ReferenceEquals(c, CommandCancelSentinel)
-            ? $"[{Hex(MutedText)}]{Markup.Escape(c.Name)}[/]"
-            : $"[bold {Hex(BrandCyan)}]{Markup.Escape(c.Name)}[/]\n    [{Hex(MutedText)}]{Markup.Escape(c.Description)}[/]";
 
     private void Render()
     {

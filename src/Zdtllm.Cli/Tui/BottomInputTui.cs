@@ -1,6 +1,7 @@
 using System.Text;
 using Spectre.Console;
 using Zdtllm.Core;
+using Zdtllm.Core.Repl;
 using Zdtllm.Core.Tui;
 using Zdtllm.Tools;
 
@@ -36,10 +37,12 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     private readonly IUserInputQueue _queue;
     private readonly IAnsiConsole _spectre;
     private readonly bool _bypassPermissions;
+    private readonly IReadOnlyList<SlashCommandInfo> _slashCommands;
     private readonly MultiLineEditor _editor = new();
     private readonly object _render = new();
     private readonly SemaphoreSlim _readerGate = new(1, 1); // held by the key reader; a prompt takes it to pause reading
 
+    private volatile bool _openSlashPicker; // set by HandleKey ("/"), serviced by the reader loop
     private TaskCompletionSource<string?>? _pendingRead;
     private long _thinkingStartTicks; // 0 = idle; otherwise Stopwatch ticks at turn start
     private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
@@ -53,11 +56,13 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     /// <summary>Write REPL / model output here — it's line-buffered into the scrolling region.</summary>
     public TextWriter Output { get; }
 
-    public BottomInputTui(IUserInputQueue queue, IAnsiConsole spectre, bool bypassPermissions)
+    public BottomInputTui(IUserInputQueue queue, IAnsiConsole spectre, bool bypassPermissions,
+        IReadOnlyList<SlashCommandInfo>? slashCommands = null)
     {
         _queue = queue ?? throw new ArgumentNullException(nameof(queue));
         _spectre = spectre ?? throw new ArgumentNullException(nameof(spectre));
         _bypassPermissions = bypassPermissions;
+        _slashCommands = slashCommands ?? Array.Empty<SlashCommandInfo>();
         Output = new LineBufferedWriter(EmitOutputLine);
     }
 
@@ -150,8 +155,32 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
             catch { /* never let the reader die */ }
             finally { _readerGate.Release(); }
 
+            // Service a pending "/" picker request now that the gate is released (RunExclusiveAsync
+            // re-takes it). Runs on this reader thread; blocking here is fine — the whole point is to
+            // pause reading while the picker owns the keyboard.
+            if (_openSlashPicker)
+            {
+                _openSlashPicker = false;
+                RunSlashPicker();
+                lastTick = _clock.ElapsedMilliseconds;
+            }
+
             if (!SafeKeyAvailable()) Thread.Sleep(12);
         }
+    }
+
+    private void RunSlashPicker()
+    {
+        try
+        {
+            var chosen = RunExclusiveAsync(() =>
+                Input.SpectreChoice.SelectSlashCommandAsync(_spectre, _slashCommands, CancellationToken.None))
+                .GetAwaiter().GetResult();
+            if (chosen is not null) _editor.InsertText(chosen + " ");
+            else _editor.InsertChar('/');   // cancelled → keep the slash for manual typing
+        }
+        catch { /* picker failed — leave the box as-is */ }
+        RedrawBox();
     }
 
     // ---- IInteractivePrompter (AskUserQuestion / ExitPlanMode) ----
@@ -292,6 +321,15 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
             case ConsoleKey.Home: _editor.Home(); return;
             case ConsoleKey.End: _editor.End(); return;
             case ConsoleKey.Escape: return;
+        }
+
+        // Typing "/" on an empty box opens the slash-command autocomplete picker (same list the REPL
+        // shows). We can't run it here — this method holds the reader gate — so flag it and let the
+        // reader loop service it once the gate is free.
+        if (k.KeyChar == '/' && _editor.IsEmpty && _slashCommands.Count > 0)
+        {
+            _openSlashPicker = true;
+            return;
         }
 
         if (k.KeyChar != '\0' && !char.IsControl(k.KeyChar))

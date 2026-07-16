@@ -188,7 +188,8 @@ internal static class Program
             && AnsiConsole.Console.Profile.Capabilities.Ansi
             && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ZDT_NO_TUI"));
         BottomInputTui? tui = tuiMode
-            ? new BottomInputTui(inputQueue!, AnsiConsole.Console, parsed.DangerouslySkipPermissions)
+            ? new BottomInputTui(inputQueue!, AnsiConsole.Console, parsed.DangerouslySkipPermissions,
+                SlashCommandCatalog.All)
             : null;
 
         var registry = new ToolRegistry();

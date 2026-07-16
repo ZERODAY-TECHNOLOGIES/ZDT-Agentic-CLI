@@ -1,4 +1,5 @@
 using Spectre.Console;
+using Zdtllm.Core.Repl;
 using Zdtllm.Tools;
 
 namespace Zdtllm.Cli.Input;
@@ -73,6 +74,38 @@ internal static class SpectreChoice
             return new[] { chosen.Label };
         }
     }
+
+    private static readonly SlashCommandInfo SlashCancelSentinel =
+        new("(type it yourself)", "close this menu and type the command by hand");
+
+    /// <summary>
+    /// The <c>/</c>-command autocomplete picker: a searchable list of slash commands. Returns the
+    /// chosen <c>/name</c>, or null if the user cancelled or picked the "type it yourself" escape
+    /// hatch. The caller owns the console (pausing any background reader) before calling.
+    /// </summary>
+    public static async Task<string?> SelectSlashCommandAsync(
+        IAnsiConsole console, IReadOnlyList<SlashCommandInfo> commands, CancellationToken ct)
+    {
+        var choices = commands.Append(SlashCancelSentinel).ToList();
+        var prompt = new SelectionPrompt<SlashCommandInfo>()
+            .Title($"[bold {Cyan}]/ commands[/]  [{Mute}](type to filter · ↑/↓ · Enter to pick)[/]")
+            .PageSize(Math.Clamp(choices.Count + 1, 4, 15))
+            .HighlightStyle(new Style(new Color(0x1B, 0xEA, 0xCD)))
+            .UseConverter(FormatSlash)
+            .EnableSearch()
+            .AddChoices(choices);
+        try
+        {
+            var chosen = await prompt.ShowAsync(console, ct).ConfigureAwait(false);
+            return ReferenceEquals(chosen, SlashCancelSentinel) ? null : chosen.Name;
+        }
+        catch (OperationCanceledException) { return null; }
+    }
+
+    private static string FormatSlash(SlashCommandInfo c) =>
+        ReferenceEquals(c, SlashCancelSentinel)
+            ? $"[{Mute}]{Markup.Escape(c.Name)}[/]"
+            : $"[bold {Cyan}]{Markup.Escape(c.Name)}[/]\n    [{Mute}]{Markup.Escape(c.Description)}[/]";
 
     private static async Task<string> ReadFreeTextAsync(IAnsiConsole console, CancellationToken ct) =>
         await new TextPrompt<string>($"[{Cyan}]Your answer:[/]").AllowEmpty().ShowAsync(console, ct)
