@@ -208,6 +208,30 @@ public sealed class ArgumentParserTests
     }
 
     [Fact]
+    public void Workflow_and_repeatable_args_are_parsed()
+    {
+        var parsed = ArgumentParser.Parse([
+            "--workflow", "review",
+            "--arg", "files=a.cs,b.cs",
+            "--arg", "depth=deep",
+        ]);
+
+        parsed.Workflow.Should().Be("review");
+        parsed.WorkflowArgs.Should().Equal("files=a.cs,b.cs", "depth=deep");
+    }
+
+    [Fact]
+    public void Parse_workflow_args_builds_key_value_dictionary()
+    {
+        var dict = Program.ParseWorkflowArgs(new[] { "files=a.cs,b.cs", "depth=deep", "malformed" });
+
+        dict.Should().HaveCount(2);
+        dict["files"].Should().Be("a.cs,b.cs");
+        dict["depth"].Should().Be("deep");
+        dict.Should().NotContainKey("malformed"); // no '=', ignored
+    }
+
+    [Fact]
     public void Resume_with_uuid_sets_resume_id_and_no_picker()
     {
         var parsed = ArgumentParser.Parse(["--resume", "abc-123"]);

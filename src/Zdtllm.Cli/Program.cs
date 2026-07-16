@@ -7,6 +7,7 @@ using Zdtllm.Core.Observers;
 using Zdtllm.Cli.Input;
 using Zdtllm.Core.Repl;
 using Zdtllm.Core.Sessions;
+using Zdtllm.Core.Workflows;
 using Zdtllm.Core.Setup;
 using Zdtllm.LiteLLM;
 using Zdtllm.Mcp;
@@ -350,6 +351,15 @@ internal static class Program
         // way to guarantee disposal across both print and interactive paths.
         try
         {
+
+        // --workflow: run a declarative multi-agent workflow one-shot, then exit. Uses the same
+        // subagent machinery the Agent tool does. Ctrl+C cancels it.
+        if (parsed.Workflow is not null)
+        {
+            Console.CancelKeyPress += (_, e) => { e.Cancel = true; programCts.Cancel(); };
+            return await RunWorkflowAsync(parsed, subagentRunner, cwd, session.Model, programCts.Token)
+                .ConfigureAwait(false);
+        }
 
         if (parsed.PrintMode)
         {
@@ -732,6 +742,61 @@ internal static class Program
     ///   3. null → no context tracking, /context tells the user how to fix it.
     /// </summary>
     /// <summary>
+    /// Run a declarative workflow one-shot: load it, execute every phase (progress to stderr),
+    /// print the final phase's output to stdout for piping. Returns a POSIX-ish exit code.
+    /// </summary>
+    private static async Task<int> RunWorkflowAsync(
+        ParsedArgs parsed, ISubagentRunner runner, string cwd, string model, CancellationToken ct)
+    {
+        var loader = new WorkflowLoader(cwd);
+        WorkflowDefinition workflow;
+        try
+        {
+            workflow = loader.Load(parsed.Workflow!);
+        }
+        catch (WorkflowException ex)
+        {
+            await Console.Error.WriteLineAsync($"zdt: {ex.Message}").ConfigureAwait(false);
+            return 2;
+        }
+
+        var args = ParseWorkflowArgs(parsed.WorkflowArgs);
+        await Console.Error.WriteLineAsync(
+            $"zdt: running workflow '{workflow.Name}' — {workflow.Phases.Count} phase(s)")
+            .ConfigureAwait(false);
+
+        WorkflowResult result;
+        try
+        {
+            result = await new WorkflowRunner(runner)
+                .RunAsync(workflow, args, Console.Error, ct, maxParallel: parsed.MaxParallel ?? 0, parentModel: model)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            await Console.Error.WriteLineAsync("zdt: workflow cancelled.").ConfigureAwait(false);
+            return 130;
+        }
+
+        // stdout carries the final phase's text (pipe-friendly). Intermediate phases go to stderr.
+        await Console.Out.WriteLineAsync(result.FinalOutput).ConfigureAwait(false);
+        return 0;
+    }
+
+    /// <summary>Parse repeatable <c>--arg key=value</c> tokens into a case-sensitive dictionary.</summary>
+    internal static IReadOnlyDictionary<string, string> ParseWorkflowArgs(IReadOnlyList<string> raw)
+    {
+        var dict = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var token in raw)
+        {
+            var eq = token.IndexOf('=');
+            if (eq <= 0) continue; // ignore malformed entries (no key)
+            dict[token[..eq].Trim()] = token[(eq + 1)..];
+        }
+        return dict;
+    }
+
+    /// <summary>
     /// Decide whether the active model accepts images. Priority: an explicit <c>litellm.vision</c>
     /// setting, else LiteLLM's <c>/model/info</c> <c>supports_vision</c> for the resolved model,
     /// else false (conservative — the user asked for images gated on capable models). Best-effort:
@@ -1035,6 +1100,8 @@ internal static class Program
         Console.WriteLine("  --no-wizard                    skip the first-run setup wizard");
         Console.WriteLine("  --bare                         skip auto-discovery of skills");
         Console.WriteLine("  --plan                         start in plan mode (read-only; propose a plan before changes)");
+        Console.WriteLine("  --workflow <name>              run a declarative workflow from .zdtllm/workflows/, then exit");
+        Console.WriteLine("  --arg key=value                input for --workflow (repeatable; list values are comma-separated)");
         Console.WriteLine("  --tool-calling <native|xml>    transport for tool calls (default: native)");
         Console.WriteLine("  --system-prompt <text>         replace the default system prompt with <text>");
         Console.WriteLine("  --system-prompt-file <path>    replace the default system prompt with file contents");

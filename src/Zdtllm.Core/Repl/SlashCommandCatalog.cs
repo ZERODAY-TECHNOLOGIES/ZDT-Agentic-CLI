@@ -15,6 +15,8 @@ public static class SlashCommandCatalog
         new SlashCommandInfo("/help", "show the command list"),
         new SlashCommandInfo("/model", "switch the model used by the next turn"),
         new SlashCommandInfo("/plan", "toggle plan mode (read-only; propose a plan before changes)"),
+        new SlashCommandInfo("/workflow", "run a multi-agent workflow (/workflow <name> key=value …)"),
+        new SlashCommandInfo("/workflows", "list declarative workflows in .zdtllm/workflows/"),
         new SlashCommandInfo("/context", "show context-window usage and per-role breakdown"),
         new SlashCommandInfo("/compact", "summarize older turns to free context"),
         new SlashCommandInfo("/status", "show session id, model, mode, message count"),

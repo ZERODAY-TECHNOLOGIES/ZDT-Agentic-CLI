@@ -1,5 +1,6 @@
 using Spectre.Console;
 using Zdtllm.Core.Sessions;
+using Zdtllm.Core.Workflows;
 using Zdtllm.Tools;
 
 namespace Zdtllm.Core.Repl;
@@ -361,6 +362,14 @@ public sealed class Repl
                 await HandlePlanCommandAsync().ConfigureAwait(false);
                 return SlashOutcome.Continue;
 
+            case "/workflows":
+                await ListWorkflowsAsync().ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
+            case "/workflow":
+                await HandleWorkflowCommandAsync(args, ct).ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
             default:
                 await _output.WriteLineAsync(
                         Palette.Red($"Unknown command: {cmd}.") + " " +
@@ -391,6 +400,8 @@ public sealed class Repl
         await WriteCommandRowAsync("/init", "create ZDTLLM.md (project memory file) in the cwd").ConfigureAwait(false);
         await WriteCommandRowAsync("/compact", "summarize older turns to free context").ConfigureAwait(false);
         await WriteCommandRowAsync("/plan", "toggle plan mode (read-only; propose a plan before changes)").ConfigureAwait(false);
+        await WriteCommandRowAsync("/workflows", "list declarative workflows in .zdtllm/workflows/").ConfigureAwait(false);
+        await WriteCommandRowAsync("/workflow <name> [k=v]", "run a multi-agent workflow").ConfigureAwait(false);
         await WriteCommandRowAsync("/agents", "list available subagent types and their tool sets").ConfigureAwait(false);
     }
 
@@ -671,6 +682,128 @@ public sealed class Repl
                              "approve it (or run /plan again) to make changes."))
                 .ConfigureAwait(false);
         }
+    }
+
+    private async Task ListWorkflowsAsync()
+    {
+        var workflows = new WorkflowLoader(_cwd).List();
+        if (workflows.Count == 0)
+        {
+            await _output.WriteLineAsync(
+                Palette.Mute($"No workflows found in {Path.Combine(_cwd, ".zdtllm", "workflows")}. ") +
+                Palette.Mute("Add a <name>.json there, then run ") + Palette.Cyan("/workflow <name>") + Palette.Mute("."))
+                .ConfigureAwait(false);
+            return;
+        }
+
+        await _output.WriteLineAsync(Palette.BodyBold("Available workflows:")).ConfigureAwait(false);
+        foreach (var w in workflows)
+        {
+            await _output.WriteLineAsync(
+                $"  {Palette.GoldBold(w.Name)}  {Palette.Mute($"({w.PhaseCount} phase(s))")}")
+                .ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(w.Description))
+                await _output.WriteLineAsync($"    {Palette.Mute(w.Description!)}").ConfigureAwait(false);
+        }
+        await _output.WriteLineAsync(
+            Palette.Mute("  Run one with ") + Palette.Cyan("/workflow <name> key=value …")).ConfigureAwait(false);
+    }
+
+    private async Task HandleWorkflowCommandAsync(string args, CancellationToken ct)
+    {
+        if (_subagentRunner is null)
+        {
+            await _output.WriteLineAsync(
+                Palette.Mute("/workflow needs the Agent/subagent runner (interactive mode)."))
+                .ConfigureAwait(false);
+            return;
+        }
+
+        var (name, rest) = SplitFirstToken(args);
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            await _output.WriteLineAsync(Palette.Mute("Usage: /workflow <name> [key=value …]")).ConfigureAwait(false);
+            await ListWorkflowsAsync().ConfigureAwait(false);
+            return;
+        }
+
+        WorkflowDefinition workflow;
+        try
+        {
+            workflow = new WorkflowLoader(_cwd).Load(name);
+        }
+        catch (WorkflowException ex)
+        {
+            await _error.WriteLineAsync(Palette.Red($"zdt: {ex.Message}")).ConfigureAwait(false);
+            return;
+        }
+
+        var wfArgs = ParseKeyValues(rest);
+
+        // Publish a turn CTS so a single Ctrl+C cancels the workflow (like a normal turn).
+        using var turnCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _currentTurnCts = turnCts;
+        try
+        {
+            var result = await new WorkflowRunner(_subagentRunner)
+                .RunAsync(workflow, wfArgs, _error, turnCts.Token, maxParallel: 0, parentModel: _session.Model)
+                .ConfigureAwait(false);
+
+            foreach (var phase in result.Phases)
+            {
+                await _output.WriteLineAsync(
+                    Palette.CyanBold($"◇ {phase.Title}") + " " + Palette.Mute($"({phase.Outputs.Count} output(s))"))
+                    .ConfigureAwait(false);
+                foreach (var outText in phase.Outputs)
+                {
+                    if (_richConsole is not null)
+                    {
+                        _richConsole.Write(MarkdownRenderer.Render(outText));
+                        _richConsole.WriteLine();
+                    }
+                    else
+                    {
+                        await _output.WriteLineAsync(outText).ConfigureAwait(false);
+                    }
+                }
+            }
+            await _output.WriteLineAsync(
+                Palette.Cyan("✓") + " " + Palette.Body($"Workflow '{result.Name}' complete."))
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (turnCts.IsCancellationRequested)
+        {
+            await _error.WriteLineAsync(Palette.Mute("(workflow cancelled)")).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await _error.WriteLineAsync(Palette.Red($"zdt: workflow failed: {ex.Message}")).ConfigureAwait(false);
+        }
+        finally
+        {
+            _currentTurnCts = null;
+        }
+    }
+
+    private static (string First, string Remainder) SplitFirstToken(string s)
+    {
+        s = s.Trim();
+        if (s.Length == 0) return (string.Empty, string.Empty);
+        var sp = s.IndexOf(' ');
+        return sp < 0 ? (s, string.Empty) : (s[..sp], s[(sp + 1)..].Trim());
+    }
+
+    private static IReadOnlyDictionary<string, string> ParseKeyValues(string s)
+    {
+        var dict = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(s)) return dict;
+        foreach (var token in s.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var eq = token.IndexOf('=');
+            if (eq <= 0) continue;
+            dict[token[..eq].Trim()] = token[(eq + 1)..];
+        }
+        return dict;
     }
 
     private async Task HandleContextCommandAsync()

@@ -228,6 +228,41 @@ so a resumed session won't re-send them.
 resume it (`zdt -r <id>`). During a turn, one Ctrl+C interrupts just that turn; at the prompt, one
 Ctrl+C shows "press again to exit" and a second one exits — exactly like claude-cli.
 
+### Workflows (multi-agent orchestration)
+
+Declarative, deterministic multi-agent pipelines — the orchestration is fixed by a file, only the
+subagents' text is model-driven, so it stays model-agnostic. Drop a JSON file in
+`.zdtllm/workflows/<name>.json`:
+
+```json
+{
+  "name": "review",
+  "description": "Review each changed file, then synthesize",
+  "inputs": ["files"],
+  "phases": [
+    { "title": "Review", "agent": "code-reviewer", "forEach": "files", "parallel": true,
+      "prompt": "Read {{item}} in full and list security issues with file:line." },
+    { "title": "Synthesize", "agent": "general-purpose",
+      "prompt": "Merge these findings, worst first:\n\n{{Review.results}}" }
+  ]
+}
+```
+
+- **Phases run in order.** A phase with `forEach` fans a subagent out over the items of an input
+  list (comma/newline separated), in parallel (capped by `--max-parallel`) or sequentially.
+- **Templating**: `{{arg}}` (inputs), `{{item}}` (the current fan-out element), and
+  `{{PhaseTitle.results}}` (a prior phase's combined output) are substituted into prompts.
+- **Each step is a subagent** (`general-purpose` | `code-reviewer` | `explore`) run through the same
+  machinery as the `Agent` tool — including retry/fallback. A step that fails is recorded, not fatal.
+
+Run it:
+
+```bash
+zdt --workflow review --arg files=src/a.cs,src/b.cs     # one-shot; final phase → stdout, progress → stderr
+```
+
+or in the REPL: `/workflows` lists them, `/workflow review files=a.cs,b.cs` runs one.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

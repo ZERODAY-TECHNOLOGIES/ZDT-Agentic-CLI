@@ -41,6 +41,12 @@ internal static class ArgumentParser
                 case "--plan":
                     result.Plan = true;
                     break;
+                case "--workflow":
+                    result.Workflow = NextValue(args, ref i, "--workflow");
+                    break;
+                case "--arg":
+                    result.WorkflowArgs.Add(NextValue(args, ref i, "--arg"));
+                    break;
                 case "--tool-calling":
                     result.ToolCallingMode = NextValue(args, ref i, "--tool-calling");
                     break;
@@ -178,6 +184,10 @@ internal sealed class ParsedArgs
     public bool Bare { get; set; }
     /// <summary>Start the interactive session in plan mode (read-only; drafts a plan for approval).</summary>
     public bool Plan { get; set; }
+    /// <summary>Name of a declarative workflow (from .zdtllm/workflows/) to run one-shot, then exit.</summary>
+    public string? Workflow { get; set; }
+    /// <summary>Repeatable <c>key=value</c> inputs for the workflow (list values are comma-separated).</summary>
+    public List<string> WorkflowArgs { get; } = new();
     public string? ToolCallingMode { get; set; }
     public string? SessionId { get; set; }
     public bool Continue { get; set; }
