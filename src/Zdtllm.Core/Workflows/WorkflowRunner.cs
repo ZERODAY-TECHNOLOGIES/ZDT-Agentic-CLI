@@ -95,7 +95,7 @@ public sealed class WorkflowRunner
             {
                 ct.ThrowIfCancellationRequested();
                 var prompt = WorkflowTemplate.Resolve(phase.Prompt, WithItem(baseContext, item));
-                seq.Add(await RunStepAsync(phase, prompt, parentModel, ct).ConfigureAwait(false));
+                seq.Add(await RunStepAsync(phase, prompt, parentModel, ct, item).ConfigureAwait(false));
             }
             return seq;
         }
@@ -107,26 +107,29 @@ public sealed class WorkflowRunner
         var tasks = items.Select(item =>
         {
             var prompt = WorkflowTemplate.Resolve(phase.Prompt, WithItem(baseContext, item));
-            return RunStepGuardedAsync(sem, phase, prompt, parentModel, ct);
+            return RunStepGuardedAsync(sem, phase, prompt, parentModel, item, ct);
         }).ToArray();
 
         return (await Task.WhenAll(tasks).ConfigureAwait(false)).ToList();
     }
 
     private async Task<string> RunStepGuardedAsync(
-        SemaphoreSlim? sem, WorkflowPhase phase, string prompt, string? parentModel, CancellationToken ct)
+        SemaphoreSlim? sem, WorkflowPhase phase, string prompt, string? parentModel, string? item, CancellationToken ct)
     {
-        if (sem is null) return await RunStepAsync(phase, prompt, parentModel, ct).ConfigureAwait(false);
+        if (sem is null) return await RunStepAsync(phase, prompt, parentModel, ct, item).ConfigureAwait(false);
         await sem.WaitAsync(ct).ConfigureAwait(false);
-        try { return await RunStepAsync(phase, prompt, parentModel, ct).ConfigureAwait(false); }
+        try { return await RunStepAsync(phase, prompt, parentModel, ct, item).ConfigureAwait(false); }
         finally { sem.Release(); }
     }
 
     private async Task<string> RunStepAsync(
-        WorkflowPhase phase, string prompt, string? parentModel, CancellationToken ct)
+        WorkflowPhase phase, string prompt, string? parentModel, CancellationToken ct, string? item = null)
     {
+        // Include the fan-out item in the description so the live-activity tag distinguishes
+        // parallel agents (e.g. "Review: a.cs" vs "Review: b.cs").
+        var description = string.IsNullOrEmpty(item) ? phase.Title : $"{phase.Title}: {item}";
         var request = new SubagentRequest(
-            Description: phase.Title,
+            Description: description,
             Prompt: prompt,
             Type: phase.Agent,
             MaxTurns: phase.MaxTurns,

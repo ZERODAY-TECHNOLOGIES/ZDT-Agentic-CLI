@@ -303,7 +303,11 @@ internal static class Program
         // at dispatch time. The captured snapshot of Models / SubagentModels is fine because
         // settings are read once at startup and never mutate at runtime; if that ever changes,
         // this delegate would need to read live state instead.
-        var subagentRunner = new SubagentRunner(agent);
+        // Live subagent activity is streamed (tagged per agent) to stderr so you can watch what
+        // every parallel agent / workflow step is doing. Kept OFF for a plain scripted -p run
+        // (unless --verbose) so automated callers don't get a noisy stderr.
+        var subagentSink = parsed.PrintMode && !parsed.Verbose ? null : Console.Error;
+        var subagentRunner = new SubagentRunner(agent, subagentSink);
         var modelAliases = settings.LiteLLM.Models;
         var subagentOverrides = settings.LiteLLM.SubagentModels;
         var smallFastModel = settings.LiteLLM.SmallFastModel;

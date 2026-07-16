@@ -67,7 +67,7 @@ public sealed class WorkflowRunnerTests
     {
         var runner = new FakeRunner
         {
-            Responder = r => r.Description == "Review" ? $"finding({r.Prompt})" : "SYNTH:" + r.Prompt,
+            Responder = r => r.Description.StartsWith("Review") ? $"finding({r.Prompt})" : "SYNTH:" + r.Prompt,
         };
         var args = new Dictionary<string, string> { ["files"] = "x,y" };
 

@@ -255,6 +255,12 @@ subagents' text is model-driven, so it stays model-agnostic. Drop a JSON file in
 - **Each step is a subagent** (`general-purpose` | `code-reviewer` | `explore`) run through the same
   machinery as the `Agent` tool — including retry/fallback. A step that fails is recorded, not fatal.
 
+**Watch every agent live.** When several subagents run at once (a workflow fan-out, or parallel
+`Agent` calls), each agent's activity is streamed to stderr **tagged with its label** — e.g.
+`[Review: a.cs #2] Read src/a.cs` — so you can follow what all of them are doing at once in one
+scroll (no mid-line interleaving). It's on in interactive + workflow runs; a plain scripted `-p`
+run keeps it off unless you pass `--verbose`.
+
 Run it:
 
 ```bash

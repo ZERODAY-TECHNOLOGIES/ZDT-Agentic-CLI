@@ -48,10 +48,21 @@ public sealed class SubagentRunner : ISubagentRunner
 
     private readonly AgentLoop _parent;
 
-    public SubagentRunner(AgentLoop parent)
+    /// <summary>
+    /// Optional shared sink for live subagent activity. When set, every subagent's output + status
+    /// is streamed here line-by-line, each line tagged with the agent's label, so several parallel
+    /// subagents' work is visible interleaved in one stream. Null (tests, quiet -p) keeps the old
+    /// behaviour: subagent chatter is buffered and discarded, only the final text bubbles up.
+    /// </summary>
+    private readonly TextWriter? _activitySink;
+    private readonly object _sinkLock = new();
+    private int _dispatchCounter;
+
+    public SubagentRunner(AgentLoop parent, TextWriter? activitySink = null)
     {
         ArgumentNullException.ThrowIfNull(parent);
         _parent = parent;
+        _activitySink = activitySink;
     }
 
     public IReadOnlyList<string> AvailableTypes => AvailableTypeNames;
@@ -77,6 +88,11 @@ public sealed class SubagentRunner : ISubagentRunner
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        // One stable label per dispatch, used to tag this subagent's live activity so parallel
+        // agents stay distinguishable in the shared stream. Uses the description (the model's /
+        // workflow's short title) plus a monotonic number.
+        var label = BuildLabel(request.Description, Interlocked.Increment(ref _dispatchCounter));
+
         // Attempt 1: requested type. Attempt 2: same type (transient retry — most LiteLLM/network
         // failures are flaky one-shot timeouts). Attempt 3 (only if requested type wasn't already
         // general-purpose): fall back to general-purpose, which has the broadest tool set and the
@@ -96,7 +112,7 @@ public sealed class SubagentRunner : ISubagentRunner
             var (effectiveType, isFallback) = attempts[i];
             try
             {
-                var result = await RunOnceAsync(request with { Type = effectiveType }, ct).ConfigureAwait(false);
+                var result = await RunOnceAsync(request with { Type = effectiveType }, label, ct).ConfigureAwait(false);
                 if (isFallback)
                 {
                     var note = $"[fallback to general-purpose after {i} failure(s) of '{request.Type}']\n\n";
@@ -120,7 +136,15 @@ public sealed class SubagentRunner : ISubagentRunner
             lastError);
     }
 
-    private async Task<SubagentResult> RunOnceAsync(SubagentRequest request, CancellationToken ct)
+    /// <summary>Compact, unique-ish tag for a subagent's live-activity lines: <c>[desc #n]</c>.</summary>
+    private static string BuildLabel(string description, int seq)
+    {
+        var desc = string.IsNullOrWhiteSpace(description) ? "agent" : description.Trim();
+        if (desc.Length > 28) desc = string.Concat(desc.AsSpan(0, 28), "…");
+        return $"[{desc} #{seq}] ";
+    }
+
+    private async Task<SubagentResult> RunOnceAsync(SubagentRequest request, string label, CancellationToken ct)
     {
         var subRegistry = BuildRegistryForType(request.Type, _parent.Tools);
         // Resolve which model the subagent runs on. Priority:
@@ -166,24 +190,38 @@ public sealed class SubagentRunner : ISubagentRunner
 
         using var session = Session.NewEphemeral(subOptions.Model, subOptions.ToolCallingMode);
 
-        // Buffer the subagent's streamed text + status so the parent's stdout/stderr stays
-        // clean. Only the AgentResult.FinalText is bubbled up.
-        using var capturedOutput = new StringWriter();
-        using var capturedStatus = new StringWriter();
+        // With a live sink, stream this subagent's output + status there, each line tagged with its
+        // label, so you can watch what every parallel agent is doing. Without one, buffer and
+        // discard as before (only the final text bubbles up). The final text is returned from the
+        // AgentResult regardless of where the display copy went, so nothing is lost either way.
+        TextWriter output = _activitySink is not null
+            ? new LivePrefixWriter(_activitySink, _sinkLock, label)
+            : new StringWriter();
+        TextWriter status = _activitySink is not null
+            ? new LivePrefixWriter(_activitySink, _sinkLock, label)
+            : new StringWriter();
 
-        var result = await subAgent.RunTurnAsync(
-            session,
-            request.Prompt,
-            output: capturedOutput,
-            status: capturedStatus,
-            ct: ct).ConfigureAwait(false);
+        try
+        {
+            var result = await subAgent.RunTurnAsync(
+                session,
+                request.Prompt,
+                output: output,
+                status: status,
+                ct: ct).ConfigureAwait(false);
 
-        return new SubagentResult(
-            FinalText: result.FinalText,
-            Turns: result.Turns,
-            PromptTokens: result.PromptTokens,
-            CompletionTokens: result.CompletionTokens,
-            Model: resolvedModel);
+            return new SubagentResult(
+                FinalText: result.FinalText,
+                Turns: result.Turns,
+                PromptTokens: result.PromptTokens,
+                CompletionTokens: result.CompletionTokens,
+                Model: resolvedModel);
+        }
+        finally
+        {
+            output.Dispose();
+            status.Dispose();
+        }
     }
 
     /// <summary>
