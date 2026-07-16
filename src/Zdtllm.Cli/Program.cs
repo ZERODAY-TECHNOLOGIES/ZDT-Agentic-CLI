@@ -5,6 +5,7 @@ using Zdtllm.Config;
 using Zdtllm.Core;
 using Zdtllm.Core.Observers;
 using Zdtllm.Cli.Input;
+using Zdtllm.Cli.Tui;
 using Zdtllm.Core.Repl;
 using Zdtllm.Core.Sessions;
 using Zdtllm.Core.Workflows;
@@ -173,6 +174,20 @@ internal static class Program
         // a human to approve). Starts on when --plan is passed; toggled at runtime with /plan.
         PlanModeState? planMode = interactive ? new PlanModeState(parsed.Plan) : null;
 
+        // The persistent bottom-input TUI (claude-code layout: output scrolls above, a multi-line
+        // input box stays pinned and writable during and between turns). Default for an interactive
+        // ANSI TTY; ZDT_NO_TUI or ZDT_BASIC_INPUT falls back to the line-based REPL. When on it
+        // becomes the input source, the turn-capture hook, and the AskUserQuestion/ExitPlanMode
+        // prompter; subagent activity streams into its scroll region (the fleet view is off in TUI).
+        var tuiMode = interactive
+            && inputQueue is not null
+            && !basicInput
+            && AnsiConsole.Console.Profile.Capabilities.Ansi
+            && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ZDT_NO_TUI"));
+        BottomInputTui? tui = tuiMode
+            ? new BottomInputTui(inputQueue!, AnsiConsole.Console, parsed.DangerouslySkipPermissions)
+            : null;
+
         var registry = new ToolRegistry();
         registry.Register(new ReadTool());
         registry.Register(new WriteTool());
@@ -186,10 +201,13 @@ internal static class Program
         registry.Register(new WebSearchTool());
         if (skills.Count > 0)
             registry.Register(new SkillTool(skills));
-        if (turnInput is not null)
-            registry.Register(new AskUserQuestionTool(turnInput));
-        if (turnInput is not null && planMode is not null)
-            registry.Register(new ExitPlanModeTool(planMode, turnInput));
+        // The human-facing prompter for AskUserQuestion / ExitPlanMode: the TUI when it's on
+        // (it owns the console), otherwise the ConsoleInput driver.
+        Zdtllm.Tools.IInteractivePrompter? prompter = tui is not null ? tui : turnInput;
+        if (prompter is not null)
+            registry.Register(new AskUserQuestionTool(prompter));
+        if (prompter is not null && planMode is not null)
+            registry.Register(new ExitPlanModeTool(planMode, prompter));
 
         // MCP servers — parse every --mcp-config in order (later entries override earlier ones
         // for the same server name), spawn each as a stdio subprocess, register its tools as
@@ -260,8 +278,10 @@ internal static class Program
         var additionalDirs = MergeAdditionalDirectories(parsed.AddDirs, settings.Permissions.AdditionalDirectories);
 
         // Print mode pipes stdout through the shell so a spinner/markdown renderer would
-        // mangle redirected output. Interactive mode benefits from rich rendering.
-        var richConsole = parsed.PrintMode ? null : AnsiConsole.Console;
+        // mangle redirected output. Interactive mode benefits from rich rendering — EXCEPT under
+        // the bottom-input TUI, which owns the screen with a scroll region and can't share it with
+        // Spectre's live spinner, so output there streams as plain lines into the scroll region.
+        var richConsole = (parsed.PrintMode || tuiMode) ? null : AnsiConsole.Console;
 
         // Compose the agent observer based on --output-format / --verbose. stream-json owns
         // stdout in -p mode (delta events go through the observer); aggregating json captures
@@ -308,14 +328,19 @@ internal static class Program
         //     ≥2 run at once); ZDT_NO_AGENT_VIEW falls back to the tagged stream.
         //   • otherwise → each subagent's activity streamed tagged to stderr (off for a plain
         //     scripted -p run unless --verbose, so automated callers get a clean stderr).
+        // The fleet view (Spectre live) can't share the screen with the TUI's scroll region, so in
+        // TUI mode subagent activity streams (tagged) into the TUI's scroll region instead.
         var agentViewEnabled = interactive
+            && !tuiMode
             && turnInput is not null
             && AnsiConsole.Console.Profile.Capabilities.Ansi
             && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ZDT_NO_AGENT_VIEW"));
         AgentFleetView? fleetView = agentViewEnabled ? new AgentFleetView(AnsiConsole.Console, turnInput) : null;
-        TextWriter? subagentSink = fleetView is not null
-            ? null
-            : (parsed.PrintMode && !parsed.Verbose ? null : Console.Error);
+        TextWriter? subagentSink = tui is not null
+            ? tui.Output
+            : fleetView is not null
+                ? null
+                : (parsed.PrintMode && !parsed.Verbose ? null : Console.Error);
         var subagentRunner = new SubagentRunner(agent, subagentSink, fleetView);
         var modelAliases = settings.LiteLLM.Models;
         var subagentOverrides = settings.LiteLLM.SubagentModels;
@@ -434,19 +459,27 @@ internal static class Program
             AnsiConsole.MarkupLine(
                 $"[{Branding.Hex(Branding.MutedText)}]🖼  vision: on — drag an image onto the prompt to attach it.[/]");
 
+        // In TUI mode the bottom-input TUI is the input source, the turn-capture hook (drives the
+        // "thinking" indicator), and the output sink (its scroll region); Spectre rich rendering is
+        // off. Otherwise the classic line REPL wiring.
+        var replOutput = tui is not null ? tui.Output : Console.Out;
+        var replError = tui is not null ? tui.Output : Console.Error;
+        var replInputSource = tui is not null ? (IReplInputSource)tui : richInputSource;
+        var replCapture = tui is not null ? (ITurnInputCapture)tui : turnInput;
+
         var repl = new Repl(
             session,
             agent,
             Console.In,
-            Console.Out,
-            Console.Error,
+            replOutput,
+            replError,
             cwd,
             richConsole: richConsole,
             subagentRunner: subagentRunner,
             inputQueue: inputQueue,
-            inputCapture: turnInput,
+            inputCapture: replCapture,
             planMode: planMode,
-            richInput: richInputSource);
+            richInput: replInputSource);
 
         // Ctrl+C behaviour, matching claude-cli:
         //   • During a turn  → first press interrupts the turn (keeps the REPL alive) and clears
@@ -490,6 +523,7 @@ internal static class Program
         }
         finally
         {
+            tui?.Dispose();
             fleetView?.Dispose();
             turnInput?.Dispose();
             await mcpManager.DisposeAsync().ConfigureAwait(false);

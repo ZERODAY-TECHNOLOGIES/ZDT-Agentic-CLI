@@ -167,9 +167,20 @@ dotnet run --project src/Zdtllm.Cli -- -p "Read README.md and tell me what it co
 
 ### Interactive features
 
-These three claude-cli behaviours work with **any** LiteLLM-served model — nothing here is
+These claude-cli behaviours work with **any** LiteLLM-served model — nothing here is
 Anthropic-specific, and they degrade gracefully to a no-op when there's no real terminal
 (print mode, piped stdin, subagents).
+
+**Persistent input box (the default TUI).** On an interactive ANSI terminal, model/tool output
+scrolls in the upper part of the screen while a **multi-line input box stays pinned at the bottom**,
+always writable — you can type (and edit with the arrow keys, Home/End, Backspace/Delete,
+Ctrl+A/E/U/K) whether the model is thinking or idle. Enter sends; `\`+Enter or Alt+Enter adds a
+newline; paste keeps its newlines. Submitting while a turn runs queues the message (folded into the
+run); submitting when idle starts a turn. A status line shows `⏺ thinking (Ns)` during a turn, and
+the footer shows the permission mode — including a clear `⚠ bypass permissions ON` when you passed
+`--dangerously-skip-permissions`. Set `ZDT_NO_TUI=1` (or `ZDT_BASIC_INPUT=1`) to fall back to the
+line-based REPL — which keeps the `/`-autocomplete picker and the arrow-key agent fleet view (those
+aren't in the TUI yet).
 
 **Resume a past conversation with a picker.** `-r` / `--resume` now takes an *optional*
 session id:

@@ -434,92 +434,22 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
 
     // ================= interactive selection (IInteractivePrompter) =================
 
-    // Reference-identity sentinel for the always-present "type your own answer" option, so we can
-    // tell it apart from a real choice that happens to share its label.
-    private static readonly PromptChoice FreeTextChoice =
-        new("✎ Something else…", "Type your own answer");
-
     public async Task<IReadOnlyList<string>> SelectAsync(
         string question, string? header, IReadOnlyList<PromptChoice> options,
         bool multiSelect, bool allowFreeText, CancellationToken ct)
     {
+        // Own the console (pausing the capture reader) so the Spectre prompt has sole key access.
         await _consoleLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var title = BuildTitle(question, header);
-            // Always offer a free-text escape hatch when asked, so the user is never boxed into
-            // the canned options — they can answer with something the model didn't anticipate.
-            var choices = allowFreeText ? options.Append(FreeTextChoice).ToList() : options.ToList();
-            var pageSize = Math.Clamp(choices.Count + 1, 3, 16);
-
-            if (multiSelect)
-            {
-                var prompt = new MultiSelectionPrompt<PromptChoice>()
-                    .Title(title)
-                    .PageSize(pageSize)
-                    .NotRequired()
-                    .HighlightStyle(new Style(BrandCyan))
-                    .UseConverter(FormatChoice)
-                    .AddChoices(choices);
-                prompt.InstructionsText = $"[{Hex(MutedText)}](space to toggle, enter to confirm)[/]";
-                var chosen = await prompt.ShowAsync(_console, ct).ConfigureAwait(false);
-
-                var result = new List<string>();
-                foreach (var c in chosen)
-                {
-                    if (ReferenceEquals(c, FreeTextChoice))
-                    {
-                        var custom = await ReadFreeTextAsync(ct).ConfigureAwait(false);
-                        if (!string.IsNullOrWhiteSpace(custom)) result.Add(custom.Trim());
-                    }
-                    else result.Add(c.Label);
-                }
-                return result;
-            }
-            else
-            {
-                var prompt = new SelectionPrompt<PromptChoice>()
-                    .Title(title)
-                    .PageSize(pageSize)
-                    .HighlightStyle(new Style(BrandCyan))
-                    .UseConverter(FormatChoice)
-                    .AddChoices(choices);
-                var chosen = await prompt.ShowAsync(_console, ct).ConfigureAwait(false);
-
-                if (ReferenceEquals(chosen, FreeTextChoice))
-                {
-                    var custom = await ReadFreeTextAsync(ct).ConfigureAwait(false);
-                    return new[] { string.IsNullOrWhiteSpace(custom) ? "(no answer)" : custom.Trim() };
-                }
-                return new[] { chosen.Label };
-            }
+            return await SpectreChoice.SelectAsync(_console, question, header, options, multiSelect, allowFreeText, ct)
+                .ConfigureAwait(false);
         }
         finally
         {
             _consoleLock.Release();
         }
     }
-
-    /// <summary>Read a free-text answer (used when the user picks the "Something else…" option).</summary>
-    private async Task<string> ReadFreeTextAsync(CancellationToken ct)
-    {
-        var prompt = new TextPrompt<string>($"[{Hex(BrandCyan)}]Your answer:[/]")
-            .AllowEmpty();
-        return await prompt.ShowAsync(_console, ct).ConfigureAwait(false);
-    }
-
-    private static string BuildTitle(string question, string? header)
-    {
-        var q = $"[bold {Hex(BrandCyan)}]{Markup.Escape(question)}[/]";
-        return string.IsNullOrWhiteSpace(header) ? q : $"[{Hex(MutedText)}]{Markup.Escape(header!)}[/]\n{q}";
-    }
-
-    // Each option renders on two lines: the label, then its description indented underneath in a
-    // muted tone — so the description sits directly below the choice it explains.
-    private static string FormatChoice(PromptChoice c) =>
-        string.IsNullOrWhiteSpace(c.Description)
-            ? Markup.Escape(c.Label)
-            : $"{Markup.Escape(c.Label)}\n    [{Hex(MutedText)}]{Markup.Escape(c.Description!)}[/]";
 
     private static string Hex(Color c) => $"#{c.R:X2}{c.G:X2}{c.B:X2}";
 

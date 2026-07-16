@@ -8,7 +8,7 @@ namespace Zdtllm.Core;
 /// subagent's streamed output/status into discrete lines for the fleet view's per-agent buffer.
 /// Thread-safe: a subagent may write from several threads (parallel tool dispatch).
 /// </summary>
-internal sealed class LineBufferedWriter : TextWriter
+public sealed class LineBufferedWriter : TextWriter
 {
     private readonly Action<string> _onLine;
     private readonly Encoding _encoding;
