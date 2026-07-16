@@ -58,11 +58,22 @@ public sealed class SubagentRunner : ISubagentRunner
     private readonly object _sinkLock = new();
     private int _dispatchCounter;
 
-    public SubagentRunner(AgentLoop parent, TextWriter? activitySink = null)
+    /// <summary>
+    /// Optional interactive fleet view. When set, each subagent is registered with it and its
+    /// output/status is fed there line-by-line so the user can navigate between live agents.
+    /// Takes precedence over <see cref="_activitySink"/>; null keeps the plain (sink/buffer) path.
+    /// </summary>
+    private readonly AgentFleet.IAgentFleetMonitor? _fleetMonitor;
+
+    public SubagentRunner(
+        AgentLoop parent,
+        TextWriter? activitySink = null,
+        AgentFleet.IAgentFleetMonitor? fleetMonitor = null)
     {
         ArgumentNullException.ThrowIfNull(parent);
         _parent = parent;
         _activitySink = activitySink;
+        _fleetMonitor = fleetMonitor;
     }
 
     public IReadOnlyList<string> AvailableTypes => AvailableTypeNames;
@@ -93,47 +104,59 @@ public sealed class SubagentRunner : ISubagentRunner
         // workflow's short title) plus a monotonic number.
         var label = BuildLabel(request.Description, Interlocked.Increment(ref _dispatchCounter));
 
-        // Attempt 1: requested type. Attempt 2: same type (transient retry — most LiteLLM/network
-        // failures are flaky one-shot timeouts). Attempt 3 (only if requested type wasn't already
-        // general-purpose): fall back to general-purpose, which has the broadest tool set and the
-        // simplest prompt — likeliest to succeed when a constrained profile keeps failing.
-        var attempts = new List<(string Type, bool IsFallback)>
+        // Register the agent with the fleet view (if any) up front so it appears the moment it
+        // starts, and mark it done/failed exactly once at the end (across all retry attempts).
+        var fleetId = _fleetMonitor?.Register(label) ?? -1;
+        var succeeded = false;
+        try
         {
-            (request.Type, false),
-            (request.Type, false),
-        };
-        if (!string.Equals(request.Type, "general-purpose", StringComparison.Ordinal))
-            attempts.Add(("general-purpose", true));
-
-        Exception? lastError = null;
-        for (var i = 0; i < attempts.Count; i++)
-        {
-            ct.ThrowIfCancellationRequested();
-            var (effectiveType, isFallback) = attempts[i];
-            try
+            // Attempt 1: requested type. Attempt 2: same type (transient retry — most LiteLLM/network
+            // failures are flaky one-shot timeouts). Attempt 3 (only if requested type wasn't already
+            // general-purpose): fall back to general-purpose, which has the broadest tool set and the
+            // simplest prompt — likeliest to succeed when a constrained profile keeps failing.
+            var attempts = new List<(string Type, bool IsFallback)>
             {
-                var result = await RunOnceAsync(request with { Type = effectiveType }, label, ct).ConfigureAwait(false);
-                if (isFallback)
+                (request.Type, false),
+                (request.Type, false),
+            };
+            if (!string.Equals(request.Type, "general-purpose", StringComparison.Ordinal))
+                attempts.Add(("general-purpose", true));
+
+            Exception? lastError = null;
+            for (var i = 0; i < attempts.Count; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                var (effectiveType, isFallback) = attempts[i];
+                try
                 {
-                    var note = $"[fallback to general-purpose after {i} failure(s) of '{request.Type}']\n\n";
-                    return result with { FinalText = note + result.FinalText };
+                    var result = await RunOnceAsync(request with { Type = effectiveType }, label, fleetId, ct).ConfigureAwait(false);
+                    succeeded = true;
+                    if (isFallback)
+                    {
+                        var note = $"[fallback to general-purpose after {i} failure(s) of '{request.Type}']\n\n";
+                        return result with { FinalText = note + result.FinalText };
+                    }
+                    return result;
                 }
-                return result;
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    // User-requested cancellation — surface immediately, do not retry.
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                }
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                // User-requested cancellation — surface immediately, do not retry.
-                throw;
-            }
-            catch (Exception ex)
-            {
-                lastError = ex;
-            }
-        }
 
-        throw new SubagentExecutionException(
-            $"Subagent '{request.Type}' failed after {attempts.Count} attempt(s): {lastError?.Message}",
-            lastError);
+            throw new SubagentExecutionException(
+                $"Subagent '{request.Type}' failed after {attempts.Count} attempt(s): {lastError?.Message}",
+                lastError);
+        }
+        finally
+        {
+            _fleetMonitor?.Complete(fleetId, failed: !succeeded);
+        }
     }
 
     /// <summary>Compact, unique-ish tag for a subagent's live-activity lines: <c>[desc #n]</c>.</summary>
@@ -144,7 +167,7 @@ public sealed class SubagentRunner : ISubagentRunner
         return $"[{desc} #{seq}] ";
     }
 
-    private async Task<SubagentResult> RunOnceAsync(SubagentRequest request, string label, CancellationToken ct)
+    private async Task<SubagentResult> RunOnceAsync(SubagentRequest request, string label, int fleetId, CancellationToken ct)
     {
         var subRegistry = BuildRegistryForType(request.Type, _parent.Tools);
         // Resolve which model the subagent runs on. Priority:
@@ -190,16 +213,27 @@ public sealed class SubagentRunner : ISubagentRunner
 
         using var session = Session.NewEphemeral(subOptions.Model, subOptions.ToolCallingMode);
 
-        // With a live sink, stream this subagent's output + status there, each line tagged with its
-        // label, so you can watch what every parallel agent is doing. Without one, buffer and
-        // discard as before (only the final text bubbles up). The final text is returned from the
-        // AgentResult regardless of where the display copy went, so nothing is lost either way.
-        TextWriter output = _activitySink is not null
-            ? new LivePrefixWriter(_activitySink, _sinkLock, label)
-            : new StringWriter();
-        TextWriter status = _activitySink is not null
-            ? new LivePrefixWriter(_activitySink, _sinkLock, label)
-            : new StringWriter();
+        // Route this subagent's output + status to the best available display:
+        //   1. the interactive fleet view (line-buffered into its per-agent panel), or
+        //   2. a tagged stream sink (each line prefixed with the label), or
+        //   3. a discard buffer (only the final text bubbles up).
+        // The final text is returned from the AgentResult regardless, so nothing is lost.
+        TextWriter output, status;
+        if (_fleetMonitor is not null)
+        {
+            output = new LineBufferedWriter(line => _fleetMonitor.Append(fleetId, line));
+            status = new LineBufferedWriter(line => _fleetMonitor.Append(fleetId, line));
+        }
+        else if (_activitySink is not null)
+        {
+            output = new LivePrefixWriter(_activitySink, _sinkLock, label);
+            status = new LivePrefixWriter(_activitySink, _sinkLock, label);
+        }
+        else
+        {
+            output = new StringWriter();
+            status = new StringWriter();
+        }
 
         try
         {

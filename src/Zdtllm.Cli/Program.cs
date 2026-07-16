@@ -303,11 +303,20 @@ internal static class Program
         // at dispatch time. The captured snapshot of Models / SubagentModels is fine because
         // settings are read once at startup and never mutate at runtime; if that ever changes,
         // this delegate would need to read live state instead.
-        // Live subagent activity is streamed (tagged per agent) to stderr so you can watch what
-        // every parallel agent / workflow step is doing. Kept OFF for a plain scripted -p run
-        // (unless --verbose) so automated callers don't get a noisy stderr.
-        var subagentSink = parsed.PrintMode && !parsed.Verbose ? null : Console.Error;
-        var subagentRunner = new SubagentRunner(agent, subagentSink);
+        // How subagent activity is surfaced:
+        //   • interactive TTY → a navigable "fleet view" (arrow-key switch between live agents when
+        //     ≥2 run at once); ZDT_NO_AGENT_VIEW falls back to the tagged stream.
+        //   • otherwise → each subagent's activity streamed tagged to stderr (off for a plain
+        //     scripted -p run unless --verbose, so automated callers get a clean stderr).
+        var agentViewEnabled = interactive
+            && turnInput is not null
+            && AnsiConsole.Console.Profile.Capabilities.Ansi
+            && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ZDT_NO_AGENT_VIEW"));
+        AgentFleetView? fleetView = agentViewEnabled ? new AgentFleetView(AnsiConsole.Console, turnInput) : null;
+        TextWriter? subagentSink = fleetView is not null
+            ? null
+            : (parsed.PrintMode && !parsed.Verbose ? null : Console.Error);
+        var subagentRunner = new SubagentRunner(agent, subagentSink, fleetView);
         var modelAliases = settings.LiteLLM.Models;
         var subagentOverrides = settings.LiteLLM.SubagentModels;
         var smallFastModel = settings.LiteLLM.SmallFastModel;
@@ -481,6 +490,7 @@ internal static class Program
         }
         finally
         {
+            fleetView?.Dispose();
             turnInput?.Dispose();
             await mcpManager.DisposeAsync().ConfigureAwait(false);
         }

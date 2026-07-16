@@ -91,6 +91,25 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
         return imgs;
     }
 
+    /// <summary>
+    /// Take exclusive ownership of the console (pausing the queue-capture reader) for as long as the
+    /// returned handle is held. Used by the interactive agent fleet view so its key navigation
+    /// doesn't fight the capture loop. Blocks until the capture reader yields (it does so every poll
+    /// tick, so this returns promptly).
+    /// </summary>
+    public IDisposable EnterExclusive()
+    {
+        _consoleLock.Wait();
+        return new Releaser(_consoleLock);
+    }
+
+    private sealed class Releaser : IDisposable
+    {
+        private SemaphoreSlim? _sem;
+        public Releaser(SemaphoreSlim sem) => _sem = sem;
+        public void Dispose() { _sem?.Release(); _sem = null; }
+    }
+
     // ================= idle line editor (IReplInputSource) =================
 
     public async Task<string?> ReadLineAsync(CancellationToken ct)
