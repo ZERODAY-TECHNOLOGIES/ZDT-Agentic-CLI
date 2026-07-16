@@ -6,7 +6,26 @@
     <AssemblyName>zdt</AssemblyName>
     <!-- Default dev-build version. The release workflow overrides this with the
          git tag (without the leading 'v') via -p:Version=0.1.0 at publish time. -->
-    <Version>0.7.0</Version>
+    <Version>0.7.1</Version>
+
+    <!-- Publisher / product identity. A self-contained single-file exe with NO version
+         metadata reads to AV heuristics (and SmartScreen) as an "unknown, unsigned" blob and
+         gets extra false-positive weight. Stamping real Company/Product/Description gives the
+         binary a legitimate identity in its Win32 version resource. -->
+    <Company>zer0day.ro</Company>
+    <Authors>zer0day Technologies</Authors>
+    <Product>zdtllmcli</Product>
+    <AssemblyTitle>zdt — CLI LLM Agent, backed by LiteLLM</AssemblyTitle>
+    <Description>zdtllmcli (zdt) is an open-source agentic CLI for engineering work, backed by LiteLLM. A zer0day.ro project.</Description>
+    <Copyright>Copyright © zer0day.ro. MIT licensed.</Copyright>
+    <PackageProjectUrl>https://zer0day.ro</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ZERODAY-TECHNOLOGIES/ZDT-Agentic-CLI</RepositoryUrl>
+
+    <!-- Do NOT Brotli-compress the single-file bundle. A compressed .NET single-file has very
+         high entropy and is a well-known false-positive trigger for Windows Defender & friends
+         (it looks like a packed/obfuscated payload). Shipping uncompressed makes the binary
+         larger but far less likely to be flagged as malware on an unsigned download. -->
+    <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
   </PropertyGroup>
 
   <ItemGroup>

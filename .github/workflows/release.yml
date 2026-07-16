@@ -63,7 +63,10 @@ jobs:
           # IncludeNativeLibrariesForSelfExtract extracts native libs to a temp dir on first
           # run rather than embedding them as resources — required for Spectre.Console + a
           # few BCL natives that don't tolerate the bundled-resources path.
-          # EnableCompressionInSingleFile uses Brotli to roughly halve the on-disk size.
+          # EnableCompressionInSingleFile is deliberately OFF (see csproj): a Brotli-compressed
+          # single-file exe is high-entropy and is a well-known false-positive trigger for
+          # Windows Defender / SmartScreen (it looks like a packer). We trade a larger binary
+          # for not being flagged as malware on an unsigned download.
           # No PublishTrimmed: we use System.Text.Json with anonymous types in many places
           # (LiteLLM, MCP, observers) and Spectre.Console reflection — trimming would break
           # those at runtime. AOT migration is a future phase.
@@ -73,7 +76,7 @@ jobs:
             --self-contained true \
             -p:PublishSingleFile=true \
             -p:IncludeNativeLibrariesForSelfExtract=true \
-            -p:EnableCompressionInSingleFile=true \
+            -p:EnableCompressionInSingleFile=false \
             -p:DebugType=none \
             -p:DebugSymbols=false \
             -p:Version=${{ steps.ver.outputs.version }} \

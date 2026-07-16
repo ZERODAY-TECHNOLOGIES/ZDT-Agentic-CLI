@@ -48,6 +48,17 @@ Pin a specific version: append `-s -- --version v0.1.0` (bash) or `-Version v0.1
 Supported targets: `linux-x64`, `linux-arm64`, `osx-x64`, `osx-arm64`, `win-x64`,
 `win-arm64`.
 
+### Antivirus / SmartScreen note (Windows)
+
+The release binaries are **self-contained and unsigned**, so Windows SmartScreen or some
+antivirus engines may show an "unknown publisher" warning or a heuristic false positive on
+first run. This is not a detection of actual malicious behaviour — zdt is open source, builds
+reproducibly from this repo via the tagged GitHub Actions release workflow, and the binaries
+are published uncompressed with full publisher metadata to minimise these false positives. If
+your AV quarantines it, verify the SHA256 against `checksums.txt` on the release, allow-list it,
+and (optionally) report the false positive to your AV vendor. Building from source
+(`dotnet publish`) avoids the download-reputation heuristic entirely.
+
 ## Configure
 
 Settings cascade across three scopes (low → high precedence):
