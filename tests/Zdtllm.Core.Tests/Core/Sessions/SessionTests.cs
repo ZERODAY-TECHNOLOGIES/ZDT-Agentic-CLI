@@ -33,6 +33,39 @@ public sealed class SessionTests : IDisposable
     }
 
     [Fact]
+    public void AddUser_with_images_keeps_them_in_memory_but_persists_only_a_note()
+    {
+        var store = SessionStore.Create(_tempDir);
+        using (var session = Session.NewPersistent(store, "gpt-4o"))
+        {
+            session.AddUser("describe the picture", new[] { "data:image/png;base64,AAAA" });
+
+            // Live message carries the image so the vision model sees it.
+            var msg = session.Messages.Last();
+            msg.Role.Should().Be("user");
+            msg.Content.Should().Be("describe the picture");
+            msg.Images.Should().ContainSingle().Which.Should().Be("data:image/png;base64,AAAA");
+        }
+
+        // On disk: the note is persisted, NOT the base64 bytes.
+        var text = File.ReadAllText(Directory.GetFiles(_tempDir, "*.jsonl")[0]);
+        text.Should().Contain("describe the picture");
+        text.Should().Contain("attached 1 image");
+        text.Should().NotContain("AAAA");
+    }
+
+    [Fact]
+    public void AddUser_without_images_is_unchanged()
+    {
+        using var session = Session.NewEphemeral("m");
+        session.AddUser("plain");
+
+        var msg = session.Messages.Last();
+        msg.Content.Should().Be("plain");
+        msg.Images.Should().BeEmpty();
+    }
+
+    [Fact]
     public void Persistent_session_writes_meta_event_immediately()
     {
         var store = SessionStore.Create(_tempDir);

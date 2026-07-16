@@ -114,16 +114,25 @@ public sealed class Repl
                 }
 
                 var trimmed = line.Trim();
-                if (trimmed.Length == 0) continue;
 
                 if (trimmed.StartsWith('/'))
                 {
+                    _richInput?.TakePendingImages(); // a slash command carries no attachment
                     var slashResult = await HandleSlashAsync(trimmed, ct).ConfigureAwait(false);
                     if (slashResult == SlashOutcome.Exit) return 0;
                     continue;
                 }
 
-                await RunTurnAndFollowupsAsync(trimmed, ct).ConfigureAwait(false);
+                // Images the user dragged onto the prompt while composing this line (vision models).
+                var images = _richInput?.TakePendingImages();
+                var hasImages = images is { Count: > 0 };
+
+                // Blank line and nothing attached → nothing to do. A blank line WITH an image is a
+                // valid "look at this" turn; give the model a default prompt so it has something.
+                if (trimmed.Length == 0 && !hasImages) continue;
+                if (trimmed.Length == 0) trimmed = "(see the attached image)";
+
+                await RunTurnAndFollowupsAsync(trimmed, ct, images).ConfigureAwait(false);
             }
 
             return 0;
@@ -200,12 +209,17 @@ public sealed class Repl
     /// after the last tool round. With no queue configured (tests, non-interactive) this is a
     /// single ProcessUserTurnAsync call, unchanged.
     /// </summary>
-    private async Task RunTurnAndFollowupsAsync(string prompt, CancellationToken ct)
+    private async Task RunTurnAndFollowupsAsync(
+        string prompt, CancellationToken ct, IReadOnlyList<string>? images = null)
     {
         string? next = prompt;
+        // Images attach only to the first turn — the one the user typed with the drop. Queued
+        // follow-ups are text-only.
+        var turnImages = images;
         while (next is not null && !ct.IsCancellationRequested)
         {
-            await ProcessUserTurnAsync(next, ct).ConfigureAwait(false);
+            await ProcessUserTurnAsync(next, ct, turnImages).ConfigureAwait(false);
+            turnImages = null;
 
             if (_inputQueue is not null && _inputQueue.TryDequeue(out var queued))
             {
@@ -227,7 +241,8 @@ public sealed class Repl
         return s.Length <= max ? s : string.Concat(s.AsSpan(0, max), "…");
     }
 
-    private async Task ProcessUserTurnAsync(string prompt, CancellationToken ct)
+    private async Task ProcessUserTurnAsync(
+        string prompt, CancellationToken ct, IReadOnlyList<string>? images = null)
     {
         // Mid-turn auto-compact (hard threshold) is now AgentLoop's responsibility — it
         // fires between iterations regardless of whether we're driving the parent here
@@ -246,7 +261,7 @@ public sealed class Repl
         _inputCapture?.BeginCapture();
         try
         {
-            await _agent.RunTurnAsync(_session, prompt, _output, _error, turnCts.Token).ConfigureAwait(false);
+            await _agent.RunTurnAsync(_session, prompt, _output, _error, turnCts.Token, images).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (turnCts.IsCancellationRequested)
         {

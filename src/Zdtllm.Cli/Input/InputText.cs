@@ -77,6 +77,55 @@ internal static class InputText
         catch { return false; }
     }
 
+    private static readonly IReadOnlyDictionary<string, string> ImageMimeByExtension =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [".png"] = "image/png",
+            [".jpg"] = "image/jpeg",
+            [".jpeg"] = "image/jpeg",
+            [".gif"] = "image/gif",
+            [".webp"] = "image/webp",
+            [".bmp"] = "image/bmp",
+        };
+
+    /// <summary>Max image size we'll inline as base64 (~vision-model limits + keeps requests sane).</summary>
+    private const long MaxImageBytes = 10L * 1024 * 1024;
+
+    /// <summary>True when <paramref name="s"/>, once normalised, has a known image extension.</summary>
+    public static bool IsImagePath(string s)
+    {
+        var p = NormalizeDroppedPath(s);
+        var ext = Path.GetExtension(p);
+        return !string.IsNullOrEmpty(ext) && ImageMimeByExtension.ContainsKey(ext);
+    }
+
+    /// <summary>
+    /// If <paramref name="s"/> is an existing image file within the size cap, read it and return a
+    /// <c>data:</c> URI plus its file name. Best-effort — returns false (and the caller keeps the
+    /// path as text) on anything unexpected: not an image, missing, too big, or unreadable.
+    /// </summary>
+    public static bool TryLoadImageDataUri(string s, out string dataUri, out string fileName)
+    {
+        dataUri = string.Empty;
+        fileName = string.Empty;
+        var path = NormalizeDroppedPath(s);
+        var ext = Path.GetExtension(path);
+        if (string.IsNullOrEmpty(ext) || !ImageMimeByExtension.TryGetValue(ext, out var mime)) return false;
+        try
+        {
+            var info = new FileInfo(path);
+            if (!info.Exists || info.Length == 0 || info.Length > MaxImageBytes) return false;
+            var bytes = File.ReadAllBytes(path);
+            dataUri = $"data:{mime};base64,{Convert.ToBase64String(bytes)}";
+            fileName = Path.GetFileName(path);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     /// <summary>
     /// Reconstruct the text of a drained key burst: printable chars as themselves, Enter as a
     /// newline, other control keys dropped. Used to turn a fast burst (a paste) back into text.

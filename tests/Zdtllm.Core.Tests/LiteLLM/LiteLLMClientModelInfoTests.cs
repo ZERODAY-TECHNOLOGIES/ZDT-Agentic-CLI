@@ -38,6 +38,25 @@ public sealed class LiteLLMClientModelInfoTests
     }
 
     [Fact]
+    public async Task Parses_supports_vision_flag()
+    {
+        var body = """
+            {"data":[
+              {"model_name":"gpt-4o","model_info":{"max_tokens":128000,"supports_vision":true}},
+              {"model_name":"qwen-coder","model_info":{"max_tokens":32000,"supports_vision":false}},
+              {"model_name":"mystery","model_info":{"max_tokens":8000}}
+            ]}
+            """;
+        var client = BuildClient(new StubHandler(Json(HttpStatusCode.OK, body)));
+
+        var infos = await client.GetModelInfoAsync();
+
+        infos.Single(m => m.ModelName == "gpt-4o").SupportsVision.Should().BeTrue();
+        infos.Single(m => m.ModelName == "qwen-coder").SupportsVision.Should().BeFalse();
+        infos.Single(m => m.ModelName == "mystery").SupportsVision.Should().BeNull();
+    }
+
+    [Fact]
     public async Task Effective_window_falls_back_to_max_tokens_when_input_tokens_missing()
     {
         var body = """

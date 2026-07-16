@@ -248,6 +248,12 @@ internal static class Program
         var contextManager = await BuildContextManagerAsync(parsed, settings, client, session.Model)
             .ConfigureAwait(false);
 
+        // Vision gating: attach dropped images only when the active model can actually read them.
+        // litellm.vision in settings wins; otherwise we auto-detect via /model/info supports_vision.
+        if (turnInput is not null)
+            turnInput.VisionCapable = await ResolveVisionCapabilityAsync(settings, client, session.Model)
+                .ConfigureAwait(false);
+
         var baseText = ResolveBaseSystemPrompt(parsed);
         var appendText = ResolveAppendSystemPrompt(parsed);
         var additionalDirs = MergeAdditionalDirectories(parsed.AddDirs, settings.Permissions.AdditionalDirectories);
@@ -401,6 +407,9 @@ internal static class Program
                 $"[bold {Branding.Hex(Branding.BrandGold)}]◆ plan mode[/] " +
                 $"[{Branding.Hex(Branding.MutedText)}]— read-only; the agent proposes a plan for your approval. " +
                 "Toggle with [/]" + $"[bold {Branding.Hex(Branding.BodyText)}]/plan[/][{Branding.Hex(Branding.MutedText)}].[/]");
+        if (turnInput?.VisionCapable == true)
+            AnsiConsole.MarkupLine(
+                $"[{Branding.Hex(Branding.MutedText)}]🖼  vision: on — drag an image onto the prompt to attach it.[/]");
 
         var repl = new Repl(
             session,
@@ -722,6 +731,29 @@ internal static class Program
     ///      the resolved model name.
     ///   3. null → no context tracking, /context tells the user how to fix it.
     /// </summary>
+    /// <summary>
+    /// Decide whether the active model accepts images. Priority: an explicit <c>litellm.vision</c>
+    /// setting, else LiteLLM's <c>/model/info</c> <c>supports_vision</c> for the resolved model,
+    /// else false (conservative — the user asked for images gated on capable models). Best-effort:
+    /// a /model/info failure just means "no vision," never a crash.
+    /// </summary>
+    private static async Task<bool> ResolveVisionCapabilityAsync(
+        EffectiveSettings settings, LiteLLMClient client, string resolvedModel)
+    {
+        if (settings.LiteLLM.Vision is bool configured) return configured;
+        try
+        {
+            var infos = await client.GetModelInfoAsync().ConfigureAwait(false);
+            var match = infos.FirstOrDefault(m =>
+                string.Equals(m.ModelName, resolvedModel, StringComparison.Ordinal));
+            return match?.SupportsVision ?? false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static async Task<ContextManager?> BuildContextManagerAsync(
         ParsedArgs parsed,
         EffectiveSettings settings,

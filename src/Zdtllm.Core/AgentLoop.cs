@@ -233,7 +233,8 @@ public sealed class AgentLoop
         string userPrompt,
         TextWriter output,
         TextWriter status,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlyList<string>? images = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentException.ThrowIfNullOrEmpty(userPrompt);
@@ -269,7 +270,7 @@ public sealed class AgentLoop
         var effectivePrompt = _planMode?.InPlanMode == true
             ? userPrompt + "\n\n" + PlanModeState.Reminder
             : userPrompt;
-        session.AddUser(effectivePrompt);
+        session.AddUser(effectivePrompt, images);
 
         IReadOnlyList<ToolDef>? toolDefList = null;
         if (!xmlMode)

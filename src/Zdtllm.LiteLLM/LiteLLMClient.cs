@@ -99,7 +99,8 @@ public sealed class LiteLLMClient
                     modelName,
                     MaxInputTokens: ReadNullableInt(info, "max_input_tokens"),
                     MaxOutputTokens: ReadNullableInt(info, "max_output_tokens"),
-                    MaxTokens: ReadNullableInt(info, "max_tokens")));
+                    MaxTokens: ReadNullableInt(info, "max_tokens"),
+                    SupportsVision: ReadNullableBool(info, "supports_vision")));
             }
             return result;
         }
@@ -114,6 +115,18 @@ public sealed class LiteLLMClient
         if (parent.ValueKind != JsonValueKind.Object) return null;
         if (!parent.TryGetProperty(name, out var v)) return null;
         return v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var n) ? n : null;
+    }
+
+    private static bool? ReadNullableBool(JsonElement parent, string name)
+    {
+        if (parent.ValueKind != JsonValueKind.Object) return null;
+        if (!parent.TryGetProperty(name, out var v)) return null;
+        return v.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            _ => null,
+        };
     }
 
     /// <summary>
@@ -333,7 +346,7 @@ public sealed class LiteLLMClient
     private static RequestMessage ToWireMessage(ChatMessage m) => new()
     {
         Role = m.Role,
-        Content = m.Content,
+        Content = BuildContent(m),
         ToolCalls = m.ToolCalls.IsDefaultOrEmpty
             ? null
             : m.ToolCalls
@@ -342,6 +355,25 @@ public sealed class LiteLLMClient
                 .ToList(),
         ToolCallId = m.ToolCallId,
     };
+
+    /// <summary>
+    /// Build a message's <c>content</c> value. Plain text stays a JSON string (every model
+    /// understands it). When the message carries image attachments, content becomes the OpenAI
+    /// multimodal array — a text part (if any) followed by one <c>image_url</c> part per image —
+    /// which LiteLLM routes to vision-capable models. Only user turns ever carry images, so
+    /// non-vision paths are byte-for-byte unchanged.
+    /// </summary>
+    private static object? BuildContent(ChatMessage m)
+    {
+        if (m.Images.IsDefaultOrEmpty) return m.Content;
+
+        var parts = new List<object>(m.Images.Length + 1);
+        if (!string.IsNullOrEmpty(m.Content))
+            parts.Add(new { type = "text", text = m.Content });
+        foreach (var img in m.Images)
+            parts.Add(new { type = "image_url", image_url = new { url = img } });
+        return parts;
+    }
 
     private static RequestTool ToWireTool(ToolDef t) =>
         new("function", new RequestFunctionDef(t.Name, t.Description, t.Parameters));
@@ -362,7 +394,8 @@ internal sealed record RequestStreamOptions(bool IncludeUsage);
 internal sealed class RequestMessage
 {
     public required string Role { get; init; }
-    public string? Content { get; init; }
+    // string for the text-only case, or a List<object> of content parts for multimodal (images).
+    public object? Content { get; init; }
     public List<RequestToolCall>? ToolCalls { get; init; }
     public string? ToolCallId { get; init; }
 }

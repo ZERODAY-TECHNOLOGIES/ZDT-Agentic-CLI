@@ -201,6 +201,9 @@ internal sealed class RawLiteLLM
     /// </summary>
     public Dictionary<string, string>? SubagentModels { get; set; }
 
+    /// <summary>Optional vision override — see <see cref="LiteLLMSettings.Vision"/>.</summary>
+    public bool? Vision { get; set; }
+
     public LiteLLMSettings ToEffective(Func<string, string?> envRead) => new(
         BaseUrl: EnvironmentExpander.ExpandNullable(BaseUrl, envRead),
         ApiKey: EnvironmentExpander.ExpandNullable(ApiKey, envRead),
@@ -212,7 +215,8 @@ internal sealed class RawLiteLLM
         // SmallFastModel comes only from env (ZDT_SMALL_FAST_MODEL); RawLiteLLM doesn't
         // expose a settings.json key for it. Keep it null here and let the env layer in
         // LoadEffectiveSettings populate it.
-        SmallFastModel: null);
+        SmallFastModel: null,
+        Vision: Vision);
 
     private static ImmutableDictionary<string, string> ToStringDict(
         Dictionary<string, string>? src,

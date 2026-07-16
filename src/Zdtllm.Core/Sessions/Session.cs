@@ -117,11 +117,24 @@ public sealed class Session : IDisposable
         _store?.Append(new SystemEvent(content));
     }
 
-    public void AddUser(string content)
+    public void AddUser(string content, IReadOnlyList<string>? imageDataUrls = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(content);
-        _messages.Add(ChatMessage.User(content));
-        _store?.Append(new UserEvent(content));
+        if (imageDataUrls is { Count: > 0 })
+        {
+            // Keep the base64 images in the live message so the vision model sees them (and keeps
+            // seeing them on later turns — that's how image context works). But do NOT persist the
+            // bytes: they'd bloat the JSONL and can't be faithfully replayed on resume anyway.
+            // We persist the text plus a note so the transcript still records that images were sent.
+            _messages.Add(ChatMessage.UserWithImages(content, imageDataUrls));
+            _store?.Append(new UserEvent(
+                content + $"\n\n[attached {imageDataUrls.Count} image(s) — not stored in session]"));
+        }
+        else
+        {
+            _messages.Add(ChatMessage.User(content));
+            _store?.Append(new UserEvent(content));
+        }
     }
 
     public void AddAssistant(string? content, ImmutableArray<ToolCall> toolCalls = default)

@@ -54,6 +54,43 @@ public sealed class InputTextTests
         InputText.ReconstructBurst(keys).Should().Be("hi\nx");
     }
 
+    [Theory]
+    [InlineData("/x/photo.png", true)]
+    [InlineData("\"C:\\a\\b\\image.JPG\"", true)]
+    [InlineData("/x/clip.webp", true)]
+    [InlineData("/x/notes.txt", false)]
+    [InlineData("/x/archive.zip", false)]
+    public void Is_image_path_checks_extension(string path, bool expected)
+    {
+        InputText.IsImagePath(path).Should().Be(expected);
+    }
+
+    [Fact]
+    public void Try_load_image_data_uri_reads_a_real_image_into_a_data_uri()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "zdt-img-" + Guid.NewGuid().ToString("N") + ".png");
+        File.WriteAllBytes(tmp, new byte[] { 1, 2, 3, 4 });
+        try
+        {
+            InputText.TryLoadImageDataUri($"\"{tmp}\"", out var uri, out var name).Should().BeTrue();
+            uri.Should().StartWith("data:image/png;base64,");
+            uri.Should().EndWith(Convert.ToBase64String(new byte[] { 1, 2, 3, 4 }));
+            name.Should().Be(Path.GetFileName(tmp));
+        }
+        finally { File.Delete(tmp); }
+    }
+
+    [Fact]
+    public void Try_load_image_data_uri_rejects_non_images_and_missing_files()
+    {
+        InputText.TryLoadImageDataUri("/does/not/exist.png", out _, out _).Should().BeFalse();
+
+        var tmp = Path.Combine(Path.GetTempPath(), "zdt-txt-" + Guid.NewGuid().ToString("N") + ".txt");
+        File.WriteAllText(tmp, "hi");
+        try { InputText.TryLoadImageDataUri(tmp, out _, out _).Should().BeFalse(); }
+        finally { File.Delete(tmp); }
+    }
+
     [Fact]
     public void Looks_like_existing_path_detects_a_real_file()
     {

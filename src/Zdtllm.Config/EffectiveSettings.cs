@@ -85,7 +85,12 @@ public sealed record LiteLLMSettings(
     /// <c>ANTHROPIC_SMALL_FAST_MODEL</c>) so a single env line can route every fast
     /// subagent through one cheap model without touching settings.json.
     /// </summary>
-    string? SmallFastModel)
+    string? SmallFastModel,
+    /// <summary>
+    /// Explicit override for whether the model accepts images (vision). When set, it wins over
+    /// LiteLLM <c>/model/info</c> <c>supports_vision</c> auto-detection. Null = auto-detect.
+    /// </summary>
+    bool? Vision = null)
 {
     public static LiteLLMSettings Empty { get; } = new(
         BaseUrl: null,
@@ -95,7 +100,8 @@ public sealed record LiteLLMSettings(
         Models: ImmutableDictionary<string, string>.Empty,
         ContextWindows: ImmutableDictionary<string, int>.Empty,
         SubagentModels: ImmutableDictionary<string, string>.Empty,
-        SmallFastModel: null);
+        SmallFastModel: null,
+        Vision: null);
 
     public LiteLLMSettings Merge(LiteLLMSettings higher) => new(
         BaseUrl: higher.BaseUrl ?? BaseUrl,
@@ -105,7 +111,8 @@ public sealed record LiteLLMSettings(
         Models: EffectiveSettings.MergeOverride(Models, higher.Models),
         ContextWindows: EffectiveSettings.MergeOverride(ContextWindows, higher.ContextWindows),
         SubagentModels: EffectiveSettings.MergeOverride(SubagentModels, higher.SubagentModels),
-        SmallFastModel: higher.SmallFastModel ?? SmallFastModel);
+        SmallFastModel: higher.SmallFastModel ?? SmallFastModel,
+        Vision: higher.Vision ?? Vision);
 }
 
 /// <summary>

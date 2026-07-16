@@ -44,6 +44,18 @@ internal sealed class LineEditorState
         public override string Display => $"[pasted {_lines} line{(_lines == 1 ? "" : "s")}]";
     }
 
+    // An attached image (drag & drop onto a vision model). It contributes NO submitted text — the
+    // image travels separately as a content part — but it holds its data URI so that removing the
+    // chip (Backspace) also removes the attachment. See <see cref="Images"/>.
+    private sealed class ImageElement : Element
+    {
+        public string DataUri { get; }
+        private readonly string _label;
+        public ImageElement(string dataUri, string label) { DataUri = dataUri; _label = label; }
+        public override string Value => string.Empty;
+        public override string Display => $"[🖼 {_label}]";
+    }
+
     private readonly List<Element> _elements = new();
     private int _cursor; // 0 .. _elements.Count
 
@@ -72,6 +84,17 @@ internal sealed class LineEditorState
         _elements.Insert(_cursor, new PasteElement(text));
         _cursor++;
     }
+
+    /// <summary>Insert an image attachment chip at the cursor (its data URI travels separately).</summary>
+    public void InsertImage(string dataUri, string label)
+    {
+        _elements.Insert(_cursor, new ImageElement(dataUri, label));
+        _cursor++;
+    }
+
+    /// <summary>Data URIs of image chips currently in the buffer, in order. Empty if none.</summary>
+    public IReadOnlyList<string> Images() =>
+        _elements.OfType<ImageElement>().Select(e => e.DataUri).ToList();
 
     public void Backspace()
     {

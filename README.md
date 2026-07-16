@@ -211,6 +211,15 @@ Editing keys — cursor moves, Home/End, Backspace/Delete, Ctrl+A/E/U/K, Ctrl+D 
 line — all work. Set `ZDT_BASIC_INPUT=1` to fall back to plain line input on a terminal where the
 editor misbehaves.
 
+**Images (vision).** When the active model supports vision, dragging an **image** (png, jpg, gif,
+webp, bmp) onto the prompt attaches it — it shows as a `[🖼 name]` chip and is sent to the model as
+a standard OpenAI multimodal `image_url` part. On a text-only model the image is left as a path
+instead (so nothing errors), and the startup banner tells you when vision is on. Capability is
+auto-detected from LiteLLM's `/model/info` (`supports_vision`); override it with `litellm.vision`
+in settings.json when the proxy doesn't report it. Attached image bytes are kept in the live
+conversation but not written into the session file (they'd bloat it and can't survive a resume),
+so a resumed session won't re-send them.
+
 **Graceful exit.** On `/exit`, EOF, or Ctrl+C, zdt tells you which session just closed and how to
 resume it (`zdt -r <id>`). During a turn, one Ctrl+C interrupts just that turn; at the prompt, one
 Ctrl+C shows "press again to exit" and a second one exits — exactly like claude-cli.

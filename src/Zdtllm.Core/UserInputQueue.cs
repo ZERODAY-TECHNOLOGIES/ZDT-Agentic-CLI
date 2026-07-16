@@ -59,6 +59,13 @@ public interface IReplInputSource
 {
     /// <summary>Read one submitted line (pastes resolved to real text). Null = EOF / exit.</summary>
     Task<string?> ReadLineAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Return (and clear) any image attachments the user dropped while composing the line that was
+    /// just read — as data: URIs ready to send to a vision model. Default: none. Only the
+    /// interactive console reader collects these, and only when the model supports vision.
+    /// </summary>
+    IReadOnlyList<string> TakePendingImages() => Array.Empty<string>();
 }
 
 /// <summary>

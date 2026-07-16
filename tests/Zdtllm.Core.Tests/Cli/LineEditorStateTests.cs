@@ -91,6 +91,38 @@ public sealed class LineEditorStateTests
     }
 
     [Fact]
+    public void Image_chip_contributes_no_text_but_surfaces_its_data_uri()
+    {
+        var s = new LineEditorState();
+        s.InsertText("look: ");
+        s.InsertImage("data:image/png;base64,AAAA", "shot.png");
+
+        s.Display().Should().Be("look: [🖼 shot.png]");
+        s.Resolve().Should().Be("look: ");           // image adds no submitted text
+        s.Images().Should().ContainSingle().Which.Should().Be("data:image/png;base64,AAAA");
+    }
+
+    [Fact]
+    public void Backspacing_an_image_chip_removes_the_attachment()
+    {
+        var s = new LineEditorState();
+        s.InsertImage("data:image/png;base64,AAAA", "a.png");
+        s.Backspace();
+
+        s.Images().Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Multiple_image_chips_keep_order()
+    {
+        var s = new LineEditorState();
+        s.InsertImage("data:image/png;base64,ONE", "1.png");
+        s.InsertImage("data:image/png;base64,TWO", "2.png");
+
+        s.Images().Should().Equal("data:image/png;base64,ONE", "data:image/png;base64,TWO");
+    }
+
+    [Fact]
     public void Inline_newline_shows_a_marker_but_resolves_to_a_real_newline()
     {
         var s = new LineEditorState();

@@ -7,13 +7,26 @@ public sealed record ChatMessage(
     string Role,
     string? Content,
     ImmutableArray<ToolCall> ToolCalls,
-    string? ToolCallId)
+    string? ToolCallId,
+    ImmutableArray<string> Images = default)
 {
+    /// <summary>
+    /// Image references attached to this message (data: URIs or http(s) URLs), sent as OpenAI
+    /// multimodal <c>image_url</c> content parts. Empty for the common text-only case. Populated
+    /// only for a user turn where the human dropped an image and the model supports vision.
+    /// </summary>
+    public ImmutableArray<string> Images { get; init; } =
+        Images.IsDefault ? ImmutableArray<string>.Empty : Images;
+
     public static ChatMessage System(string content) =>
         new("system", content, ImmutableArray<ToolCall>.Empty, ToolCallId: null);
 
     public static ChatMessage User(string content) =>
         new("user", content, ImmutableArray<ToolCall>.Empty, ToolCallId: null);
+
+    /// <summary>A user message with image attachments (data: URIs / URLs) for vision models.</summary>
+    public static ChatMessage UserWithImages(string? content, IEnumerable<string> images) =>
+        new("user", content, ImmutableArray<ToolCall>.Empty, ToolCallId: null, [..images]);
 
     public static ChatMessage AssistantText(string content) =>
         new("assistant", content, ImmutableArray<ToolCall>.Empty, ToolCallId: null);
@@ -38,7 +51,8 @@ public sealed record ModelInfo(
     string ModelName,
     int? MaxInputTokens,
     int? MaxOutputTokens,
-    int? MaxTokens)
+    int? MaxTokens,
+    bool? SupportsVision = null)
 {
     /// <summary>
     /// Best guess for the usable input context size: prefer max_input_tokens,

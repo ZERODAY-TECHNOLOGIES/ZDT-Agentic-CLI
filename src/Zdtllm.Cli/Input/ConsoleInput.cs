@@ -43,6 +43,15 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
     private readonly LineEditorState _state = new();
     private int _lastRenderVisibleLen;
 
+    // Set once the model is resolved (see Program). When true, dropped image files are attached as
+    // vision content parts; when false they're inserted as a plain path (the model has no vision).
+    public bool VisionCapable { get; set; }
+
+    // Image attachments from the line that was just submitted, handed to the REPL via
+    // TakePendingImages(). Captured at submit time from the buffer, so a chip the user backspaced
+    // away is correctly excluded.
+    private IReadOnlyList<string> _pendingImages = Array.Empty<string>();
+
     // Queue-capture state.
     private readonly StringBuilder _captureBuf = new();
     private CancellationTokenSource? _captureCts;
@@ -69,6 +78,13 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
 
     public int QueuedCount => _queue.Count;
 
+    public IReadOnlyList<string> TakePendingImages()
+    {
+        var imgs = _pendingImages;
+        _pendingImages = Array.Empty<string>();
+        return imgs;
+    }
+
     // ================= idle line editor (IReplInputSource) =================
 
     public async Task<string?> ReadLineAsync(CancellationToken ct)
@@ -94,6 +110,9 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
                 var outcome = ProcessBatch(batch);
                 if (outcome == Outcome.Submit)
                 {
+                    // Snapshot image attachments from the buffer NOW (chips backspaced away are
+                    // gone) so TakePendingImages() hands the REPL exactly what's still attached.
+                    _pendingImages = _state.Images();
                     Console.Write(Environment.NewLine);
                     return _state.Resolve();
                 }
@@ -151,13 +170,29 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
     {
         if (text.IndexOf('\n') < 0)
         {
-            // Single line — treat as a possibly-dropped path and clean it up.
-            _state.InsertText(InputText.NormalizeDroppedPath(text));
+            // Single line: a dropped image file (on a vision model) attaches as an image chip;
+            // anything else is inserted as clean path / text.
+            var norm = InputText.NormalizeDroppedPath(text);
+            if (VisionCapable && InputText.TryLoadImageDataUri(norm, out var uri, out var name))
+                _state.InsertImage(uri, name);
+            else
+                _state.InsertText(norm);
         }
         else
         {
-            // Multi-line paste → one compact chip so the single-line editor never wraps.
-            _state.InsertPaste(text.TrimEnd('\n', '\r'));
+            // Multiple files dropped at once arrive newline-separated. If they're all images (and
+            // the model has vision), attach each; otherwise collapse to a compact paste chip.
+            var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (VisionCapable && lines.Length > 0 && lines.All(InputText.IsImagePath))
+            {
+                foreach (var line in lines)
+                    if (InputText.TryLoadImageDataUri(line, out var uri, out var name))
+                        _state.InsertImage(uri, name);
+            }
+            else
+            {
+                _state.InsertPaste(text.TrimEnd('\n', '\r'));
+            }
         }
     }
 
