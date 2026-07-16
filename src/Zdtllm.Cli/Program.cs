@@ -285,7 +285,8 @@ internal static class Program
             richConsole: formatOwnsStdout ? null : richConsole,
             observer: observer,
             inputQueue: inputQueue,
-            planMode: planMode);
+            planMode: planMode,
+            typeAhead: turnInput);
 
         // Task tool needs the parent agent to spawn subagents from. Register it AFTER the
         // agent is built — the registry holds a live reference, so the parent agent will see

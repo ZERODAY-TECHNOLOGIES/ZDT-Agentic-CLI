@@ -12,7 +12,7 @@ public sealed class ExitPlanModeToolTests
         public FakePrompter(bool available, string choice) { IsAvailable = available; _choice = choice; }
         public Task<IReadOnlyList<string>> SelectAsync(
             string question, string? header, IReadOnlyList<PromptChoice> options,
-            bool multiSelect, CancellationToken ct) =>
+            bool multiSelect, bool allowFreeText, CancellationToken ct) =>
             Task.FromResult<IReadOnlyList<string>>(new[] { _choice });
     }
 

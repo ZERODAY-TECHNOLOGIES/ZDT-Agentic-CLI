@@ -18,13 +18,16 @@ public interface IInteractivePrompter
     /// <summary>
     /// Present <paramref name="options"/> for <paramref name="question"/> and block until the
     /// user chooses. Returns the selected labels in display order — exactly one for a
-    /// single-select prompt, zero-or-more when <paramref name="multiSelect"/> is true.
+    /// single-select prompt, zero-or-more when <paramref name="multiSelect"/> is true. When
+    /// <paramref name="allowFreeText"/> is set, an extra "type your own answer" option is offered
+    /// and, if picked, the user's typed text is returned in place of a canned label.
     /// </summary>
     Task<IReadOnlyList<string>> SelectAsync(
         string question,
         string? header,
         IReadOnlyList<PromptChoice> options,
         bool multiSelect,
+        bool allowFreeText,
         CancellationToken ct);
 }
 
@@ -41,6 +44,6 @@ public sealed class UnavailablePrompter : IInteractivePrompter
 
     public Task<IReadOnlyList<string>> SelectAsync(
         string question, string? header, IReadOnlyList<PromptChoice> options,
-        bool multiSelect, CancellationToken ct) =>
+        bool multiSelect, bool allowFreeText, CancellationToken ct) =>
         throw new InvalidOperationException("No interactive terminal is available for prompting.");
 }

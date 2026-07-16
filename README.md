@@ -184,15 +184,18 @@ and its model. Sessions live under `.zdtllm/sessions/`. When stdin is redirected
 back to the most-recent session instead of prompting.
 
 **Queue messages while the model works.** You no longer have to wait for a turn to finish
-before typing the next thing. Keep typing while the model streams / calls tools; each line
-you enter is queued and folded into the *same* task at the next tool-round boundary (or run
-as a follow-up turn if the model already finished). zdt prints `↳ picked up your queued
-message` when it consumes one.
+before typing the next thing. Keep typing while the model streams / calls tools — what you type
+shows live in the "thinking" spinner (`⌨ … (Enter to queue)`), and each line you submit is
+queued (`N queued`) and folded into the *same* task at the next tool-round boundary (or run as a
+follow-up turn if the model already finished). zdt prints `↳ picked up your queued message`
+when it consumes one.
 
 **Let the model offer you choices.** The model can call the `AskUserQuestion` tool to present
-a short list of options; you pick with ↑/↓ and Enter (Space toggles for multi-select). It's
-registered only in interactive mode, so in `-p` / subagent runs the model is told to decide
-for itself instead of blocking on input that will never arrive.
+a short list of options; you pick with ↑/↓ and Enter (Space toggles for multi-select). Each
+option shows a one-line description underneath it, and every question always includes a
+`✎ Something else…` option so you can type a free-text answer the model didn't anticipate. It's
+registered only in interactive mode, so in `-p` / subagent runs the model is told to decide for
+itself instead of blocking on input that will never arrive.
 
 **Plan mode.** Start with `--plan`, or toggle it any time with `/plan`. In plan mode the agent
 is read-only — `Write`, `Edit`, `NotebookEdit` and `Bash` are blocked — so it investigates and

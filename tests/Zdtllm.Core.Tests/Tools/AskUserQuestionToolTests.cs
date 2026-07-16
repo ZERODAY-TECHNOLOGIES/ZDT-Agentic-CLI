@@ -18,11 +18,14 @@ public sealed class AskUserQuestionToolTests
             _answer = answer;
         }
 
+        public bool LastAllowFreeText { get; private set; }
+
         public Task<IReadOnlyList<string>> SelectAsync(
             string question, string? header, IReadOnlyList<PromptChoice> options,
-            bool multiSelect, CancellationToken ct)
+            bool multiSelect, bool allowFreeText, CancellationToken ct)
         {
             Calls.Add((question, multiSelect, options.Count));
+            LastAllowFreeText = allowFreeText;
             return Task.FromResult(_answer);
         }
     }
@@ -163,6 +166,23 @@ public sealed class AskUserQuestionToolTests
 
         result.IsError.Should().BeFalse();
         prompter.Calls[0].OptionCount.Should().Be(2);
+    }
+
+    [Fact]
+    public async Task Always_offers_a_free_text_option_to_the_prompter()
+    {
+        var prompter = new FakePrompter(available: true, "Postgres");
+        var tool = new AskUserQuestionTool(prompter);
+
+        await AskAsync(tool, new
+        {
+            questions = new[]
+            {
+                new { question = "Which database?", options = new[] { new { label = "Postgres" } } },
+            },
+        });
+
+        prompter.LastAllowFreeText.Should().BeTrue();
     }
 
     [Fact]

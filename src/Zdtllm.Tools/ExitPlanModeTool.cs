@@ -78,7 +78,8 @@ public sealed class ExitPlanModeTool : ITool
         IReadOnlyList<string> chosen;
         try
         {
-            chosen = await _prompter.SelectAsync(question, "Plan", options, multiSelect: false, ct)
+            chosen = await _prompter.SelectAsync(
+                question, "Plan", options, multiSelect: false, allowFreeText: false, ct)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException)

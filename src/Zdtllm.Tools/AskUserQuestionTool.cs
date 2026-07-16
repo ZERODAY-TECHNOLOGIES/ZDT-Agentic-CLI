@@ -106,7 +106,7 @@ public sealed class AskUserQuestionTool : ITool
             foreach (var q in questions)
             {
                 var selected = await _prompter
-                    .SelectAsync(q.Question, q.Header, q.Options, q.MultiSelect, ct)
+                    .SelectAsync(q.Question, q.Header, q.Options, q.MultiSelect, allowFreeText: true, ct)
                     .ConfigureAwait(false);
 
                 var label = string.IsNullOrWhiteSpace(q.Header) ? q.Question : q.Header;

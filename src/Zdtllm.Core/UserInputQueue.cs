@@ -36,6 +36,21 @@ public interface IUserInputQueue
 }
 
 /// <summary>
+/// Read-only view of what the user is typing WHILE a turn runs, so the AgentLoop can surface it
+/// in the live "thinking" spinner — otherwise mid-turn typing is invisible and the queue feels
+/// broken ("did it take my input?"). Implemented by the interactive console driver; null in tests
+/// and print mode.
+/// </summary>
+public interface ITypeAheadStatus
+{
+    /// <summary>The line currently being typed but not yet submitted ("" when nothing is typed).</summary>
+    string CurrentInput { get; }
+
+    /// <summary>How many complete messages are queued, waiting to be folded into the run.</summary>
+    int QueuedCount { get; }
+}
+
+/// <summary>
 /// The REPL's idle line reader. The plain path wraps a <see cref="System.IO.TextReader"/>
 /// (tests, non-TTY); the interactive path is a full line editor that draws its own prompt and
 /// supports multi-line paste and drag-and-drop. Returns null on EOF / exit request.

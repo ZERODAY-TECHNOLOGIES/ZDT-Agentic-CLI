@@ -47,6 +47,7 @@ public sealed record AgentResult(
 public sealed class AgentLoop
 {
     private static readonly Color BrandCyan = new(0x1B, 0xEA, 0xCD);
+    private static readonly Color BrandGold = new(0xE5, 0xD9, 0x36);
     private static readonly Color MuteText = new(0x68, 0x7B, 0x89);
 
     private readonly LiteLLMClient _client;
@@ -71,6 +72,12 @@ public sealed class AgentLoop
     /// ExitPlanMode) instead of changing the workspace. Null (the common case) disables all of it.
     /// </summary>
     private readonly IPlanModeSwitch? _planMode;
+
+    /// <summary>
+    /// Optional view of the user's mid-turn typing, surfaced in the live spinner so queued input
+    /// is visible instead of feeling like the terminal froze. Null in print mode / tests.
+    /// </summary>
+    private readonly ITypeAheadStatus? _typeAhead;
 
     /// <summary>
     /// Per-turn count of tool calls that returned <c>isError=true</c> (unknown tool,
@@ -170,7 +177,8 @@ public sealed class AgentLoop
         IAnsiConsole? richConsole = null,
         IAgentObserver? observer = null,
         IUserInputQueue? inputQueue = null,
-        IPlanModeSwitch? planMode = null)
+        IPlanModeSwitch? planMode = null,
+        ITypeAheadStatus? typeAhead = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(tools);
@@ -185,6 +193,7 @@ public sealed class AgentLoop
         _observer = observer;
         _inputQueue = inputQueue;
         _planMode = planMode;
+        _typeAhead = typeAhead;
     }
 
     public PermissionRuleSet Permissions => _perms;
@@ -315,10 +324,12 @@ public sealed class AgentLoop
                 // the gap to first chunk can be 30s+, and a frozen label looks broken.
                 statusCtx?.Status(BuildSpinnerLabel(streamSw.Elapsed, charsStreamed));
 
-                // Periodic ticker: advance the elapsed counter every ~500ms even when no chunks
-                // arrive. Without this, a slow / hung backend leaves the spinner frozen at "0s ·
-                // ↓ 0 tokens" so the user can't tell if zdt is broken or just waiting. With it,
-                // they see "5s · 12s · 30s · ..." and can decide when to Ctrl+C.
+                // Periodic ticker: refresh the spinner even when no chunks arrive, so the elapsed
+                // counter advances (a frozen "0s" looks broken on a slow backend) AND the
+                // type-ahead readout (what the user is typing / how many messages are queued)
+                // stays live. 120ms keeps mid-turn typing feeling responsive; when there's no
+                // type-ahead source, a slower cadence is plenty for just the clock.
+                var tickMs = _typeAhead is not null ? 120 : 400;
                 using var tickerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 var tickerTask = statusCtx is null
                     ? Task.CompletedTask
@@ -328,7 +339,7 @@ public sealed class AgentLoop
                         {
                             while (!tickerCts.Token.IsCancellationRequested)
                             {
-                                await Task.Delay(500, tickerCts.Token).ConfigureAwait(false);
+                                await Task.Delay(tickMs, tickerCts.Token).ConfigureAwait(false);
                                 statusCtx.Status(BuildSpinnerLabel(streamSw.Elapsed, charsStreamed));
                             }
                         }
@@ -900,9 +911,36 @@ public sealed class AgentLoop
         await _richConsole.Status()
             .Spinner(Spinner.Known.Dots)
             .SpinnerStyle(new Style(BrandCyan))
-            .StartAsync(label, async _ =>
+            .StartAsync(label, async statusCtx =>
             {
-                result = await ExecuteToolAsync(call, ctx, ct).ConfigureAwait(false);
+                // While a (possibly long) tool runs, keep refreshing the label with the
+                // type-ahead readout so the user can still see what they're typing / how many
+                // messages they've queued. Only spun up when there's a type-ahead source.
+                using var tickerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                var ticker = _typeAhead is null
+                    ? Task.CompletedTask
+                    : Task.Run(async () =>
+                    {
+                        try
+                        {
+                            while (!tickerCts.Token.IsCancellationRequested)
+                            {
+                                await Task.Delay(120, tickerCts.Token).ConfigureAwait(false);
+                                statusCtx.Status(label + TypeAheadSuffix());
+                            }
+                        }
+                        catch (OperationCanceledException) { /* normal */ }
+                    }, tickerCts.Token);
+                try
+                {
+                    result = await ExecuteToolAsync(call, ctx, ct).ConfigureAwait(false);
+                }
+                finally
+                {
+                    tickerCts.Cancel();
+                    try { await ticker.WaitAsync(TimeSpan.FromMilliseconds(200)).ConfigureAwait(false); }
+                    catch { /* swallow */ }
+                }
             })
             .ConfigureAwait(false);
         // Print a confirmation line after the spinner clears so the call stays in scrollback.
@@ -1291,7 +1329,7 @@ public sealed class AgentLoop
     /// final Usage chunk arrives. We still display the *real* prompt/completion totals after
     /// the turn ends via the existing /context output and the observer's OnFinal.
     /// </summary>
-    private static string BuildSpinnerLabel(TimeSpan elapsed, int charsStreamed)
+    private string BuildSpinnerLabel(TimeSpan elapsed, int charsStreamed)
     {
         var seconds = (int)elapsed.TotalSeconds;
         string time;
@@ -1306,7 +1344,33 @@ public sealed class AgentLoop
         else tokens = $"{approxTokens / 1_000_000.0:F1}M";
 
         return $"[{Hex(BrandCyan)}]thinking[/] " +
-               $"[{Hex(MuteText)}]({time} · ↓ {tokens} tokens)[/]";
+               $"[{Hex(MuteText)}]({time} · ↓ {tokens} tokens)[/]" +
+               TypeAheadSuffix();
+    }
+
+    /// <summary>
+    /// Builds the trailing bit of the spinner label that shows mid-turn typing / queued messages,
+    /// so the user sees their input is being taken instead of thinking the terminal froze. Empty
+    /// when nothing is being typed or queued (or when there's no type-ahead source at all).
+    /// </summary>
+    private string TypeAheadSuffix()
+    {
+        if (_typeAhead is null) return string.Empty;
+        var typing = _typeAhead.CurrentInput;
+        var queued = _typeAhead.QueuedCount;
+
+        var sb = new StringBuilder();
+        if (!string.IsNullOrEmpty(typing))
+        {
+            var shown = typing.Length > 48 ? "…" + typing[^48..] : typing;
+            sb.Append($"  [{Hex(BrandGold)}]⌨ {Markup.Escape(shown)}▏[/] ")
+              .Append($"[{Hex(MuteText)}](Enter to queue)[/]");
+        }
+        if (queued > 0)
+        {
+            sb.Append($"  [{Hex(BrandGold)}]{queued} queued[/]");
+        }
+        return sb.ToString();
     }
 
     /// <summary>
@@ -1314,7 +1378,7 @@ public sealed class AgentLoop
     /// streaming 50+ chunks/sec would Status() faster than Spectre can repaint and we'd see
     /// flicker / wasted work. The throttle is per-turn (lastUpdate is reset by the caller).
     /// </summary>
-    private static void UpdateSpinnerThrottled(
+    private void UpdateSpinnerThrottled(
         StatusContext? statusCtx,
         System.Diagnostics.Stopwatch sw,
         int charsStreamed,
