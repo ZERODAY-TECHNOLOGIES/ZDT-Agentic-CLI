@@ -156,6 +156,9 @@ internal static class Program
         var interactive = !parsed.PrintMode
             && !Console.IsInputRedirected
             && !Console.IsOutputRedirected;
+        // Signal working/waiting through the terminal (taskbar progress + tab title), like
+        // claude-code's animated CMD icon. Interactive TTY only; harmless no-op elsewhere.
+        if (interactive) TerminalStatus.Enable();
         UserInputQueue? inputQueue = interactive ? new UserInputQueue() : null;
         ConsoleInput? turnInput = interactive
             ? new ConsoleInput(inputQueue!, AnsiConsole.Console, SlashCommandCatalog.All)
@@ -523,6 +526,7 @@ internal static class Program
         }
         finally
         {
+            TerminalStatus.Clear();
             tui?.Dispose();
             fleetView?.Dispose();
             turnInput?.Dispose();

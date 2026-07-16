@@ -99,12 +99,14 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     public void BeginCapture()
     {
         Interlocked.Exchange(ref _thinkingStartTicks, _clock.ElapsedTicks == 0 ? 1 : _clock.ElapsedTicks);
+        TerminalStatus.Working();   // taskbar/tab: "working"
         RedrawBox();
     }
 
     public Task EndCaptureAsync()
     {
         Interlocked.Exchange(ref _thinkingStartTicks, 0);
+        TerminalStatus.Idle();      // taskbar/tab: "ready" + flash
         RedrawBox();
         return Task.CompletedTask;
     }

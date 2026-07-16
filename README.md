@@ -235,6 +235,12 @@ in settings.json when the proxy doesn't report it. Attached image bytes are kept
 conversation but not written into the session file (they'd bloat it and can't survive a resume),
 so a resumed session won't re-send them.
 
+**Working / waiting indicator (taskbar + tab).** Like claude-code's animated CMD icon, zdt signals
+its state through the terminal itself: an **indeterminate progress spinner on the taskbar/tab icon**
+(OSC 9;4) and a tab title (`⏳ zdt — working` vs `zdt — ready`) while a turn runs, and it **rings the
+bell** the moment a turn finishes so the taskbar flashes "your turn" even if the window's in the
+background. Interactive TTY only; terminals that don't support the codes just ignore them.
+
 **Graceful exit.** On `/exit`, EOF, or Ctrl+C, zdt tells you which session just closed and how to
 resume it (`zdt -r <id>`). During a turn, one Ctrl+C interrupts just that turn; at the prompt, one
 Ctrl+C shows "press again to exit" and a second one exits — exactly like claude-cli.

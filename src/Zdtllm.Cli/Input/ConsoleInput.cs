@@ -353,6 +353,7 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
 
     public void BeginCapture()
     {
+        TerminalStatus.Working();   // taskbar/tab: "working"
         if (_captureTask is not null) return;
         lock (_captureBuf) _captureBuf.Clear();
         _captureCts = new CancellationTokenSource();
@@ -362,6 +363,7 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
 
     public async Task EndCaptureAsync()
     {
+        TerminalStatus.Idle();      // taskbar/tab: "ready" + flash
         var cts = _captureCts;
         var task = _captureTask;
         _captureCts = null;
