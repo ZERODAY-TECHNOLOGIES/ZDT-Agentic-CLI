@@ -200,7 +200,10 @@ public sealed class AgentFleetView : IAgentFleetMonitor, IDisposable
         var focused = _model.Focused(recentLines: 18);
         IRenderable body = focused is null || focused.RecentLines.Count == 0
             ? new Markup($"[{Mute}](no output yet)[/]")
-            : new Text(string.Join("\n", focused.RecentLines)); // Text = literal, no markup injection
+            // Text = literal, no markup injection. Sanitized: raw ANSI escapes (Palette colors from
+            // the subagent stream) and tabs would be counted as printable width by Spectre's
+            // measurer, tearing the panel borders / overlapping lines.
+            : new Text(string.Join("\n", focused.RecentLines.Select(SanitizeForPanel)));
 
         var header = focused is null
             ? "output"
@@ -230,6 +233,21 @@ public sealed class AgentFleetView : IAgentFleetMonitor, IDisposable
     {
         try { return Console.KeyAvailable; }
         catch (InvalidOperationException) { return false; }
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex AnsiPattern = new(
+        // CSI (colors/cursor), OSC (titles; BEL- or ST-terminated), and any stray lone ESC+char.
+        @"\x1b\[[0-9;:?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b.",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>Make a streamed line safe for Spectre width measurement: drop ANSI escape
+    /// sequences, expand tabs, and strip remaining control characters.</summary>
+    internal static string SanitizeForPanel(string line)
+    {
+        if (string.IsNullOrEmpty(line)) return string.Empty;
+        var s = line.IndexOf('\x1b') >= 0 ? AnsiPattern.Replace(line, "") : line;
+        if (s.IndexOf('\t') >= 0) s = s.Replace("\t", "  ");
+        return s.Any(char.IsControl) ? new string(s.Where(c => !char.IsControl(c)).ToArray()) : s;
     }
 
     public void Dispose()

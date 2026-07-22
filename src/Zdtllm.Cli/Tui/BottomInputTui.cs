@@ -21,6 +21,23 @@ namespace Zdtllm.Cli.Tui;
 /// disable) with a plain-REPL fallback.
 /// </para>
 ///
+/// <para>
+/// Rendering discipline (the anti-flicker / anti-ghosting rules):
+/// <list type="bullet">
+/// <item>Every paint is composed into ONE string and emitted with a single <c>Console.Write</c>,
+/// wrapped in DEC 2026 synchronized-output so the terminal presents it atomically.</item>
+/// <item>While an exclusive section owns the screen (slash picker, AskUserQuestion, the fleet
+/// view's alternate screen) output lines are DEFERRED and box redraws suppressed; everything is
+/// flushed when the screen comes back. Nothing may draw over an exclusive renderer.</item>
+/// <item>Before handing the screen to an exclusive prompt the box is ERASED — if the prompt
+/// scrolls the screen, no stale copy of the box can be dragged into the transcript.</item>
+/// <item>The scroll region is re-asserted whenever its computed bottom row changes (box height OR
+/// terminal height), never left stale after a resize.</item>
+/// <item>When the box shrinks, the vacated rows are cleared so old status/footer rows can't leak
+/// into the scrollback as ghost lines.</item>
+/// </list>
+/// </para>
+///
 /// It plugs into the existing REPL as its input source (<see cref="IReplInputSource"/>), turn-capture
 /// hook (<see cref="ITurnInputCapture"/>) and output writer, so the REPL's slash-commands / turn /
 /// farewell logic is reused unchanged.
@@ -32,6 +49,11 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     private const string Gold = "\x1b[38;2;229;217;54m";
     private const string Red = "\x1b[38;2;239;68;68m";
     private const string Mute = "\x1b[38;2;104;123;137m";
+    // DEC 2026 synchronized output: the terminal buffers everything between begin/end and presents
+    // it as one atomic frame — no half-painted rows, no cursor-jump flicker. Terminals that don't
+    // support it (older conhost) simply ignore the sequences.
+    private const string SyncBegin = "\x1b[?2026h";
+    private const string SyncEnd = "\x1b[?2026l";
     private const int MaxInputRows = 8;
 
     private readonly IUserInputQueue _queue;
@@ -50,7 +72,12 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     private CancellationTokenSource? _cts;
     private Task? _reader;
     private volatile bool _started;
-    private int _lastBoxHeight = -1;
+    private int _disposed;
+    private bool _exclusive;                       // guarded by _render: an exclusive renderer owns the screen
+    private readonly List<string> _deferred = new(); // guarded by _render: output held back while exclusive
+    private int _regionBottom = -1;                // last DECSTBM bottom row actually emitted (-1 = none)
+    private int _paintedBoxTop = -1;               // first row of the last painted box (-1 = not painted)
+    private int _paintedBoxHeight = -1;            // height of the last painted box
     private int _rows = 24, _cols = 80;
 
     /// <summary>Write REPL / model output here — it's line-buffered into the scrolling region.</summary>
@@ -75,11 +102,18 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
         RefreshDims();
         lock (_render)
         {
-            Console.Write("\x1b[?7l");          // disable autowrap so clipped lines never wrap-scroll
-            ApplyScrollRegion(force: true);
+            var sb = BeginFrame();
+            var boxH = BoxHeight();
+            // Reserve room below whatever is already on screen (the banner): if the cursor sits
+            // near the bottom these LFs scroll just enough that the box won't overwrite the last
+            // lines already printed; mid-screen they only move the cursor down.
+            sb.Append(Reset).Append('\n', boxH);
+            sb.Append("\x1b[?7l");              // disable autowrap so clipped lines never wrap-scroll
+            AppendScrollRegionLocked(sb, force: true);
             // Park the output cursor on the last scrollable row.
-            Console.Write($"\x1b[{_rows - BoxHeight()};1H");
-            RedrawBoxLocked();
+            sb.Append($"\x1b[{_rows - boxH};1H");
+            AppendBoxLocked(sb);
+            EndFrame(sb);
         }
         _cts = new CancellationTokenSource();
         _reader = Task.Run(() => ReaderLoop(_cts.Token));
@@ -132,7 +166,9 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
                 while (SafeKeyAvailable() && batch.Count < 8192)
                     batch.Add(Console.ReadKey(intercept: true));
 
-                if (batch.Count == 1) { HandleKey(batch[0]); handled = true; }
+                // Editor mutations happen under the render lock: other threads snapshot
+                // _editor.Lines while painting, and List<T> must never be enumerated mid-insert.
+                if (batch.Count == 1) { lock (_render) HandleKey(batch[0]); handled = true; }
                 else if (batch.Count > 1)
                 {
                     // A burst = paste: insert literally (newlines kept), don't submit.
@@ -140,15 +176,20 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
                     foreach (var k in batch)
                         if (k.Key == ConsoleKey.Enter) sb.Append('\n');
                         else if (!char.IsControl(k.KeyChar)) sb.Append(k.KeyChar);
-                    _editor.InsertText(sb.ToString());
+                    lock (_render) _editor.InsertText(sb.ToString());
                     handled = true;
                 }
 
-                // Redraw on input, and ~5x/sec while thinking so the timer advances.
                 var now = _clock.ElapsedMilliseconds;
-                if (handled || (Volatile.Read(ref _thinkingStartTicks) != 0 && now - lastTick > 180))
+                if (handled)
                 {
                     RedrawBox();
+                    lastTick = now;
+                }
+                else if (Volatile.Read(ref _thinkingStartTicks) != 0 && now - lastTick > 180)
+                {
+                    // ~5x/sec while thinking: only the status row changes — repaint just it.
+                    RedrawStatusRow();
                     lastTick = now;
                 }
             }
@@ -176,8 +217,11 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
             var chosen = RunExclusiveAsync(() =>
                 Input.SpectreChoice.SelectSlashCommandAsync(_spectre, _slashCommands, CancellationToken.None))
                 .GetAwaiter().GetResult();
-            if (chosen is not null) _editor.InsertText(chosen + " ");
-            else _editor.InsertChar('/');   // cancelled → keep the slash for manual typing
+            lock (_render)
+            {
+                if (chosen is not null) _editor.InsertText(chosen + " ");
+                else _editor.InsertChar('/');   // cancelled → keep the slash for manual typing
+            }
         }
         catch { /* picker failed — leave the box as-is */ }
         RedrawBox();
@@ -197,9 +241,9 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     }
 
     /// <summary>
-    /// Run <paramref name="action"/> with sole ownership of the console: pause the key reader, lift
-    /// the scroll region and drop below the box so Spectre can render + read keys normally, then
-    /// restore the region and box afterwards.
+    /// Run <paramref name="action"/> with sole ownership of the console: pause the key reader,
+    /// erase the box and lift the scroll region so Spectre can render + read keys normally, then
+    /// restore the region, flush deferred output, and repaint the box afterwards.
     /// </summary>
     private async Task<T> RunExclusiveAsync<T>(Func<Task<T>> action)
     {
@@ -215,48 +259,62 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     /// Pause the reader and hand the whole terminal to a full-screen renderer (the fleet view) on the
     /// <b>alternate screen buffer</b> — like vim/less: the view gets a pristine screen, and disposing
     /// the handle switches back to the main buffer, restoring the conversation + input box exactly as
-    /// they were, then re-asserts the scroll region and resumes the reader. Synchronous counterpart of
-    /// <see cref="RunExclusiveAsync{T}"/> (the fleet view's blocking render loop runs on its own
-    /// thread, so the blocking wait is fine).
+    /// they were, then re-asserts the scroll region and resumes the reader. While the view owns the
+    /// screen, all TUI output is deferred (flushed on return) so nothing can paint over it.
+    /// Synchronous counterpart of <see cref="RunExclusiveAsync{T}"/> (the fleet view's blocking
+    /// render loop runs on its own thread, so the blocking wait is fine).
     /// </summary>
     public IDisposable EnterExclusive()
     {
         _readerGate.Wait();
         lock (_render)
         {
-            Console.Write("\x1b[?1049h");     // enter alternate screen buffer (fresh, isolated)
-            Console.Write("\x1b[r");          // no scroll region on the alt screen
-            Console.Write("\x1b[?7h");        // autowrap on — Spectre expects it
-            Console.Write("\x1b[H\x1b[2J");   // home + clear the alt screen
+            _exclusive = true;                // from here on, output defers and box redraws no-op
+            Console.Write(
+                "\x1b[?1049h" +               // enter alternate screen buffer (fresh, isolated)
+                "\x1b[r" +                    // no scroll region on the alt screen
+                "\x1b[?7h" +                  // autowrap on — Spectre expects it
+                "\x1b[H\x1b[2J");             // home + clear the alt screen
+            _regionBottom = -1;               // force region re-apply on restore
+            _paintedBoxTop = -1;
         }
         return new ExclusiveScope(this);
     }
 
     // Leave the alternate screen: the main buffer (conversation + box) comes back verbatim; still
-    // re-assert the region + redraw the box so output resumes correctly regardless of whether the
-    // terminal preserved our DECSTBM margins across the buffer switch.
+    // re-assert the region + repaint so output resumes correctly regardless of whether the terminal
+    // preserved our DECSTBM margins across the buffer switch. Deferred output is flushed here.
     private void RestoreFromAltScreen()
     {
         lock (_render)
         {
-            Console.Write("\x1b[?7l");        // autowrap off again (our clipping model)
-            Console.Write("\x1b[?1049l");     // back to the main screen buffer
-            _lastBoxHeight = -1;              // force region re-apply
-            ApplyScrollRegion(force: true);
-            Console.Write($"\x1b[{_rows - BoxHeight()};1H");
-            RedrawBoxLocked();
+            _exclusive = false;
+            var sb = BeginFrame();
+            sb.Append("\x1b[?7l");            // autowrap off again (our clipping model)
+            sb.Append("\x1b[?1049l");         // back to the main screen buffer
+            AppendScrollRegionLocked(sb, force: true);
+            FlushDeferredLocked(sb);
+            AppendBoxLocked(sb);
+            EndFrame(sb);
         }
     }
 
-    // Holds nothing on entry; takes _render to emit the lift sequence.
+    // Holds nothing on entry; takes _render to emit the lift sequence. The box is ERASED before
+    // the exclusive renderer takes over: if its output scrolls the (now region-less) screen, there
+    // is no pinned box left to be dragged up into the transcript as a ghost copy.
     private void LiftForExclusive()
     {
         lock (_render)
         {
-            Console.Write("\x1b[r");                       // lift scroll region
-            Console.Write("\x1b[?7h");                     // restore autowrap (Spectre expects it)
-            Console.Write($"\x1b[{_rows};1H\x1b[0m\r\n");  // move below the box
-            _lastBoxHeight = -1;                            // force region re-apply on redraw
+            var top = _paintedBoxTop > 0 ? _paintedBoxTop : _rows - BoxHeight() + 1;
+            var sb = BeginFrame();
+            sb.Append("\x1b[r");                          // lift scroll region (homes the cursor)
+            sb.Append("\x1b[?7h");                        // restore autowrap (Spectre expects it)
+            sb.Append($"\x1b[{top};1H{Reset}\x1b[0J");    // erase the box; prompt renders in its place
+            EndFrame(sb);
+            _regionBottom = -1;                           // force region re-apply on restore
+            _paintedBoxTop = -1;
+            _exclusive = true;                            // defer output until restore
         }
     }
 
@@ -264,10 +322,13 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     {
         lock (_render)
         {
-            Console.Write("\x1b[?7l");                      // autowrap off again (our clipping model)
-            ApplyScrollRegion(force: true);
-            Console.Write($"\x1b[{_rows - BoxHeight()};1H");
-            RedrawBoxLocked();
+            _exclusive = false;
+            var sb = BeginFrame();
+            sb.Append("\x1b[?7l");                        // autowrap off again (our clipping model)
+            AppendScrollRegionLocked(sb, force: true);
+            FlushDeferredLocked(sb);
+            AppendBoxLocked(sb);
+            EndFrame(sb);
         }
     }
 
@@ -284,6 +345,7 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
         }
     }
 
+    // Holds _render (called from the reader loop under the lock).
     private void HandleKey(ConsoleKeyInfo k)
     {
         if ((k.Modifiers & ConsoleModifiers.Control) != 0)
@@ -365,38 +427,67 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
 
     // ---- rendering ----
 
+    // Every paint path composes ONE frame into a StringBuilder and writes it in a single
+    // Console.Write, wrapped in DEC 2026 synchronized output. One write = no interleaving with
+    // other writers mid-frame; sync markers = the terminal presents it atomically (no flicker).
+    private static StringBuilder BeginFrame() => new StringBuilder(256).Append(SyncBegin);
+
+    private static void EndFrame(StringBuilder sb)
+    {
+        sb.Append(SyncEnd);
+        Console.Write(sb.ToString());
+    }
+
     private void EmitOutputLine(string line)
     {
         lock (_render)
         {
             if (!_started) { Console.WriteLine(line); return; }
-            RefreshDims();
-            ApplyScrollRegion(force: false); // keep the region in sync if the box grew/shrank
-
-            // Append one line at the bottom of the scroll region: write it on the last scrollable
-            // row, clear any leftovers, then LF. LF at the bottom of a DECSTBM region scrolls only
-            // that region up by one — the pinned box below is untouched. Autowrap is off so a
-            // full-width line can't wrap-scroll. Crucially we do NOT redraw the whole box here (that
-            // per-line flood was what garbled the multi-agent output); we only re-park the cursor.
-            var outRow = _rows - BoxHeight();
-            Console.Write($"\x1b[{outRow};1H");
-            Console.Write(Clip(line, _cols - 1));
-            Console.Write("\x1b[K\n");
-            ParkCursorInInputLocked();
+            if (_exclusive) { _deferred.Add(line); return; } // never paint over an exclusive renderer
+            var sb = BeginFrame();
+            AppendOutputLineLocked(sb, line);
+            // If the box height changed since the last paint (the user grew/shrank the input while
+            // output streamed), repaint it so vacated rows are cleared; otherwise just re-park the
+            // cursor. The per-line full-box flood is what garbled multi-agent output historically —
+            // keep the common path to "append one line + re-park".
+            if (BoxHeight() != _paintedBoxHeight) AppendBoxLocked(sb);
+            else AppendParkCursorLocked(sb);
+            EndFrame(sb);
         }
     }
 
+    // Holds _render. Append one line at the bottom of the scroll region: write it on the last
+    // scrollable row, clear any leftovers, then LF. LF at the bottom of a DECSTBM region scrolls
+    // only that region up by one — the pinned box below is untouched. Autowrap is off so a
+    // full-width line can't wrap-scroll.
+    private void AppendOutputLineLocked(StringBuilder sb, string line)
+    {
+        RefreshDims();
+        AppendScrollRegionLocked(sb, force: false); // keep the region in sync if rows/box changed
+        var outRow = _rows - BoxHeight();
+        sb.Append($"\x1b[{outRow};1H");
+        sb.Append(Clip(line, _cols - 1));
+        sb.Append(Reset).Append("\x1b[K\n");
+    }
+
+    // Holds _render. Flush output that arrived while an exclusive section owned the screen.
+    private void FlushDeferredLocked(StringBuilder sb)
+    {
+        if (_deferred.Count == 0) return;
+        foreach (var line in _deferred) AppendOutputLineLocked(sb, line);
+        _deferred.Clear();
+    }
+
     // Holds _render. Move the visible cursor back into the input box without repainting the box.
-    private void ParkCursorInInputLocked()
+    private void AppendParkCursorLocked(StringBuilder sb)
     {
         var boxH = BoxHeight();
         var top = _rows - boxH + 1;
-        var lines = _editor.Lines;
-        var inputRows = Math.Clamp(lines.Count, 1, MaxInputRows);
-        var firstLine = Math.Max(0, Math.Min(_editor.CursorRow - (inputRows - 1), lines.Count - inputRows));
+        var inputRows = Math.Clamp(_editor.LineCount, 1, MaxInputRows);
+        var firstLine = Math.Max(0, Math.Min(_editor.CursorRow - (inputRows - 1), _editor.LineCount - inputRows));
         var curScreenRow = top + 1 + (_editor.CursorRow - firstLine);
         var curCol = 2 + Math.Min(_editor.CursorCol, _cols - 4) + 1;
-        Console.Write($"\x1b[{curScreenRow};{curCol}H");
+        sb.Append($"\x1b[{curScreenRow};{curCol}H");
     }
 
     private void EchoQueuedLine(string text) =>
@@ -404,22 +495,51 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
 
     private void RedrawBox()
     {
-        lock (_render) { if (_started) RedrawBoxLocked(); }
+        lock (_render)
+        {
+            if (!_started || _exclusive) return;
+            var sb = BeginFrame();
+            AppendBoxLocked(sb);
+            EndFrame(sb);
+        }
+    }
+
+    /// <summary>Fast path for the thinking-timer tick: only the status row changes — rewrite just
+    /// that row and re-park the cursor, instead of flooding the whole box 5x/sec.</summary>
+    private void RedrawStatusRow()
+    {
+        lock (_render)
+        {
+            if (!_started || _exclusive || _paintedBoxTop < 1) return;
+            var sb = BeginFrame();
+            AppendRowLocked(sb, _paintedBoxTop, StatusText());
+            AppendParkCursorLocked(sb);
+            EndFrame(sb);
+        }
     }
 
     // Holds _render.
-    private void RedrawBoxLocked()
+    private void AppendBoxLocked(StringBuilder sb)
     {
         RefreshDims();
-        ApplyScrollRegion(force: false);
+        AppendScrollRegionLocked(sb, force: false);
 
         var boxH = BoxHeight();
         var top = _rows - boxH + 1;           // first box row (1-based)
         var lines = _editor.Lines;
         var inputRows = Math.Clamp(lines.Count, 1, MaxInputRows);
 
+        // If the box shrank (its top moved DOWN), the vacated rows above the new top are now part
+        // of the scroll region and still hold old status/input content — clear them, or they scroll
+        // into the transcript as ghost box fragments.
+        if (_paintedBoxTop > 0 && _paintedBoxTop < top)
+            for (var r = _paintedBoxTop; r < top; r++)
+                sb.Append($"\x1b[{r};1H\x1b[2K");
+        _paintedBoxTop = top;
+        _paintedBoxHeight = boxH;
+
         // Status line.
-        WriteRow(top, StatusText());
+        AppendRowLocked(sb, top, StatusText());
 
         // Input lines (first prefixed "> ", continuations "  "). Show a window if there are more
         // lines than fit, keeping the cursor row visible.
@@ -429,16 +549,16 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
             var li = firstLine + i;
             var prefix = li == 0 ? $"{Cyan}>{Reset} " : "  ";
             var content = li < lines.Count ? lines[li] : "";
-            WriteRow(top + 1 + i, prefix + Clip(content, _cols - 3));
+            AppendRowLocked(sb, top + 1 + i, prefix + Clip(content, _cols - 3));
         }
 
         // Footer.
-        WriteRow(top + 1 + inputRows, FooterText());
+        AppendRowLocked(sb, top + 1 + inputRows, FooterText());
 
         // Park the visible cursor at the editor position inside the input area.
         var curScreenRow = top + 1 + (_editor.CursorRow - firstLine);
         var curCol = 2 /* "> " */ + Math.Min(_editor.CursorCol, _cols - 4) + 1; // 1-based
-        Console.Write($"\x1b[{curScreenRow};{curCol}H");
+        sb.Append($"\x1b[{curScreenRow};{curCol}H");
     }
 
     private string StatusText()
@@ -461,28 +581,33 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
         return $"{mode}  {Mute}·  / commands · Ctrl+C interrupt/exit{Reset}";
     }
 
-    // Holds _render.
-    private void WriteRow(int row, string content)
+    // Holds _render. Write a full box row: position, content, then reset + clear-to-EOL. Writing
+    // content first and clearing the tail (instead of 2K-then-write) avoids the blank-row flash on
+    // terminals without synchronized-output support.
+    private void AppendRowLocked(StringBuilder sb, int row, string content)
     {
         if (row < 1 || row > _rows) return;
-        Console.Write($"\x1b[{row};1H\x1b[2K"); // go to row, clear it
-        Console.Write(content);
+        sb.Append($"\x1b[{row};1H");
+        sb.Append(content);
+        sb.Append(Reset).Append("\x1b[K");
     }
 
     private int BoxHeight()
     {
-        var inputRows = Math.Clamp(_editor.Lines.Count, 1, MaxInputRows);
+        var inputRows = Math.Clamp(_editor.LineCount, 1, MaxInputRows);
         return 1 /*status*/ + inputRows + 1 /*footer*/;
     }
 
-    // Holds _render.
-    private void ApplyScrollRegion(bool force)
+    // Holds _render. Re-asserts the DECSTBM region whenever its computed bottom row changed —
+    // whether from a box-height change OR a terminal resize. A stale region is what turns
+    // region-bottom LFs into whole-screen scrolls (ghost boxes everywhere). Note DECSTBM homes the
+    // cursor, so every caller must position the cursor afterwards.
+    private void AppendScrollRegionLocked(StringBuilder sb, bool force)
     {
-        var boxH = BoxHeight();
-        if (!force && boxH == _lastBoxHeight) return;
-        _lastBoxHeight = boxH;
-        // Reserve the bottom box; output scrolls in rows 1..(rows-boxH).
-        Console.Write($"\x1b[1;{Math.Max(1, _rows - boxH)}r");
+        var bottom = Math.Max(1, _rows - BoxHeight());
+        if (!force && bottom == _regionBottom) return;
+        _regionBottom = bottom;
+        sb.Append($"\x1b[1;{bottom}r");
     }
 
     private void RefreshDims()
@@ -500,9 +625,46 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     private static string Clip(string s, int max)
     {
         if (max <= 0) return "";
-        // Strip embedded newlines for single-row rendering; truncate to width.
+        // Strip embedded newlines for single-row rendering; truncate to VISIBLE width. The
+        // truncation must be ANSI-aware: counting raw chars would cut colored lines way short
+        // and could slice through an escape sequence, spraying "[0m" fragments into the
+        // transcript. Escape sequences are copied wholesale and never counted.
         s = s.Replace("\r", "").Replace("\n", "⏎");
-        return s.Length <= max ? s : s[..max];
+        if (s.IndexOf('\x1b') < 0)
+            return s.Length <= max ? s : s[..max];
+
+        var sb = new StringBuilder(s.Length);
+        var visible = 0;
+        var truncated = false;
+        for (var i = 0; i < s.Length;)
+        {
+            if (s[i] == '\x1b')
+            {
+                var start = i;
+                i++; // consume ESC
+                if (i < s.Length && s[i] == '[')
+                {
+                    i++; // CSI: parameters/intermediates then one final byte in @-~
+                    while (i < s.Length && (s[i] < '@' || s[i] > '~')) i++;
+                    if (i < s.Length) i++;
+                }
+                else if (i < s.Length && s[i] == ']')
+                {
+                    i++; // OSC: terminated by BEL or ST (ESC \)
+                    while (i < s.Length && s[i] != '\x07' && s[i] != '\x1b') i++;
+                    if (i < s.Length) i += s[i] == '\x07' ? 1 : Math.Min(2, s.Length - i);
+                }
+                else if (i < s.Length) i++; // two-char escape
+                sb.Append(s, start, i - start);
+                continue;
+            }
+            if (visible >= max) { truncated = true; break; }
+            sb.Append(s[i]);
+            visible++;
+            i++;
+        }
+        if (truncated) sb.Append(Reset); // never leave a color running past the cut
+        return sb.ToString();
     }
 
     private static bool SafeKeyAvailable()
@@ -513,6 +675,9 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
 
     public void Dispose()
     {
+        // Idempotent: the normal finally AND the ProcessExit hook (hard Ctrl+C exits) both call
+        // this; only the first reset sequence should be written.
+        if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
         try { _cts?.Cancel(); } catch { }
         try { _reader?.Wait(TimeSpan.FromMilliseconds(400)); } catch { }
         _cts?.Dispose();
@@ -522,10 +687,15 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
             {
                 lock (_render)
                 {
-                    Console.Write("\x1b[?1049l");         // leave the alt screen if a fleet view raced teardown
-                    Console.Write("\x1b[r");              // reset scroll region
-                    Console.Write("\x1b[?7h");            // restore autowrap
-                    Console.Write($"\x1b[{_rows};1H\x1b[0m\n"); // cursor to bottom
+                    Console.Write(
+                        SyncEnd +                     // never leave a sync frame open
+                        "\x1b[?1049l" +               // leave the alt screen if a fleet view raced teardown
+                        "\x1b[r" +                    // reset scroll region
+                        "\x1b[?7h" +                  // restore autowrap
+                        $"\x1b[{_rows};1H\x1b[0m\n"); // cursor to bottom
+                    // Don't swallow output that was deferred behind an exclusive section.
+                    foreach (var line in _deferred) Console.WriteLine(line);
+                    _deferred.Clear();
                 }
             }
             catch { }

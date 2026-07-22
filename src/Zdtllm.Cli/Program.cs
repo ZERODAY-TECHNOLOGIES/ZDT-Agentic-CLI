@@ -395,6 +395,11 @@ internal static class Program
         // because Ctrl+C also flows through the REPL/print handlers below.
         AppDomain.CurrentDomain.ProcessExit += (_, _) =>
         {
+            // Reset the terminal FIRST (scroll region, autowrap, alt screen) — on a hard exit
+            // (double Ctrl+C) the RunAsync finally never runs, and without this the user's shell
+            // is left inside a stale DECSTBM region with autowrap off. Dispose is idempotent, so
+            // the normal finally path doesn't double-reset.
+            try { tui?.Dispose(); } catch { /* swallow */ }
             try { mcpManager.DisposeAsync().AsTask().Wait(2000); } catch { /* swallow */ }
         };
 
@@ -520,16 +525,24 @@ internal static class Program
             {
                 // Console reads don't reliably unblock on cancellation (Windows), so print the
                 // farewell here (idempotent — the RunAsync finally won't double it) and let the
-                // runtime tear us down.
+                // runtime tear us down. The TUI must be disposed HERE: with e.Cancel = false the
+                // OS terminates the process directly and neither the RunAsync finally nor
+                // AppDomain.ProcessExit runs — without this the user's shell would be left inside
+                // a stale scroll region with autowrap off.
                 repl.PrintFarewell();
+                tui?.Dispose();
+                TerminalStatus.Clear();
                 e.Cancel = false;
                 programCts.Cancel();
                 return;
             }
 
             e.Cancel = true;
-            Console.Error.WriteLine();
-            Console.Error.WriteLine("  (press Ctrl+C again to exit)");
+            // In TUI mode the hint must go through the scroll-region writer — a raw stderr write
+            // would land at the parked cursor inside the input box and garble it.
+            var hintSink = tui is not null ? tui.Output : Console.Error;
+            hintSink.WriteLine("  (press Ctrl+C again to exit)");
+            hintSink.Flush();
             ctrlCResetTimer.Change(2000, Timeout.Infinite);
         };
 
