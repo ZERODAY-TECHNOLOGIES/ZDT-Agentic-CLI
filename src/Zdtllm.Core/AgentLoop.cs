@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Security.Cryptography;
 using System.Text;
@@ -94,7 +95,10 @@ public sealed class AgentLoop
 
     private readonly LiteLLMClient _client;
     private readonly ToolRegistry _tools;
-    private readonly PermissionRuleSet _perms;
+    // Not readonly: the interactive "yes, don't ask again" choice rebuilds it with an extra allow
+    // rule. Only ever reassigned during the single-threaded permission pre-resolution pass, before
+    // any (possibly parallel) tool dispatch reads it.
+    private PermissionRuleSet _perms;
     private readonly AgentLoopOptions _options;
     private readonly ContextManager? _context;
     private readonly IAnsiConsole? _richConsole;
@@ -107,6 +111,24 @@ public sealed class AgentLoop
     /// scroll region accepts ANSI text lines but can't host Spectre renderables/spinners.
     /// </summary>
     private readonly Func<string, string>? _markdownAnsi;
+
+    /// <summary>
+    /// Drives the interactive allow / always-allow / deny prompt when a tool call resolves to
+    /// <see cref="PermissionDecision.Ask"/>. The same prompter that backs AskUserQuestion /
+    /// ExitPlanMode. <see cref="UnavailablePrompter"/> (print mode, subagents) makes the loop fall
+    /// back to the text-error behaviour instead of blocking on input that will never arrive.
+    /// </summary>
+    private readonly IInteractivePrompter _prompter;
+
+    /// <summary>
+    /// Call ids the user approved for a single execution during permission pre-resolution. Removed
+    /// when consumed. Concurrent because dispatch may run tool calls in parallel; only ever written
+    /// during the serial pre-resolution pass.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, byte> _approvedOnce = new(StringComparer.Ordinal);
+
+    /// <summary>Call ids the user declined, mapped to the message handed back to the model.</summary>
+    private readonly ConcurrentDictionary<string, string> _deniedWithMessage = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Optional queue of user messages typed while THIS turn is already running (interactive
@@ -229,7 +251,8 @@ public sealed class AgentLoop
         IUserInputQueue? inputQueue = null,
         IPlanModeSwitch? planMode = null,
         ITypeAheadStatus? typeAhead = null,
-        Func<string, string>? markdownAnsi = null)
+        Func<string, string>? markdownAnsi = null,
+        IInteractivePrompter? prompter = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(tools);
@@ -246,6 +269,7 @@ public sealed class AgentLoop
         _planMode = planMode;
         _typeAhead = typeAhead;
         _markdownAnsi = markdownAnsi;
+        _prompter = prompter ?? UnavailablePrompter.Instance;
     }
 
     public PermissionRuleSet Permissions => _perms;
@@ -723,6 +747,20 @@ public sealed class AgentLoop
                 try
                 {
                     await _context.CompactAsync(session, _client, ct).ConfigureAwait(false);
+
+                    // Summarisation keeps the last K *user* turns verbatim and only collapses whole
+                    // turns in between. Inside one long agentic turn there is a single user message,
+                    // so it can free nothing — yet the tool results just appended may still overflow
+                    // the window. Fall back to truncating the oldest tool results in place so the
+                    // next request doesn't 400. (No-op when summarisation already brought us under.)
+                    if (_context.IsProjectedBeyondHardThreshold(session))
+                    {
+                        var truncated = _context.TruncateOldToolResults(session);
+                        if (truncated > 0)
+                            await status.WriteLineAsync(
+                                Palette.Mute($"  ↳ truncated {truncated} older tool result(s) to free context"))
+                                .ConfigureAwait(false);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -949,6 +987,10 @@ public sealed class AgentLoop
         CancellationToken ct)
     {
         if (calls.Length == 0) return Array.Empty<string>();
+
+        // Ask the human about any permission-gated call up-front, serially — before the spinner or
+        // parallel dispatch. The verdicts are consumed by ExecuteToolCoreAsync per call id.
+        await PreResolvePermissionsAsync(calls, status, ct).ConfigureAwait(false);
 
         var allParallelisable = calls.All(c =>
         {
@@ -1365,6 +1407,122 @@ public sealed class AgentLoop
         }
     }
 
+    /// <summary>
+    /// Resolve a tool call to a permission decision. Bash gets special handling: its raw specifier
+    /// is the ENTIRE command line, so it must be decomposed into sub-commands (each independently
+    /// allowed) rather than glob-matched whole — otherwise a chained sub-command rides along on a
+    /// narrow allow rule.
+    /// </summary>
+    private PermissionDecision DecisionFor(string toolName, string? specifier) =>
+        toolName == "Bash" && specifier is not null
+            ? _perms.EvaluateBash(specifier)
+            : _perms.Evaluate(toolName, specifier);
+
+    private enum PermissionPrompt { AllowOnce, AllowAlways, Deny }
+
+    /// <summary>
+    /// Before dispatching a batch, ask the human about any call that resolves to Ask — the
+    /// interactive allow / always-allow / deny prompt. Runs serially and up-front (prompting is
+    /// inherently one-at-a-time) so it never collides with the tool-execution spinner or with
+    /// parallel dispatch. The verdict is recorded per call id and honoured later in
+    /// <see cref="ExecuteToolCoreAsync"/>: allow-once executes this time only; allow-always adds a
+    /// session-scoped exact allow rule so it never re-asks; decline hands the model a "user
+    /// declined" result instead of running the tool. A no-op when permissions are skipped or no
+    /// interactive terminal is attached (print mode / subagents) — the text-error fallback stands.
+    /// </summary>
+    private async Task PreResolvePermissionsAsync(ImmutableArray<ToolCall> calls, TextWriter status, CancellationToken ct)
+    {
+        if (_options.SkipPermissions || !_prompter.IsAvailable) return;
+
+        foreach (var call in calls)
+        {
+            var tool = _tools.Get(call.FunctionName);
+            if (tool is null) continue; // unknown tool — handled in core
+
+            // Plan mode refuses mutating tools outright; no point asking about them.
+            if (_planMode?.InPlanMode == true && PlanModeState.BlockedTools.Contains(call.FunctionName))
+                continue;
+
+            JsonDocument doc;
+            try
+            {
+                doc = string.IsNullOrWhiteSpace(call.Arguments)
+                    ? JsonDocument.Parse("{}")
+                    : JsonDocument.Parse(call.Arguments);
+            }
+            catch (JsonException)
+            {
+                continue; // malformed args — core reports the parse error
+            }
+
+            using (doc)
+            {
+                var specifier = tool.GetSpecifierForPermissions(doc.RootElement);
+                if (DecisionFor(call.FunctionName, specifier) != PermissionDecision.Ask)
+                    continue;
+
+                PermissionPrompt outcome;
+                try
+                {
+                    outcome = await PromptForPermissionAsync(call.FunctionName, specifier, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw; // user aborted the turn — propagate to the loop's cancellation path
+                }
+                catch (Exception ex)
+                {
+                    await status.WriteLineAsync(Palette.Red($"  ↳ permission prompt failed: {ex.Message}"))
+                        .ConfigureAwait(false);
+                    continue; // leave unresolved → core emits the text error
+                }
+
+                switch (outcome)
+                {
+                    case PermissionPrompt.AllowOnce:
+                        _approvedOnce[call.Id] = 0;
+                        break;
+                    case PermissionPrompt.AllowAlways:
+                        _perms = _perms.WithAllowExact(call.FunctionName, specifier);
+                        _approvedOnce[call.Id] = 0; // runs even if the exact rule can't re-match (e.g. chained Bash)
+                        await status.WriteLineAsync(Palette.Mute(
+                            $"  ↳ won't ask again this session for {call.FunctionName}" +
+                            (specifier is null ? "" : $"({Truncate(specifier, 60)})"))).ConfigureAwait(false);
+                        break;
+                    case PermissionPrompt.Deny:
+                        _deniedWithMessage[call.Id] =
+                            $"[The user declined to run {call.FunctionName}({specifier ?? string.Empty}). " +
+                            "Do not retry this exact call; either continue without it or ask the user how to proceed.]";
+                        break;
+                }
+            }
+        }
+    }
+
+    private async Task<PermissionPrompt> PromptForPermissionAsync(string toolName, string? specifier, CancellationToken ct)
+    {
+        const string yesAlways = "Yes, and don't ask again";
+        var target = specifier is null ? toolName : $"{toolName}  {Truncate(specifier, 100)}";
+        var options = new[]
+        {
+            new PromptChoice("Yes", "run this call once"),
+            new PromptChoice(yesAlways, "allow this exact command/path for the rest of this session"),
+            new PromptChoice("No, tell the model", "decline and let the model continue without it"),
+        };
+
+        var selected = await _prompter
+            .SelectAsync($"Allow {target}?", "Permission", options, multiSelect: false, allowFreeText: false, ct)
+            .ConfigureAwait(false);
+
+        var choice = selected.Count > 0 ? selected[0] : "No";
+        if (choice.StartsWith("Yes", StringComparison.OrdinalIgnoreCase))
+            return choice.Contains("again", StringComparison.OrdinalIgnoreCase)
+                    || choice.Contains("always", StringComparison.OrdinalIgnoreCase)
+                ? PermissionPrompt.AllowAlways
+                : PermissionPrompt.AllowOnce;
+        return PermissionPrompt.Deny;
+    }
+
     private async Task<(string Content, bool IsError)> ExecuteToolCoreAsync(ToolCall call, ToolContext ctx, CancellationToken ct)
     {
         var tool = _tools.Get(call.FunctionName);
@@ -1394,14 +1552,30 @@ public sealed class AgentLoop
         {
             var args = argsDoc.RootElement;
             var specifier = tool.GetSpecifierForPermissions(args);
-            var decision = _perms.Evaluate(call.FunctionName, specifier);
+            var decision = DecisionFor(call.FunctionName, specifier);
 
             if (decision == PermissionDecision.Deny)
                 return ($"[Permission denied: {call.FunctionName}({specifier ?? string.Empty})]", true);
 
             if (decision == PermissionDecision.Ask && !_options.SkipPermissions)
-                return ($"[Permission required for {call.FunctionName}({specifier ?? string.Empty}). " +
-                       "Add an allow rule in settings.json or pass --dangerously-skip-permissions.]", true);
+            {
+                // An interactive pre-resolution pass (DispatchToolCallsAsync) may have already asked
+                // the user about this exact call. Honour that verdict; otherwise fall back to the
+                // text error — the print-mode / subagent / no-TTY case where no human is reachable.
+                if (_approvedOnce.TryRemove(call.Id, out _))
+                {
+                    // approved once — fall through and execute
+                }
+                else if (_deniedWithMessage.TryRemove(call.Id, out var declineMsg))
+                {
+                    return (declineMsg, true);
+                }
+                else
+                {
+                    return ($"[Permission required for {call.FunctionName}({specifier ?? string.Empty}). " +
+                           "Add an allow rule in settings.json or pass --dangerously-skip-permissions.]", true);
+                }
+            }
 
             var res = await tool.ExecuteAsync(args, ctx, ct).ConfigureAwait(false);
             return (res.Content, res.IsError);

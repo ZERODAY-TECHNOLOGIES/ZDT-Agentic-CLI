@@ -126,6 +126,68 @@ public sealed class ContextManager
     }
 
     /// <summary>
+    /// In-turn fallback for when <see cref="CompactAsync"/> cannot help: a single long agentic turn
+    /// has exactly ONE user message (tool results live under role "tool"), so <see cref="Slice"/>
+    /// yields an empty summarizable body and compaction is a no-op — yet the accumulated tool
+    /// results can still blow the context window and 400 the next request. This is the exact
+    /// GLM-5.2 pattern: one prompt, dozens of tool rounds, a huge window.
+    ///
+    /// <para>
+    /// We free space by truncating the CONTENT of the oldest tool results in place, keeping the last
+    /// <paramref name="keepLastToolResults"/> verbatim (the model almost always needs the most recent
+    /// ones). Truncating in place — rather than dropping messages — preserves every assistant⇄tool
+    /// pairing and role ordering, so no chat template is broken and no orphan tool message is left
+    /// behind. Returns the number of tool results that were shortened (0 if nothing was eligible).
+    /// </para>
+    /// </summary>
+    public int TruncateOldToolResults(Session session, int keepLastToolResults = 3, int perResultCap = 2000)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        if (keepLastToolResults < 0) throw new ArgumentOutOfRangeException(nameof(keepLastToolResults));
+        if (perResultCap <= 0) throw new ArgumentOutOfRangeException(nameof(perResultCap));
+
+        var msgs = session.Messages;
+
+        // Index of every tool-result message, in order.
+        var toolIdx = new List<int>();
+        for (var i = 0; i < msgs.Count; i++)
+            if (msgs[i].Role == "tool") toolIdx.Add(i);
+
+        if (toolIdx.Count <= keepLastToolResults) return 0;
+
+        // Everything at or after this index is kept verbatim (the freshest results).
+        var firstKept = toolIdx[^keepLastToolResults];
+
+        var rebuilt = new List<ChatMessage>(msgs.Count);
+        var truncated = 0;
+        for (var i = 0; i < msgs.Count; i++)
+        {
+            var m = msgs[i];
+            if (m.Role == "tool" && i < firstKept
+                && m.Content is { Length: > 0 } content && content.Length > perResultCap)
+            {
+                var elided = content.Length - perResultCap;
+                var shortened = content[..perResultCap] +
+                    $"\n… [truncated {elided} chars mid-task to free context]";
+                rebuilt.Add(m with { Content = shortened });
+                truncated++;
+            }
+            else
+            {
+                rebuilt.Add(m);
+            }
+        }
+
+        if (truncated == 0) return 0;
+
+        session.Compact(rebuilt);
+        // The next server response will recount from a smaller baseline; reset our tracker so we
+        // don't keep reporting "context full" until it does.
+        LastPromptTokens = 0;
+        return truncated;
+    }
+
+    /// <summary>
     /// Visible for tests. Splits the message list into (system+, summarizable, tail).
     /// system+: every message before the first user turn (typically just one system message);
     /// summarizable: the messages from the first user turn up to but not including the start

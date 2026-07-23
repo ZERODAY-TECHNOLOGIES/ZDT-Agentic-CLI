@@ -305,4 +305,46 @@ public sealed class ContextManagerTests : IDisposable
         ctx.LastPromptTokens.Should().Be(0);
         ctx.IsBeyondHardThreshold.Should().BeFalse();
     }
+
+    // ── TruncateOldToolResults: the in-turn fallback for the single-long-turn / GLM pattern ──
+
+    [Fact]
+    public void TruncateOldToolResults_shortens_old_results_and_keeps_recent_verbatim()
+    {
+        using var session = Session.NewEphemeral("m");
+        var ctx = new ContextManager(contextWindow: 100_000, mediumModel: "med");
+
+        // The GLM sweet spot: ONE user turn, then many assistant⇄tool rounds with big tool output.
+        session.AddSystem("sys");
+        session.AddUser("do the big task");
+        for (var i = 0; i < 6; i++)
+        {
+            session.AddAssistant(null, ImmutableArray.Create(new ToolCall($"c{i}", "Read", "{}")));
+            session.AddTool($"c{i}", new string((char)('a' + i), 6_000)); // 6 KB each
+        }
+
+        var before = session.Messages.Count;
+        var truncated = ctx.TruncateOldToolResults(session, keepLastToolResults: 3, perResultCap: 2_000);
+
+        truncated.Should().Be(3);                      // the three oldest of six
+        session.Messages.Count.Should().Be(before);    // truncation never drops messages (pairing intact)
+
+        var toolMsgs = session.Messages.Where(m => m.Role == "tool").ToList();
+        toolMsgs.Should().HaveCount(6);
+        toolMsgs.Take(3).Should().OnlyContain(m => m.Content!.Contains("truncated") && m.Content!.Length < 6_000);
+        toolMsgs.Skip(3).Should().OnlyContain(m => m.Content!.Length == 6_000); // freshest kept verbatim
+    }
+
+    [Fact]
+    public void TruncateOldToolResults_is_a_noop_when_too_few_tool_results()
+    {
+        using var session = Session.NewEphemeral("m");
+        var ctx = new ContextManager(1_000, "med");
+        session.AddUser("u");
+        session.AddAssistant(null, ImmutableArray.Create(new ToolCall("c1", "Read", "{}")));
+        session.AddTool("c1", new string('x', 9_000));
+
+        ctx.TruncateOldToolResults(session, keepLastToolResults: 3).Should().Be(0);
+        session.Messages.Single(m => m.Role == "tool").Content!.Length.Should().Be(9_000);
+    }
 }

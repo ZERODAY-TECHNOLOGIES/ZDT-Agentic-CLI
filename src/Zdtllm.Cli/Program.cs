@@ -336,7 +336,11 @@ internal static class Program
             inputQueue: inputQueue,
             planMode: planMode,
             typeAhead: turnInput,
-            markdownAnsi: formatOwnsStdout ? null : markdownAnsi);
+            markdownAnsi: formatOwnsStdout ? null : markdownAnsi,
+            // Same human-facing prompter that backs AskUserQuestion/ExitPlanMode: drives the
+            // interactive allow / always-allow / deny prompt when a tool call needs permission.
+            // Null in print mode (no TTY) → the loop keeps the text-error fallback.
+            prompter: prompter);
 
         // Task tool needs the parent agent to spawn subagents from. Register it AFTER the
         // agent is built — the registry holds a live reference, so the parent agent will see
