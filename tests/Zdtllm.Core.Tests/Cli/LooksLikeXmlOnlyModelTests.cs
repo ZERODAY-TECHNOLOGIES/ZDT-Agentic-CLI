@@ -83,20 +83,36 @@ public sealed class LooksLikeXmlOnlyModelTests
         mode.Should().Be(ToolCallingMode.Native);
     }
 
+    [Fact]
+    public void ResolveModelAndMode_defaults_glm_to_native_when_no_explicit_mode()
+    {
+        // GLM-5.2 serves native tool_calls through an OpenAI-compatible endpoint, so a fresh GLM
+        // user (no toolCallingMode set) must land on native, not XML.
+        var parsed = new ParsedArgs { Model = "medium" };
+        var settings = BuildSettings(
+            defaultModel: "medium",
+            models: new Dictionary<string, string> { ["medium"] = "glm-5.2:cloud" });
+
+        var (model, mode) = Program.ResolveModelAndMode(parsed, settings);
+
+        model.Should().Be("glm-5.2:cloud");
+        mode.Should().Be(ToolCallingMode.Native);
+    }
+
     [Theory]
     [InlineData("qwen-local")]
     [InlineData("Qwen/Qwen3-Coder-30B-A3B-Instruct")]
-    [InlineData("glm-5.1:cloud")]
-    [InlineData("glm-5:cloud")]
     [InlineData("deepseek-v3")]
     [InlineData("deepseek/deepseek-r1")]
     [InlineData("hermes-3-llama")]
     [InlineData("kimi-k2")]
     [InlineData("yi-large")]
     [InlineData("mistral-nemo-12b")]
+    [InlineData("my-local-llama")]
     public void Returns_true_for_known_xml_only_model_families(string modelName)
     {
         Program.LooksLikeXmlOnlyModel(modelName).Should().BeTrue();
+        Zdtllm.Core.ModelHeuristics.LooksLikeXmlOnly(modelName).Should().BeTrue();
     }
 
     [Theory]
@@ -104,9 +120,13 @@ public sealed class LooksLikeXmlOnlyModelTests
     [InlineData("claude-sonnet-4-6")]
     [InlineData("openai/o3-mini")]
     [InlineData("gemini-2.5-flash")]
+    [InlineData("glm-5.2:cloud")]   // GLM is native on an OpenAI-compatible endpoint
+    [InlineData("glm-5.1:cloud")]
+    [InlineData("glm-5:cloud")]
     public void Returns_false_for_native_tool_calling_model_families(string modelName)
     {
         Program.LooksLikeXmlOnlyModel(modelName).Should().BeFalse();
+        Zdtllm.Core.ModelHeuristics.LooksLikeXmlOnly(modelName).Should().BeFalse();
     }
 
     [Theory]

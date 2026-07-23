@@ -39,6 +39,17 @@ public sealed record LiteLLMClientOptions
     public TimeSpan RequestTimeout { get; init; } = TimeSpan.FromSeconds(120);
     public int MaxRetries { get; init; } = 3;
     public TimeSpan InitialBackoff { get; init; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>Optional request-shaping passthroughs. All null/empty by default so an
+    /// unconfigured client serializes a byte-for-byte identical request body (the actual
+    /// safety guarantee — <c>drop_params:false</c> forwards unknown params, it does not drop
+    /// them). See the matching <c>LiteLLMSettings</c> members for the GLM-5.2 guidance.</summary>
+    public string? ReasoningEffort { get; init; }
+    public double? Temperature { get; init; }
+    public double? TopP { get; init; }
+    public int? MaxTokens { get; init; }
+    /// <summary>Verbatim extra top-level fields; can never clobber load-bearing keys.</summary>
+    public IReadOnlyDictionary<string, JsonElement>? ExtraParams { get; init; }
 }
 
 public sealed class LiteLLMClient
@@ -158,7 +169,6 @@ public sealed class LiteLLMClient
         ArgumentException.ThrowIfNullOrEmpty(model);
 
         var bodyJson = SerializeRequest(messages, tools, model);
-
         var response = await SendWithRetryAsync(bodyJson, ct).ConfigureAwait(false);
         try
         {
@@ -326,7 +336,16 @@ public sealed class LiteLLMClient
     private static string Truncate(string s) =>
         s.Length <= 1024 ? s : string.Concat(s.AsSpan(0, 1024), "…");
 
-    private static string SerializeRequest(
+    // Instance (not static) so it can read the optional passthroughs on _options. Reserved keys
+    // that extraParams may never overwrite — the load-bearing request shape plus the named
+    // passthroughs below (which, when set, are already on the payload and must win).
+    private static readonly HashSet<string> ProtectedRequestKeys = new(StringComparer.Ordinal)
+    {
+        "model", "messages", "tools", "stream", "stream_options", "drop_params",
+        "reasoning_effort", "temperature", "top_p", "max_tokens",
+    };
+
+    private string SerializeRequest(
         IReadOnlyList<ChatMessage> messages,
         IReadOnlyList<ToolDef>? tools,
         string model)
@@ -339,8 +358,28 @@ public sealed class LiteLLMClient
             Stream = true,
             StreamOptions = new RequestStreamOptions(IncludeUsage: true),
             DropParams = false,
+            // Nullable — WhenWritingNull drops them, so an unconfigured client is byte-identical.
+            ReasoningEffort = _options.ReasoningEffort,
+            Temperature = _options.Temperature,
+            TopP = _options.TopP,
+            MaxTokens = _options.MaxTokens,
         };
-        return JsonSerializer.Serialize(payload, JsonOpts);
+
+        // Fast path: no extra params → keep the exact historical serialization (and output bytes).
+        if (_options.ExtraParams is not { Count: > 0 } extra)
+            return JsonSerializer.Serialize(payload, JsonOpts);
+
+        // Merge verbatim extra fields onto the typed payload. Load-bearing / named keys always win:
+        // a key already present on the node (structural fields, or a set named passthrough) or on the
+        // reserved list is skipped, so extraParams can never break streaming, usage, or tool routing.
+        var node = JsonSerializer.SerializeToNode(payload, JsonOpts)!.AsObject();
+        foreach (var kv in extra)
+        {
+            if (ProtectedRequestKeys.Contains(kv.Key)) continue;
+            if (node.ContainsKey(kv.Key)) continue;
+            node[kv.Key] = JsonSerializer.Deserialize<System.Text.Json.Nodes.JsonNode>(kv.Value.GetRawText());
+        }
+        return node.ToJsonString(JsonOpts);
     }
 
     private static RequestMessage ToWireMessage(ChatMessage m) => new()
@@ -387,6 +426,11 @@ internal sealed class RequestPayload
     public bool Stream { get; init; }
     public RequestStreamOptions? StreamOptions { get; init; }
     public bool DropParams { get; init; }
+    // Optional passthroughs — snake_cased by JsonOpts; dropped when null (WhenWritingNull).
+    public string? ReasoningEffort { get; init; }
+    public double? Temperature { get; init; }
+    public double? TopP { get; init; }
+    public int? MaxTokens { get; init; }
 }
 
 internal sealed record RequestStreamOptions(bool IncludeUsage);

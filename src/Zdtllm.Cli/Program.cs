@@ -133,6 +133,15 @@ internal static class Program
         {
             BaseUrl = settings.LiteLLM.BaseUrl!,
             ApiKey = settings.LiteLLM.ApiKey!,
+            // Optional request-shaping passthroughs (all null/empty unless set in settings.json).
+            // For GLM-5.2: set litellm.reasoningEffort="high" for routine coding; leave temperature
+            // UNSET (GLM is trained at 1.0 — do not lower it). These are opt-in so other models
+            // routed through the same client are unaffected.
+            ReasoningEffort = settings.LiteLLM.ReasoningEffort,
+            Temperature = settings.LiteLLM.Temperature,
+            TopP = settings.LiteLLM.TopP,
+            MaxTokens = settings.LiteLLM.MaxTokens,
+            ExtraParams = settings.LiteLLM.ExtraParams,
         });
 
         var perms = PermissionRuleSet.Build(
@@ -280,6 +289,9 @@ internal static class Program
         var baseText = ResolveBaseSystemPrompt(parsed);
         var appendText = ResolveAppendSystemPrompt(parsed);
         var additionalDirs = MergeAdditionalDirectories(parsed.AddDirs, settings.Permissions.AdditionalDirectories);
+        // Runtime <env> facts (cwd / OS / shell / date / git branch), computed once at startup and
+        // injected into the composed system prompt. Best-effort: any probe failure omits its line.
+        var envInfo = BuildEnvInfo(cwd);
 
         // Print mode pipes stdout through the shell so a spinner/markdown renderer would
         // mangle redirected output. Interactive mode benefits from rich rendering — EXCEPT under
@@ -315,7 +327,8 @@ internal static class Program
                     appendText: appendText,
                     memoryFile: memoryFile,
                     additionalDirectories: additionalDirs,
-                    skills: skills),
+                    skills: skills,
+                    envInfo: envInfo),
             },
             context: contextManager,
             richConsole: formatOwnsStdout ? null : richConsole,
@@ -780,6 +793,62 @@ internal static class Program
         catch { return 78; }
     }
 
+    /// <summary>
+    /// Build the runtime <c>&lt;env&gt;</c> block injected into the system prompt: working dir, OS,
+    /// the Bash tool's actual shell, today's date, and the git branch. Every probe is best-effort —
+    /// a failure just omits that line, never throws at startup. The shell line matters most on
+    /// Windows: the Bash tool runs <c>bash -c</c> (git-bash), so telling the model to target POSIX
+    /// bash stops it emitting PowerShell/cmd.
+    /// </summary>
+    private static string? BuildEnvInfo(string cwd)
+    {
+        try
+        {
+            var lines = new List<string>
+            {
+                $"Working directory: {cwd}",
+                $"Platform: {RuntimeInformation.OSDescription.Trim()} ({RuntimeInformation.OSArchitecture})",
+                "Shell for the Bash tool: POSIX bash (runs `bash -c`) — emit bash, never PowerShell or cmd.",
+                $"Today's date: {DateTime.Now:yyyy-MM-dd}",
+            };
+            var branch = TryGitBranch(cwd);
+            if (!string.IsNullOrEmpty(branch)) lines.Add($"Git branch: {branch}");
+            return string.Join("\n", lines);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Resolve the current git branch by reading <c>.git/HEAD</c> up the directory tree — no process
+    /// spawn, so it's fast and can't hang startup. Returns the branch name, a short SHA when
+    /// detached, or null when not in a git repo / on any error (the env block just omits the line).
+    /// </summary>
+    private static string? TryGitBranch(string cwd)
+    {
+        try
+        {
+            var dir = new DirectoryInfo(cwd);
+            while (dir is not null)
+            {
+                var head = Path.Combine(dir.FullName, ".git", "HEAD");
+                if (File.Exists(head))
+                {
+                    var content = File.ReadAllText(head).Trim();
+                    const string prefix = "ref: refs/heads/";
+                    if (content.StartsWith(prefix, StringComparison.Ordinal))
+                        return content[prefix.Length..];
+                    return content.Length >= 7 ? content[..7] : null; // detached HEAD → short sha
+                }
+                dir = dir.Parent;
+            }
+        }
+        catch { /* not a repo / unreadable → omit */ }
+        return null;
+    }
+
     private static string? TryReadMemoryFile(string cwd)
     {
         var path = Path.Combine(cwd, "ZDTLLM.md");
@@ -1115,12 +1184,14 @@ internal static class Program
             : modelAlias;
 
         // Mode resolution prioritises an explicit choice (CLI flag, then settings.json). When
-        // neither is set, infer from the model name: open-weights chat templates (qwen / glm /
-        // deepseek / hermes / kimi / yi / mistral-nemo) generally don't expose OpenAI-shaped
-        // function-calling on LiteLLM and fall back to text — which means Native mode would
-        // silently drop tool calls every turn. Auto-switching to XML and emitting a one-line
-        // stderr note keeps these models working out of the box without forcing every user to
-        // discover the toolCallingMode setting.
+        // neither is set, infer from the model name via ModelHeuristics: open-weights chat
+        // templates (qwen / deepseek / hermes / kimi / yi / mistral-nemo / local) generally don't
+        // expose OpenAI-shaped function-calling on LiteLLM and fall back to text — Native mode would
+        // silently drop tool calls every turn. Auto-switching to XML + a one-line stderr note keeps
+        // them working out of the box. GLM is deliberately NOT in that set: GLM-4.5/4.6/5.2 serve
+        // native tool_calls through an OpenAI-compatible endpoint (vLLM glm47/glm45 parser), so it
+        // defaults to native; a raw-passthrough GLM endpoint with no server-side tool parser must
+        // set toolCallingMode=xml explicitly.
         var explicitMode = parsed.ToolCallingMode ?? settings.LiteLLM.ToolCallingMode;
         ToolCallingMode mode;
         if (string.IsNullOrEmpty(explicitMode) && LooksLikeXmlOnlyModel(modelName))
@@ -1147,19 +1218,11 @@ internal static class Program
     /// verbose tool calls, no functional regression. Missed matches leave the existing
     /// "explicit-or-native" behaviour, which is the conservative default.
     /// </summary>
-    internal static bool LooksLikeXmlOnlyModel(string modelName)
-    {
-        if (string.IsNullOrEmpty(modelName)) return false;
-        ReadOnlySpan<string> markers =
-        [
-            "qwen", "glm", "deepseek", "hermes", "kimi", "yi-", "nemo",
-        ];
-        foreach (var m in markers)
-        {
-            if (modelName.Contains(m, StringComparison.OrdinalIgnoreCase)) return true;
-        }
-        return false;
-    }
+    // Thin CLI-side wrapper over the shared heuristic (kept for the internal test surface); the
+    // real logic — and its GLM=native rationale — lives in Zdtllm.Core.ModelHeuristics so the setup
+    // wizard uses the exact same predicate.
+    internal static bool LooksLikeXmlOnlyModel(string modelName) =>
+        Zdtllm.Core.ModelHeuristics.LooksLikeXmlOnly(modelName);
 
     private static void PrintVersion()
     {

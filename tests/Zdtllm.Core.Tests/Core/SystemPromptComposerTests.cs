@@ -26,6 +26,29 @@ public sealed class SystemPromptComposerTests
     }
 
     [Fact]
+    public void Env_block_is_wrapped_and_placed_between_base_and_append()
+    {
+        var result = SystemPromptComposer.Compose(
+            Base,
+            appendText: "Extra rule.",
+            envInfo: "Working directory: /repo\nToday's date: 2026-07-23");
+
+        result.Should().Contain("<env>");
+        result.Should().Contain("Working directory: /repo");
+        result.Should().Contain("</env>");
+        // Ordering: base < env < append.
+        result.IndexOf("<env>").Should().BeGreaterThan(result.IndexOf(Base));
+        result.IndexOf("Extra rule.").Should().BeGreaterThan(result.IndexOf("</env>"));
+    }
+
+    [Fact]
+    public void Env_block_is_omitted_when_not_supplied()
+    {
+        SystemPromptComposer.Compose(Base).Should().NotContain("<env>");
+        SystemPromptComposer.Compose(Base, envInfo: "   ").Should().NotContain("<env>");
+    }
+
+    [Fact]
     public void Memory_file_block_is_labelled_and_placed_after_base()
     {
         var result = SystemPromptComposer.Compose(Base,

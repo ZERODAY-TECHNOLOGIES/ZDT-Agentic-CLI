@@ -286,12 +286,10 @@ public sealed class SetupWizard
         return (root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), mergedExisting);
     }
 
+    // Uses the SAME predicate as the runtime resolver (ModelHeuristics) so the wizard's suggestion
+    // and the runtime fallback can never disagree — notably, both now suggest native for GLM.
     internal static string SuggestMode(params string[] models) =>
-        models.Any(m => m.Contains("qwen", StringComparison.OrdinalIgnoreCase) ||
-                        m.Contains("deepseek", StringComparison.OrdinalIgnoreCase) ||
-                        m.Contains("local", StringComparison.OrdinalIgnoreCase))
-            ? "xml"
-            : "native";
+        models.Any(ModelHeuristics.LooksLikeXmlOnly) ? "xml" : "native";
 
     private static bool TryParseUrl(string s) =>
         Uri.TryCreate(s, UriKind.Absolute, out var u) &&

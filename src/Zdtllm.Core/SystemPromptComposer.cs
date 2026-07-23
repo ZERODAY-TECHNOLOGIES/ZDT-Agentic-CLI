@@ -8,10 +8,11 @@ namespace Zdtllm.Core;
 /// every input is supplied by the caller. The output stitches together (in this order):
 ///
 ///   1. Base text (the default zdtllmcli prompt unless --system-prompt[-file] replaced it).
-///   2. Optional appended text (from --append-system-prompt[-file]).
-///   3. ZDTLLM.md project memory block, if non-null.
-///   4. Additional accessible directories block, if any are listed.
-///   5. <available_skills> block, if any skills are loaded.
+///   2. Runtime &lt;env&gt; block (cwd / OS / shell / date / git branch), if supplied.
+///   3. Optional appended text (from --append-system-prompt[-file]).
+///   4. ZDTLLM.md project memory block, if non-null.
+///   5. Additional accessible directories block, if any are listed.
+///   6. <available_skills> block, if any skills are loaded.
 /// </summary>
 public static class SystemPromptComposer
 {
@@ -20,11 +21,25 @@ public static class SystemPromptComposer
         string? appendText = null,
         string? memoryFile = null,
         IReadOnlyList<string>? additionalDirectories = null,
-        IReadOnlyList<SkillDefinition>? skills = null)
+        IReadOnlyList<SkillDefinition>? skills = null,
+        string? envInfo = null)
     {
         ArgumentNullException.ThrowIfNull(baseText);
 
         var sb = new StringBuilder(baseText.TrimEnd());
+
+        // Runtime environment facts, right after the base prompt (before any append) so the model
+        // knows the cwd / OS / shell / date without a tool call — and, crucially, targets the Bash
+        // tool's actual POSIX shell instead of emitting PowerShell on Windows.
+        if (!string.IsNullOrWhiteSpace(envInfo))
+        {
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("<env>");
+            sb.Append(envInfo.Trim());
+            sb.AppendLine();
+            sb.Append("</env>");
+        }
 
         if (!string.IsNullOrWhiteSpace(appendText))
         {

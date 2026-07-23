@@ -59,6 +59,13 @@ public static partial class XmlToolCallParser
     [GeneratedRegex(@"<parameter\s*=\s*([^>\s]+)\s*>(.*?)</parameter>", RegexOptions.Singleline)]
     private static partial Regex HermesParamRegex();
 
+    // GLM-5.x native emission inside <tool_call>: a bare function name, then one or more
+    // <arg_key>K</arg_key><arg_value>V</arg_value> pairs. Matches the raw chat template GLM reverts
+    // to even when asked for the <function_calls> dialect. Used only as a last resort in
+    // ExtractHermes when the JSON and <function=..> forms yield nothing.
+    [GeneratedRegex(@"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>(.*?)</arg_value>", RegexOptions.Singleline)]
+    private static partial Regex GlmArgPairRegex();
+
     public static IReadOnlyList<ParsedXmlToolCall> ExtractCalls(string? text)
     {
         if (string.IsNullOrWhiteSpace(text)) return [];
@@ -119,6 +126,22 @@ public static partial class XmlToolCallParser
              || s.Contains("<function=", StringComparison.Ordinal)))
         {
             return true;
+        }
+
+        // Backstop: a well-formed <tool_call>…</tool_call> whose body matches NONE of the recognized
+        // inner shapes (JSON object, <function=..>, GLM <arg_key>, <invoke>) extracts to zero calls
+        // and would be dropped silently. Flag it so format_breakdown telemetry fires and the unknown
+        // shape becomes visible instead of vanishing. (AgentLoop only calls this when 0 calls were
+        // extracted, so a recognized-but-parsed block never reaches here.)
+        foreach (Match block in HermesBlockRegex().Matches(s))
+        {
+            var body = block.Groups[1].Value.Trim();
+            if (body.Length == 0) continue;
+            var recognized = body.StartsWith('{')
+                || body.Contains("<function=", StringComparison.Ordinal)
+                || body.Contains("<arg_key>", StringComparison.Ordinal)
+                || body.Contains("<invoke", StringComparison.Ordinal);
+            if (!recognized) return true;
         }
 
         return false;
@@ -248,12 +271,40 @@ public static partial class XmlToolCallParser
         }
 
         // Tag form: <function=NAME>...<parameter=NAME>VALUE</parameter>...</function>
+        var before = calls.Count;
         foreach (Match func in HermesFunctionRegex().Matches(blockBody))
         {
             var name = func.Groups[1].Value.Trim();
             var body = func.Groups[2].Value;
             calls.Add(BuildCall(name, body, HermesParamRegex()));
         }
+        if (calls.Count > before) return;
+
+        // GLM-5.x native form (last resort — only when neither JSON nor <function=..> matched):
+        //   <tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>
+        // The name is the leading token before the first <arg_key>; each pair becomes one argument.
+        var argMatches = GlmArgPairRegex().Matches(blockBody);
+        if (argMatches.Count == 0) return;
+        var firstKeyIdx = blockBody.IndexOf("<arg_key>", StringComparison.Ordinal);
+        var glmName = blockBody[..firstKeyIdx].Trim();
+        if (glmName.Length == 0) return;
+        calls.Add(BuildCallFromGlmArgs(glmName, argMatches));
+    }
+
+    private static ParsedXmlToolCall BuildCallFromGlmArgs(string name, MatchCollection argPairs)
+    {
+        using var ms = new MemoryStream();
+        using (var w = new Utf8JsonWriter(ms))
+        {
+            w.WriteStartObject();
+            foreach (Match pair in argPairs)
+            {
+                w.WritePropertyName(pair.Groups[1].Value.Trim());
+                WriteParameterValue(w, pair.Groups[2].Value); // JSON-valued arg_value embeds as JSON
+            }
+            w.WriteEndObject();
+        }
+        return new ParsedXmlToolCall(name, Encoding.UTF8.GetString(ms.ToArray()));
     }
 
     private static bool TryParseHermesJson(string body, out ParsedXmlToolCall call)

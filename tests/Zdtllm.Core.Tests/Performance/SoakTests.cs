@@ -42,6 +42,23 @@ public sealed class SoakTests
         return $"data: {contentJson}\n\ndata: {stopJson}\n\ndata: [DONE]\n\n";
     }
 
+    /// <summary>
+    /// Response-replaying handler that retains NOTHING (no Requests / RequestBodies list, unlike
+    /// <c>StubHandler</c>). Used by the memory-drift soak test so the test harness itself doesn't
+    /// accumulate request bodies and contaminate the per-turn-retention measurement.
+    /// </summary>
+    private sealed class ReplayingHandler(params HttpResponseMessage[] responses) : HttpMessageHandler
+    {
+        private readonly Queue<HttpResponseMessage> _responses = new(responses);
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            if (_responses.Count == 0)
+                throw new InvalidOperationException("ReplayingHandler ran out of responses.");
+            return Task.FromResult(_responses.Dequeue());
+        }
+    }
+
     private static long ForceCollectAndMeasure()
     {
         // Three full GCs are the .NET-blessed way to drain finalizers + LOH compactions
@@ -67,7 +84,11 @@ public sealed class SoakTests
         var responses = Enumerable.Range(0, 2_000)
             .Select(_ => Sse(SimpleResponseSse("ok")))
             .ToArray();
-        var http = new HttpClient(new StubHandler(responses));
+        // ReplayingHandler (not StubHandler) so the HARNESS retains nothing: StubHandler keeps every
+        // request body in a list for assertions, which — with a realistic multi-KB system prompt —
+        // would itself dominate the measurement. This test is about per-turn retention in the
+        // AgentLoop / Session / client, not the stub's own accumulation.
+        var http = new HttpClient(new ReplayingHandler(responses));
         var client = new LiteLLMClient(http, new LiteLLMClientOptions
         {
             BaseUrl = "http://stub", ApiKey = "k", MaxRetries = 0,

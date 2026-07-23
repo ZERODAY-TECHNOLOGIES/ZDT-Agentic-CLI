@@ -204,6 +204,22 @@ internal sealed class RawLiteLLM
     /// <summary>Optional vision override — see <see cref="LiteLLMSettings.Vision"/>.</summary>
     public bool? Vision { get; set; }
 
+    /// <summary>Reasoning-effort passthrough — see <see cref="LiteLLMSettings.ReasoningEffort"/>.
+    /// For GLM-5.2 use <c>"high"</c> for routine coding, <c>"max"</c> for hard planning.</summary>
+    public string? ReasoningEffort { get; set; }
+
+    /// <summary>Sampling temperature passthrough — see <see cref="LiteLLMSettings.Temperature"/>.</summary>
+    public double? Temperature { get; set; }
+
+    /// <summary>top_p passthrough — see <see cref="LiteLLMSettings.TopP"/>.</summary>
+    public double? TopP { get; set; }
+
+    /// <summary>max_tokens output-cap passthrough — see <see cref="LiteLLMSettings.MaxTokens"/>.</summary>
+    public int? MaxTokens { get; set; }
+
+    /// <summary>Verbatim extra request fields — see <see cref="LiteLLMSettings.ExtraParams"/>.</summary>
+    public Dictionary<string, JsonElement>? ExtraParams { get; set; }
+
     public LiteLLMSettings ToEffective(Func<string, string?> envRead) => new(
         BaseUrl: EnvironmentExpander.ExpandNullable(BaseUrl, envRead),
         ApiKey: EnvironmentExpander.ExpandNullable(ApiKey, envRead),
@@ -216,7 +232,12 @@ internal sealed class RawLiteLLM
         // expose a settings.json key for it. Keep it null here and let the env layer in
         // LoadEffectiveSettings populate it.
         SmallFastModel: null,
-        Vision: Vision);
+        Vision: Vision,
+        ReasoningEffort: EnvironmentExpander.ExpandNullable(ReasoningEffort, envRead),
+        Temperature: Temperature,
+        TopP: TopP,
+        MaxTokens: MaxTokens,
+        ExtraParams: ToJsonElementDict(ExtraParams));
 
     private static ImmutableDictionary<string, string> ToStringDict(
         Dictionary<string, string>? src,
@@ -234,6 +255,15 @@ internal sealed class RawLiteLLM
         if (src is null || src.Count == 0) return ImmutableDictionary<string, int>.Empty;
         var b = ImmutableDictionary.CreateBuilder<string, int>(StringComparer.Ordinal);
         foreach (var kv in src) b[kv.Key] = kv.Value;
+        return b.ToImmutable();
+    }
+
+    private static ImmutableDictionary<string, JsonElement> ToJsonElementDict(Dictionary<string, JsonElement>? src)
+    {
+        if (src is null || src.Count == 0) return ImmutableDictionary<string, JsonElement>.Empty;
+        var b = ImmutableDictionary.CreateBuilder<string, JsonElement>(StringComparer.Ordinal);
+        // Clone each element so it survives disposal of the source JsonDocument.
+        foreach (var kv in src) b[kv.Key] = kv.Value.Clone();
         return b.ToImmutable();
     }
 }

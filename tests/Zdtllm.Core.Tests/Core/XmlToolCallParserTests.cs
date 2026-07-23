@@ -165,6 +165,64 @@ public sealed class XmlToolCallParserTests
     }
 
     [Fact]
+    public void Parses_GLM_native_arg_key_arg_value_dialect_single_arg()
+    {
+        // GLM-5.x raw chat template: bare name, then <arg_key>/<arg_value> pairs.
+        var text = "<tool_call>Read\n<arg_key>file_path</arg_key><arg_value>./README.md</arg_value>\n</tool_call>";
+
+        var calls = XmlToolCallParser.ExtractCalls(text);
+
+        calls.Should().HaveCount(1);
+        calls[0].FunctionName.Should().Be("Read");
+        using var doc = JsonDocument.Parse(calls[0].ArgumentsJson);
+        doc.RootElement.GetProperty("file_path").GetString().Should().Be("./README.md");
+    }
+
+    [Fact]
+    public void Parses_GLM_dialect_multi_arg_and_json_valued_arg()
+    {
+        var text =
+            "<tool_call>Edit" +
+            "<arg_key>file_path</arg_key><arg_value>a.cs</arg_value>" +
+            "<arg_key>opts</arg_key><arg_value>{\"all\":true}</arg_value>" +
+            "</tool_call>";
+
+        var calls = XmlToolCallParser.ExtractCalls(text);
+
+        calls.Should().HaveCount(1);
+        calls[0].FunctionName.Should().Be("Edit");
+        using var doc = JsonDocument.Parse(calls[0].ArgumentsJson);
+        doc.RootElement.GetProperty("file_path").GetString().Should().Be("a.cs");
+        // JSON-valued arg_value is embedded as JSON, not a string.
+        doc.RootElement.GetProperty("opts").GetProperty("all").GetBoolean().Should().BeTrue();
+    }
+
+    [Fact]
+    public void Parses_two_GLM_tool_call_blocks_as_two_calls()
+    {
+        var text =
+            "<tool_call>Read<arg_key>file_path</arg_key><arg_value>a</arg_value></tool_call>" +
+            "<tool_call>Glob<arg_key>pattern</arg_key><arg_value>*.cs</arg_value></tool_call>";
+
+        var calls = XmlToolCallParser.ExtractCalls(text);
+
+        calls.Should().HaveCount(2);
+        calls[0].FunctionName.Should().Be("Read");
+        calls[1].FunctionName.Should().Be("Glob");
+    }
+
+    [Fact]
+    public void Unrecognized_nonempty_tool_call_body_is_flagged_as_broken()
+    {
+        // A future/unknown <tool_call> shape that extracts to nothing must NOT vanish silently —
+        // it trips the format_breakdown backstop instead.
+        var text = "<tool_call>some totally unknown shape with no markers</tool_call>";
+
+        XmlToolCallParser.ExtractCalls(text).Should().BeEmpty();
+        XmlToolCallParser.LooksLikeBrokenXml(text).Should().BeTrue();
+    }
+
+    [Fact]
     public void Parses_Hermes_style_JSON_inside_tool_call_block()
     {
         // Some Hermes variants emit a JSON object directly:

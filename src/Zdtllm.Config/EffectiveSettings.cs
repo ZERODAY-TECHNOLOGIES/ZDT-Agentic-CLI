@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Text.Json;
 
 namespace Zdtllm.Config;
 
@@ -90,7 +91,33 @@ public sealed record LiteLLMSettings(
     /// Explicit override for whether the model accepts images (vision). When set, it wins over
     /// LiteLLM <c>/model/info</c> <c>supports_vision</c> auto-detection. Null = auto-detect.
     /// </summary>
-    bool? Vision = null)
+    bool? Vision = null,
+    /// <summary>
+    /// Reasoning-effort passthrough for reasoning models (GLM-5.2 <c>reasoning_effort</c>:
+    /// <c>"high"</c>/<c>"max"</c>; OpenAI o-series: <c>"low"</c>/<c>"medium"</c>/<c>"high"</c>).
+    /// Null = send nothing (the request stays byte-for-byte identical and the server applies its
+    /// own default — for GLM-5.2 that is <c>max</c>). Opt-in per deployment; never defaulted, since
+    /// the accepted key/values are provider-specific and <c>drop_params:false</c> forwards unknowns.
+    /// </summary>
+    string? ReasoningEffort = null,
+    /// <summary>Sampling temperature passthrough. Null = omit (server default). NOTE for GLM-5.2:
+    /// Z.ai trains/evaluates at temperature=1.0 — do NOT lower it for "coding"; leaving it unset
+    /// is the recommended behaviour.</summary>
+    double? Temperature = null,
+    /// <summary>top_p passthrough. Null = omit (server default, 0.95 for GLM-5.2). Tune temperature
+    /// OR top_p, never both.</summary>
+    double? TopP = null,
+    /// <summary>max_tokens (output cap) passthrough. Null = omit (uncapped up to the model's limit,
+    /// 128K for GLM-5.2).</summary>
+    int? MaxTokens = null,
+    /// <summary>
+    /// Generic escape hatch: arbitrary top-level request fields emitted VERBATIM (no snake_case
+    /// rename), forwarded under <c>drop_params:false</c>. Absorbs provider-specific param drift
+    /// (e.g. GLM <c>enable_thinking</c>, <c>top_k</c>, <c>chat_template_kwargs</c>) without a
+    /// release. Load-bearing keys (model/messages/tools/stream/stream_options/drop_params) and the
+    /// named passthroughs above always win — extra entries can never clobber them.
+    /// </summary>
+    ImmutableDictionary<string, JsonElement>? ExtraParams = null)
 {
     public static LiteLLMSettings Empty { get; } = new(
         BaseUrl: null,
@@ -101,7 +128,12 @@ public sealed record LiteLLMSettings(
         ContextWindows: ImmutableDictionary<string, int>.Empty,
         SubagentModels: ImmutableDictionary<string, string>.Empty,
         SmallFastModel: null,
-        Vision: null);
+        Vision: null,
+        ReasoningEffort: null,
+        Temperature: null,
+        TopP: null,
+        MaxTokens: null,
+        ExtraParams: ImmutableDictionary<string, JsonElement>.Empty);
 
     public LiteLLMSettings Merge(LiteLLMSettings higher) => new(
         BaseUrl: higher.BaseUrl ?? BaseUrl,
@@ -112,7 +144,14 @@ public sealed record LiteLLMSettings(
         ContextWindows: EffectiveSettings.MergeOverride(ContextWindows, higher.ContextWindows),
         SubagentModels: EffectiveSettings.MergeOverride(SubagentModels, higher.SubagentModels),
         SmallFastModel: higher.SmallFastModel ?? SmallFastModel,
-        Vision: higher.Vision ?? Vision);
+        Vision: higher.Vision ?? Vision,
+        ReasoningEffort: higher.ReasoningEffort ?? ReasoningEffort,
+        Temperature: higher.Temperature ?? Temperature,
+        TopP: higher.TopP ?? TopP,
+        MaxTokens: higher.MaxTokens ?? MaxTokens,
+        ExtraParams: EffectiveSettings.MergeOverride(
+            ExtraParams ?? ImmutableDictionary<string, JsonElement>.Empty,
+            higher.ExtraParams ?? ImmutableDictionary<string, JsonElement>.Empty));
 }
 
 /// <summary>

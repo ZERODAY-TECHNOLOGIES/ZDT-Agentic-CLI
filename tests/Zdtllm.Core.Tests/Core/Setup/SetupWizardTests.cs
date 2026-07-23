@@ -192,8 +192,11 @@ public sealed class SetupWizardTests : IDisposable
     [InlineData("Qwen/Qwen3-Coder-30B", "xml")]
     [InlineData("deepseek-r1", "xml")]
     [InlineData("ollama-local-llama", "xml")]
+    [InlineData("hermes-3", "xml")]      // now unified with the runtime marker set
+    [InlineData("kimi-k2", "xml")]
     [InlineData("gpt-4o", "native")]
     [InlineData("claude-sonnet-4", "native")]
+    [InlineData("glm-5.2:cloud", "native")]   // GLM defaults to native (OpenAI-compatible endpoint)
     public void Mode_suggestion_picks_xml_for_local_qwen_deepseek_else_native(string model, string expected)
     {
         SetupWizard.SuggestMode(model).Should().Be(expected);

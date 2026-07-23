@@ -13,10 +13,52 @@ namespace Zdtllm.Core;
 
 public sealed record AgentLoopOptions
 {
-    public const string DefaultSystemPrompt =
-        "You are zdtllmcli, an autonomous CLI assistant from zer0day.ro. " +
-        "Use the provided tools to read files and run shell commands when needed. " +
-        "Be concise and prefer concrete answers over speculation.";
+    // Transport-agnostic on purpose: it is shared by native AND xml tool-calling, so it must NOT
+    // describe call syntax or a hardcoded tool roster (BuildXmlSystemPrompt owns the XML protocol +
+    // catalog). Tools are referenced by role with "when available" guards. Kept ~45 lines: long
+    // enough to steer agentic coding, short enough not to tax latency each turn.
+    public const string DefaultSystemPrompt = """
+        You are zdt (zdtllmcli), an autonomous command-line coding agent from zer0day.ro.
+        You help engineers by reading, searching, editing, and running real code in their
+        project — not by describing what they could do. When a request implies work you can do
+        with your tools, do it.
+
+        # Autonomy and tools
+        - Act, don't narrate. Use your tools to gather context and make the change instead of
+          asking the user to do it or guessing. Stop to ask only when a decision is genuinely
+          the user's to make.
+        - Read before you edit. Never modify a file you haven't looked at; match the surrounding
+          code's style, naming, and conventions rather than imposing your own.
+        - Use the precise tool for the job when one is available: read files, search the codebase
+          by name and by content, edit or create files, and run shell commands. Fire independent
+          tool calls together so they run in parallel.
+        - On a multi-step task, keep a lightweight running plan (a todo list when available) so
+          nothing is dropped and the user can see progress.
+
+        # Verification
+        - After changing code, verify it: build, run the relevant tests, or exercise the change.
+          Report what you actually observed — if something failed, say so with the output; if you
+          skipped a step, say that. Never claim something works when you haven't checked.
+        - Prefer the project's own build/test/lint commands over ad-hoc ones. Don't invent file
+          paths, flags, or APIs — confirm them from the code.
+
+        # Scope
+        - Do what was asked — no more, no less. Don't refactor untouched code, add unrequested
+          features, or leave TODOs for work you were asked to finish.
+        - For a hard or ambiguous task, think the approach through first, then execute. If the
+          request is under-specified in a way that changes the outcome, ask one focused question
+          rather than guessing wrong and redoing the work.
+
+        # Response style
+        - When your model reasons before answering, think privately — the user sees only your
+          final message, so keep it tight.
+        - Be concise and concrete. Skip filler openings ("Great question!", "Sure!"), don't recap
+          at length what you just did, and don't echo large unchanged spans of code back.
+        - Reference code as path:line so the user can click straight to it. Put commands, code,
+          and file contents in fenced blocks.
+        - When you must refuse, do it in one sentence and, where possible, offer the safe
+          alternative.
+        """;
 
     public required string Model { get; init; }
     /// <summary>
@@ -307,6 +349,10 @@ public sealed class AgentLoop
         // stray invoke/function markers). Surfaced via observer hooks so consumers like
         // AppSec-Automator can branch on it without grepping result.text.
         bool formatBreakdownDetected = false;
+        // Reasoning-only recovery is allowed once per run: if a turn emits nothing but internal
+        // reasoning, we nudge the model to write a visible answer and retry. The flag (outside the
+        // loop) stops that recovery from looping. See the no-calls block below.
+        bool reasoningOnlyRecoveryTried = false;
 
         try
         {
@@ -316,10 +362,13 @@ public sealed class AgentLoop
             var pending = new SortedDictionary<int, ToolCallAccumulator>();
             int? turnPromptTokens = null;
             int? turnCompletionTokens = null;
-            // Char count of reasoning_content seen this turn (DeepSeek V3.x and other
-            // reasoning models). Counted only for verbose telemetry — the actual text
-            // is dropped per spec (reasoning is ephemeral, must not feed back into context).
+            string? turnFinishReason = null;
+            // Char count of reasoning_content seen this turn (GLM-5.2 / DeepSeek V3.x and other
+            // reasoning models). The text is dropped per spec (ephemeral, must not feed back into
+            // context) — but we keep a bounded copy for the reasoning-only fallback below, and the
+            // char count drives telemetry + the empty-answer detector.
             var reasoningCharsThisTurn = 0;
+            var reasoningText = new StringBuilder();
 
             // Live spinner counters: number of characters streamed (for a tokens-approximation
             // since servers don't send incremental usage), and total chunks (debug-style metric).
@@ -388,6 +437,10 @@ public sealed class AgentLoop
                             // streamed-char counter so the spinner keeps advancing during a long
                             // think (otherwise reasoning models look frozen for tens of seconds).
                             reasoningCharsThisTurn += rd.Text.Length;
+                            // Keep a bounded copy for the reasoning-only fallback (last-resort answer
+                            // if the model never produces visible text). Capped so a long think can't
+                            // grow memory unboundedly.
+                            if (reasoningText.Length < 16_384) reasoningText.Append(rd.Text);
                             charsStreamed += rd.Text.Length;
                             UpdateSpinnerThrottled(statusCtx, streamSw, charsStreamed, ref lastSpinnerUpdate);
                             break;
@@ -412,7 +465,10 @@ public sealed class AgentLoop
                             lastCompletionTokens = u.CompletionTokens;
                             break;
 
-                        case ChatChunk.Done:
+                        case ChatChunk.Done done:
+                            // Thread the finish_reason so a 'length' truncation is distinguishable
+                            // from a clean 'stop' (drives the reasoning-only recovery messaging).
+                            turnFinishReason = done.FinishReason;
                             break;
                     }
                 }
@@ -515,8 +571,9 @@ public sealed class AgentLoop
             // and produced nothing observable" cases on DeepSeek/R1-style models.
             if (reasoningCharsThisTurn > 0)
             {
+                var truncNote = turnFinishReason == "length" ? " · finish_reason=length (truncated)" : "";
                 await status.WriteLineAsync(
-                    Palette.Mute($"  ↳ reasoning: {reasoningCharsThisTurn} chars (dropped from context)"))
+                    Palette.Mute($"  ↳ reasoning: {reasoningCharsThisTurn} chars (dropped from context){truncNote}"))
                     .ConfigureAwait(false);
             }
 
@@ -537,16 +594,61 @@ public sealed class AgentLoop
                     ? XmlToolCallParser.Strip(assistantText.ToString()).TrimEnd()
                     : assistantText.ToString();
 
-                // Reasoning-only completion: model emitted chain-of-thought but no content
-                // and no tool calls. Common with mis-configured DeepSeek-R1 / V3.x deployments
-                // where the proxy forces thinking mode for every turn. Surface this clearly so
-                // users don't think the binary swallowed their answer.
+                // Some deployments inline reasoning as a LEADING <think>…</think> in content
+                // instead of the reasoning_content channel. Strip a leading think block only
+                // (start-anchored — a <think> later in the text may be legitimate generated
+                // markup this security tool must not corrupt) and fold it into the reasoning
+                // counter/text so the empty-answer recovery below can see and use it.
+                if (!xmlMode && displayText.Length > 0)
+                {
+                    var (visible, think) = StripLeadingThink(displayText);
+                    if (think.Length > 0)
+                    {
+                        displayText = visible;
+                        reasoningCharsThisTurn += think.Length;
+                        if (reasoningText.Length == 0) reasoningText.Append(think);
+                    }
+                }
+
+                // Reasoning-only completion: the model emitted chain-of-thought but no visible
+                // text and no tool calls. For a reasoning-only model used across all tiers (e.g.
+                // GLM-5.2) "switch to a non-reasoning variant" is a dead end — so nudge it once to
+                // write a visible answer, then fall back to surfacing the captured reasoning.
                 if (displayText.Length == 0 && reasoningCharsThisTurn > 0)
                 {
-                    await status.WriteLineAsync(Palette.Mute(
-                        "  ↳ model emitted reasoning_content only — no observable text or tool calls. " +
-                        "Try a non-reasoning variant of this model."))
-                        .ConfigureAwait(false);
+                    if (!reasoningOnlyRecoveryTried)
+                    {
+                        reasoningOnlyRecoveryTried = true;
+                        await status.WriteLineAsync(Palette.Mute(
+                            "  ↳ model emitted only internal reasoning — nudging it to write a visible answer."))
+                            .ConfigureAwait(false);
+                        // Do NOT persist an empty assistant turn (some chat templates reject an
+                        // empty assistant message immediately followed by a user turn). Append a
+                        // synthetic nudge and retry ONE iteration; the flag prevents looping.
+                        session.AddUser(
+                            "You produced only internal reasoning and no visible answer. Write your " +
+                            "final answer now, in plain text, without a thinking block.");
+                        continue;
+                    }
+
+                    // Recovery already tried and still empty → surface the captured reasoning as a
+                    // labeled last resort instead of returning a blank answer.
+                    var fallback = reasoningText.ToString().Trim();
+                    if (fallback.Length > 0)
+                    {
+                        displayText = fallback;
+                        await status.WriteLineAsync(Palette.Mute(
+                            "  ↳ still no visible answer after retry — showing the model's reasoning as a fallback."))
+                            .ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        var why = turnFinishReason == "length"
+                            ? " (response truncated — raise litellm.maxTokens)."
+                            : ".";
+                        await status.WriteLineAsync(Palette.Mute(
+                            "  ↳ model produced no visible answer" + why)).ConfigureAwait(false);
+                    }
                 }
 
                 if (_richConsole is not null && displayText.Length > 0)
@@ -1503,6 +1605,31 @@ public sealed class AgentLoop
         public string? Id { get; set; }
         public string? FunctionName { get; set; }
         public StringBuilder Arguments { get; } = new();
+    }
+
+    /// <summary>
+    /// If <paramref name="text"/> LEADS with a <c>&lt;think&gt;…&lt;/think&gt;</c> block (some
+    /// deployments inline reasoning in the content channel instead of <c>reasoning_content</c>),
+    /// return the visible remainder plus the think text. Start-anchored ONLY: a <c>&lt;think&gt;</c>
+    /// that appears mid/late in the text is left untouched — it may be legitimate generated markup,
+    /// and this agent handles arbitrary code/payloads where a mid-text paired-span strip would cause
+    /// false positives. An unclosed leading <c>&lt;think&gt;</c> means the whole message is still
+    /// reasoning, so the visible part is empty. Returns <c>(text, "")</c> when there's no leading think.
+    /// </summary>
+    internal static (string Visible, string Think) StripLeadingThink(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return (text, string.Empty);
+        var lead = text.Length - text.TrimStart().Length;
+        var body = text.AsSpan(lead);
+        const string Opener = "<think>";
+        const string Closer = "</think>";
+        if (!body.StartsWith(Opener)) return (text, string.Empty);
+        var afterOpen = text[(lead + Opener.Length)..];
+        var closeIdx = afterOpen.IndexOf(Closer, StringComparison.Ordinal);
+        if (closeIdx < 0) return (string.Empty, afterOpen); // unclosed → still thinking
+        var think = afterOpen[..closeIdx];
+        var visible = afterOpen[(closeIdx + Closer.Length)..].TrimStart();
+        return (visible, think);
     }
 
     /// <summary>
