@@ -31,6 +31,9 @@ public sealed class Repl
     private readonly IUserInputQueue? _inputQueue;
     private readonly ITurnInputCapture? _inputCapture;
     private readonly IPlanModeSwitch? _planMode;
+    /// <summary>Renders the current MCP server status for <c>/mcp</c>. Supplied by the CLI (which
+    /// owns the McpManager) so Core needn't depend on Zdtllm.Mcp. Null when MCP is unavailable.</summary>
+    private readonly Func<string>? _mcpStatus;
     private IReplInputSource? _richInput;
     private CancellationTokenSource? _currentTurnCts;
 
@@ -47,7 +50,8 @@ public sealed class Repl
         IUserInputQueue? inputQueue = null,
         ITurnInputCapture? inputCapture = null,
         IPlanModeSwitch? planMode = null,
-        IReplInputSource? richInput = null)
+        IReplInputSource? richInput = null,
+        Func<string>? mcpStatus = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(agent);
@@ -68,6 +72,7 @@ public sealed class Repl
         _inputQueue = inputQueue;
         _inputCapture = inputCapture;
         _planMode = planMode;
+        _mcpStatus = mcpStatus;
         _richInput = richInput;
     }
 
@@ -344,6 +349,10 @@ public sealed class Repl
 
             case "/permissions":
                 await PrintPermissionsAsync().ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
+            case "/mcp":
+                await PrintMcpStatusAsync().ConfigureAwait(false);
                 return SlashOutcome.Continue;
 
             case "/agents":
@@ -651,6 +660,22 @@ public sealed class Repl
         await _output.WriteLineAsync(
                 Palette.Mute("  Defaults: tools requiring permission (Bash, Edit, Write, WebFetch, WebSearch, Skill) Ask without an explicit allow."))
             .ConfigureAwait(false);
+    }
+
+    private async Task PrintMcpStatusAsync()
+    {
+        if (_mcpStatus is null)
+        {
+            await _output.WriteLineAsync(Palette.Mute(
+                "  No MCP servers configured. Pass --mcp-config <file> to connect one."))
+                .ConfigureAwait(false);
+            return;
+        }
+
+        var text = _mcpStatus();
+        await _output.WriteLineAsync(string.IsNullOrWhiteSpace(text)
+            ? Palette.Mute("  No MCP servers configured.")
+            : text).ConfigureAwait(false);
     }
 
     private static string Hex(Spectre.Console.Color c) => $"#{c.R:X2}{c.G:X2}{c.B:X2}";

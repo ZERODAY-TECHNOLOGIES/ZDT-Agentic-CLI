@@ -217,6 +217,12 @@ internal sealed class RawLiteLLM
     /// <summary>max_tokens output-cap passthrough — see <see cref="LiteLLMSettings.MaxTokens"/>.</summary>
     public int? MaxTokens { get; set; }
 
+    /// <summary>frequency_penalty passthrough — see <see cref="LiteLLMSettings.FrequencyPenalty"/>.</summary>
+    public double? FrequencyPenalty { get; set; }
+
+    /// <summary>presence_penalty passthrough — see <see cref="LiteLLMSettings.PresencePenalty"/>.</summary>
+    public double? PresencePenalty { get; set; }
+
     /// <summary>Verbatim extra request fields — see <see cref="LiteLLMSettings.ExtraParams"/>.</summary>
     public Dictionary<string, JsonElement>? ExtraParams { get; set; }
 
@@ -237,6 +243,8 @@ internal sealed class RawLiteLLM
         Temperature: Temperature,
         TopP: TopP,
         MaxTokens: MaxTokens,
+        FrequencyPenalty: FrequencyPenalty,
+        PresencePenalty: PresencePenalty,
         ExtraParams: ToJsonElementDict(ExtraParams));
 
     private static ImmutableDictionary<string, string> ToStringDict(

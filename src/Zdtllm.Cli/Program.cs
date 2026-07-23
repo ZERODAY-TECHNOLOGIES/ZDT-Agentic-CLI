@@ -118,6 +118,17 @@ internal static class Program
                 "litellm.baseUrl is still not configured. Run `zdt` interactively (no -p) to launch " +
                 "the setup wizard, or edit ~/.zdtllm/settings.json by hand.");
 
+        // Apply the settings.json "env" block to this process's environment. It was parsed and
+        // ${VAR}-expanded during load but nothing consumed it. Setting it here means Bash-tool
+        // subprocesses (and any child process) inherit committed env — proxy vars, tokens, PATH
+        // additions — without the operator having to export them in every shell. We do NOT clobber
+        // a variable that is already set in the real environment (an explicit shell export wins).
+        foreach (var kv in settings.Env)
+        {
+            if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable(kv.Key)))
+                Environment.SetEnvironmentVariable(kv.Key, kv.Value);
+        }
+
         // Default to InfiniteTimeSpan: an agentic CLI legitimately waits many minutes for the
         // model to produce a complex first chunk, especially with XML mode + a large system
         // prompt. The previous 120 s default surfaced as a confusing "(turn cancelled)" after
@@ -129,18 +140,34 @@ internal static class Program
             ? Timeout.InfiniteTimeSpan
             : TimeSpan.FromSeconds(configuredTimeout.Value);
         using var http = new HttpClient { Timeout = httpTimeout };
+
+        // GLM-5.2 is reasoning-first: with reasoning_effort unset the server thinks at its default
+        // 'max' tier on EVERY turn (including trivial tool-continuation turns). Default it to 'high'
+        // — the documented guidance — for a GLM model when the user hasn't pinned it. Any explicit
+        // litellm.reasoningEffort still wins; non-GLM models are unaffected (stays null → omitted).
+        var reasoningEffort = settings.LiteLLM.ReasoningEffort;
+        if (reasoningEffort is null)
+        {
+            var alias = parsed.Model ?? settings.Model;
+            var resolvedModel = alias is not null && settings.LiteLLM.Models.TryGetValue(alias, out var rm) ? rm : alias;
+            if (Zdtllm.Core.ModelHeuristics.LooksLikeGlm(resolvedModel))
+                reasoningEffort = "high";
+        }
+
         var client = new LiteLLMClient(http, new LiteLLMClientOptions
         {
             BaseUrl = settings.LiteLLM.BaseUrl!,
             ApiKey = settings.LiteLLM.ApiKey!,
             // Optional request-shaping passthroughs (all null/empty unless set in settings.json).
-            // For GLM-5.2: set litellm.reasoningEffort="high" for routine coding; leave temperature
-            // UNSET (GLM is trained at 1.0 — do not lower it). These are opt-in so other models
-            // routed through the same client are unaffected.
-            ReasoningEffort = settings.LiteLLM.ReasoningEffort,
+            // For GLM-5.2: reasoningEffort defaults to "high" (above); leave temperature UNSET (GLM
+            // is trained at 1.0 — do not lower it). frequency/presence penalties are opt-in
+            // anti-repetition levers. These are per-model-safe: unset → omitted → byte-identical body.
+            ReasoningEffort = reasoningEffort,
             Temperature = settings.LiteLLM.Temperature,
             TopP = settings.LiteLLM.TopP,
             MaxTokens = settings.LiteLLM.MaxTokens,
+            FrequencyPenalty = settings.LiteLLM.FrequencyPenalty,
+            PresencePenalty = settings.LiteLLM.PresencePenalty,
             ExtraParams = settings.LiteLLM.ExtraParams,
         });
 
@@ -183,8 +210,11 @@ internal static class Program
             ? turnInput
             : null;
         // Plan mode: read-only research + plan-for-approval. Interactive-only (ExitPlanMode needs
-        // a human to approve). Starts on when --plan is passed; toggled at runtime with /plan.
-        PlanModeState? planMode = interactive ? new PlanModeState(parsed.Plan) : null;
+        // a human to approve). Starts on when --plan is passed OR permissions.defaultMode is "plan"
+        // in settings.json (the CLI flag wins); toggled at runtime with /plan.
+        var startInPlanMode = parsed.Plan
+            || string.Equals(settings.Permissions.DefaultMode, "plan", StringComparison.OrdinalIgnoreCase);
+        PlanModeState? planMode = interactive ? new PlanModeState(startInPlanMode) : null;
 
         // The persistent bottom-input TUI (claude-code layout: output scrolls above, a multi-line
         // input box stays pinned and writable during and between turns). Default for an interactive
@@ -540,7 +570,8 @@ internal static class Program
             inputQueue: inputQueue,
             inputCapture: replCapture,
             planMode: planMode,
-            richInput: replInputSource);
+            richInput: replInputSource,
+            mcpStatus: () => BuildMcpStatusText(mcpManager));
 
         // Ctrl+C behaviour, matching claude-cli:
         //   • During a turn  → first press interrupts the turn (keeps the REPL alive) and clears
@@ -800,6 +831,36 @@ internal static class Program
                     $"zdt: mcp[{status.Name}] failed: {status.ErrorMessage}");
             }
         }
+    }
+
+    /// <summary>
+    /// Render the MCP server status for the <c>/mcp</c> command: one line per server with its
+    /// connected/failed state and tool count. Built here (not in Core's Repl) because the CLI owns
+    /// the McpManager — Core stays free of a Zdtllm.Mcp dependency.
+    /// </summary>
+    private static string BuildMcpStatusText(McpManager manager)
+    {
+        const string reset = "\x1b[0m";
+        const string cyan = "\x1b[38;2;27;234;205m";
+        const string body = "\x1b[38;2;232;237;242m";
+        const string mute = "\x1b[38;2;104;123;137m";
+        const string red = "\x1b[38;2;229;77;77m";
+
+        var statuses = manager.Statuses;
+        if (statuses.Count == 0)
+            return $"{mute}  No MCP servers configured. Pass --mcp-config <file> to connect one.{reset}";
+
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"{mute}  MCP servers ({statuses.Count}):{reset}");
+        foreach (var s in statuses)
+        {
+            sb.AppendLine();
+            if (s.Connected)
+                sb.Append($"  {cyan}●{reset} {body}{s.Name}{reset} {mute}— {s.ServerInfo}, {s.ToolCount} tool(s){reset}");
+            else
+                sb.Append($"  {red}○{reset} {body}{s.Name}{reset} {red}— failed: {s.ErrorMessage}{reset}");
+        }
+        return sb.ToString();
     }
 
     /// <summary>

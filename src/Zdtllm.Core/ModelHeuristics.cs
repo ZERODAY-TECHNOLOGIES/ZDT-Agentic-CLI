@@ -41,4 +41,15 @@ public static class ModelHeuristics
             if (modelName.Contains(m, StringComparison.OrdinalIgnoreCase)) return true;
         return false;
     }
+
+    /// <summary>
+    /// True when the model id looks like a GLM (Zhipu/Z.ai) model — GLM-4.5/4.6/5.2 and friends.
+    /// GLM is reasoning-first: with <c>reasoning_effort</c> unset the server thinks at its default
+    /// <c>max</c> tier on EVERY turn (including trivial tool-continuation turns), which is slow and
+    /// costly. zdt uses this to default <c>reasoning_effort</c> to <c>"high"</c> for a GLM model when
+    /// the user hasn't pinned it. Matched as a case-insensitive substring so versioned ids
+    /// (<c>glm-5.2:cloud</c>, <c>zhipu/glm-4.6</c>) still trigger.
+    /// </summary>
+    public static bool LooksLikeGlm(string? modelName) =>
+        !string.IsNullOrEmpty(modelName) && modelName.Contains("glm", StringComparison.OrdinalIgnoreCase);
 }

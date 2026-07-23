@@ -22,6 +22,7 @@ public static class SlashCommandCatalog
         new SlashCommandInfo("/status", "show session id, model, mode, message count"),
         new SlashCommandInfo("/tool-calling", "switch tool-call transport (native | xml)"),
         new SlashCommandInfo("/permissions", "show the current permission rule set"),
+        new SlashCommandInfo("/mcp", "show connected MCP servers and their tool counts"),
         new SlashCommandInfo("/agents", "list available subagent types and their tool sets"),
         new SlashCommandInfo("/clear", "drop conversation history (system prompt kept)"),
         new SlashCommandInfo("/init", "create ZDTLLM.md (project memory file) in the cwd"),

@@ -48,6 +48,11 @@ public sealed record LiteLLMClientOptions
     public double? Temperature { get; init; }
     public double? TopP { get; init; }
     public int? MaxTokens { get; init; }
+    /// <summary>frequency_penalty passthrough — anti-repetition lever. Null = omit. Fixes GLM's
+    /// tendency to repeat tool calls at the source rather than at the app-layer loop detector.</summary>
+    public double? FrequencyPenalty { get; init; }
+    /// <summary>presence_penalty passthrough. Null = omit.</summary>
+    public double? PresencePenalty { get; init; }
     /// <summary>Verbatim extra top-level fields; can never clobber load-bearing keys.</summary>
     public IReadOnlyDictionary<string, JsonElement>? ExtraParams { get; init; }
 }
@@ -71,6 +76,11 @@ public sealed class LiteLLMClient
         _http = http;
         _options = options;
     }
+
+    /// <summary>The client's configured reasoning-effort passthrough (null when unset). Callers use
+    /// this to decide whether a per-turn escalation (think/ultrathink keywords) is meaningful — a
+    /// model with no base reasoning_effort should not be sent one.</summary>
+    public string? ReasoningEffort => _options.ReasoningEffort;
 
     /// <summary>
     /// Calls the LiteLLM proxy's /model/info admin route and parses the response into
@@ -163,12 +173,13 @@ public sealed class LiteLLMClient
         IReadOnlyList<ChatMessage> messages,
         IReadOnlyList<ToolDef>? tools,
         string model,
-        [EnumeratorCancellation] CancellationToken ct = default)
+        [EnumeratorCancellation] CancellationToken ct = default,
+        string? reasoningEffortOverride = null)
     {
         ArgumentNullException.ThrowIfNull(messages);
         ArgumentException.ThrowIfNullOrEmpty(model);
 
-        var bodyJson = SerializeRequest(messages, tools, model);
+        var bodyJson = SerializeRequest(messages, tools, model, reasoningEffortOverride);
         var response = await SendWithRetryAsync(bodyJson, ct).ConfigureAwait(false);
         try
         {
@@ -343,12 +354,14 @@ public sealed class LiteLLMClient
     {
         "model", "messages", "tools", "stream", "stream_options", "drop_params",
         "reasoning_effort", "temperature", "top_p", "max_tokens",
+        "frequency_penalty", "presence_penalty",
     };
 
     private string SerializeRequest(
         IReadOnlyList<ChatMessage> messages,
         IReadOnlyList<ToolDef>? tools,
-        string model)
+        string model,
+        string? reasoningEffortOverride = null)
     {
         var payload = new RequestPayload
         {
@@ -359,10 +372,13 @@ public sealed class LiteLLMClient
             StreamOptions = new RequestStreamOptions(IncludeUsage: true),
             DropParams = false,
             // Nullable — WhenWritingNull drops them, so an unconfigured client is byte-identical.
-            ReasoningEffort = _options.ReasoningEffort,
+            // A per-turn override (think/ultrathink keyword) wins over the configured base.
+            ReasoningEffort = reasoningEffortOverride ?? _options.ReasoningEffort,
             Temperature = _options.Temperature,
             TopP = _options.TopP,
             MaxTokens = _options.MaxTokens,
+            FrequencyPenalty = _options.FrequencyPenalty,
+            PresencePenalty = _options.PresencePenalty,
         };
 
         // Fast path: no extra params → keep the exact historical serialization (and output bytes).
@@ -431,6 +447,8 @@ internal sealed class RequestPayload
     public double? Temperature { get; init; }
     public double? TopP { get; init; }
     public int? MaxTokens { get; init; }
+    public double? FrequencyPenalty { get; init; }
+    public double? PresencePenalty { get; init; }
 }
 
 internal sealed record RequestStreamOptions(bool IncludeUsage);

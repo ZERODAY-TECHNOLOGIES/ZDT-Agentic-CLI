@@ -164,6 +164,29 @@ public sealed class Session : IDisposable
         _store?.Append(new UsageEvent(promptTokens, completionTokens));
     }
 
+    /// <summary>
+    /// One-shot in-memory nudge for the reasoning-only recovery: the model emitted chain-of-thought
+    /// but no visible answer, and we want to ask it to produce one WITHOUT creating a second
+    /// consecutive user turn — strict-alternation chat templates (Qwen / GLM via vLLM) reject that
+    /// with the misleading "System message must be at the beginning". If the last message is already
+    /// a user turn, the nudge is folded into it in memory (not persisted — it is a transient retry
+    /// aid; resume replays the original turn). Otherwise a normal user turn is appended, which is
+    /// valid after an assistant/tool message.
+    /// </summary>
+    public void NudgeAfterReasoningOnly(string nudge)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(nudge);
+        if (_messages.Count > 0 && _messages[^1].Role == "user")
+        {
+            var m = _messages[^1];
+            _messages[^1] = m with { Content = (m.Content ?? string.Empty) + "\n\n" + nudge };
+        }
+        else
+        {
+            AddUser(nudge);
+        }
+    }
+
     public void Rename(string? newName)
     {
         Name = newName;

@@ -44,9 +44,49 @@ public sealed class LiteLLMClientPassthroughTests
         body.Should().NotContain("temperature");
         body.Should().NotContain("top_p");
         body.Should().NotContain("max_tokens");
+        body.Should().NotContain("frequency_penalty");
+        body.Should().NotContain("presence_penalty");
         // Load-bearing shape unchanged.
         body.Should().Contain("\"stream\":true");
         body.Should().Contain("\"drop_params\":false");
+    }
+
+    [Fact]
+    public async Task Penalties_serialize_when_set()
+    {
+        var handler = new StubHandler(Sse("data: [DONE]\n\n"));
+        var opts = new LiteLLMClientOptions
+        {
+            BaseUrl = "http://localhost:4000", ApiKey = "k", MaxRetries = 0,
+            InitialBackoff = TimeSpan.FromMilliseconds(1),
+            FrequencyPenalty = 0.2, PresencePenalty = 0.1,
+        };
+        var body = await BodyOf(Build(handler, opts), handler);
+
+        body.Should().Contain("\"frequency_penalty\":0.2");
+        body.Should().Contain("\"presence_penalty\":0.1");
+    }
+
+    [Fact]
+    public async Task Per_turn_reasoning_override_wins_over_the_configured_base()
+    {
+        var handler = new StubHandler(Sse("data: [DONE]\n\n"));
+        var opts = new LiteLLMClientOptions
+        {
+            BaseUrl = "http://localhost:4000", ApiKey = "k", MaxRetries = 0,
+            InitialBackoff = TimeSpan.FromMilliseconds(1),
+            ReasoningEffort = "high",
+        };
+        var client = Build(handler, opts);
+        client.ReasoningEffort.Should().Be("high"); // property exposes the base for gating
+
+        await foreach (var _ in client.StreamChatAsync(
+            [ChatMessage.User("ultrathink this")], tools: null, "glm-5.2:cloud", default, reasoningEffortOverride: "max"))
+        { }
+
+        var body = handler.RequestBodies.Single();
+        body.Should().Contain("\"reasoning_effort\":\"max\"");
+        body.Should().NotContain("\"reasoning_effort\":\"high\"");
     }
 
     [Fact]

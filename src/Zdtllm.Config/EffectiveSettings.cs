@@ -110,6 +110,12 @@ public sealed record LiteLLMSettings(
     /// <summary>max_tokens (output cap) passthrough. Null = omit (uncapped up to the model's limit,
     /// 128K for GLM-5.2).</summary>
     int? MaxTokens = null,
+    /// <summary>frequency_penalty passthrough (anti-repetition). Null = omit. Opt-in: fixes GLM's
+    /// tendency to repeat tool calls at the source rather than at the app-layer loop detector.
+    /// A light value (~0.1–0.3) is usually enough; do not stack with a heavy repetition_penalty.</summary>
+    double? FrequencyPenalty = null,
+    /// <summary>presence_penalty passthrough. Null = omit.</summary>
+    double? PresencePenalty = null,
     /// <summary>
     /// Generic escape hatch: arbitrary top-level request fields emitted VERBATIM (no snake_case
     /// rename), forwarded under <c>drop_params:false</c>. Absorbs provider-specific param drift
@@ -133,6 +139,8 @@ public sealed record LiteLLMSettings(
         Temperature: null,
         TopP: null,
         MaxTokens: null,
+        FrequencyPenalty: null,
+        PresencePenalty: null,
         ExtraParams: ImmutableDictionary<string, JsonElement>.Empty);
 
     public LiteLLMSettings Merge(LiteLLMSettings higher) => new(
@@ -149,6 +157,8 @@ public sealed record LiteLLMSettings(
         Temperature: higher.Temperature ?? Temperature,
         TopP: higher.TopP ?? TopP,
         MaxTokens: higher.MaxTokens ?? MaxTokens,
+        FrequencyPenalty: higher.FrequencyPenalty ?? FrequencyPenalty,
+        PresencePenalty: higher.PresencePenalty ?? PresencePenalty,
         ExtraParams: EffectiveSettings.MergeOverride(
             ExtraParams ?? ImmutableDictionary<string, JsonElement>.Empty,
             higher.ExtraParams ?? ImmutableDictionary<string, JsonElement>.Empty));

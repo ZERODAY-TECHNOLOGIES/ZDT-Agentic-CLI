@@ -52,7 +52,8 @@ public sealed record AgentLoopOptions
 
         # Response style
         - When your model reasons before answering, think privately — the user sees only your
-          final message, so keep it tight.
+          final message, so keep it tight. Never end a turn with only private reasoning: every turn
+          must produce either a tool call or a visible answer.
         - Be concise and concrete. Skip filler openings ("Great question!", "Sure!"), don't recap
           at length what you just did, and don't echo large unchanged spans of code back.
         - Reference code as path:line so the user can click straight to it. Put commands, code,
@@ -364,6 +365,19 @@ public sealed class AgentLoop
         var ctx = new ToolContext(Cwd: Directory.GetCurrentDirectory(), Model: session.Model);
         int? lastPromptTokens = null;
         int? lastCompletionTokens = null;
+
+        // think / ultrathink: a per-turn escalation of reasoning_effort for the whole turn. Only
+        // meaningful when the model already runs with a reasoning tier — sending reasoning_effort to
+        // a model that doesn't use it risks a 400 — so gate on the client's configured base.
+        var turnReasoningEffort = _client.ReasoningEffort is not null
+            ? DetectThinkingEffortOverride(userPrompt)
+            : null;
+        if (turnReasoningEffort is not null
+            && !string.Equals(turnReasoningEffort, _client.ReasoningEffort, StringComparison.OrdinalIgnoreCase))
+        {
+            await status.WriteLineAsync(Palette.Mute(
+                $"  ↳ thinking harder for this turn (reasoning_effort={turnReasoningEffort})")).ConfigureAwait(false);
+        }
         // Running totals across all iterations of THIS turn — fed to OnResultAsync so the
         // claude-shaped result event can publish summed billed tokens for the whole exchange.
         int totalInputTokens = 0;
@@ -432,7 +446,7 @@ public sealed class AgentLoop
 
                 try
                 {
-                await foreach (var chunk in _client.StreamChatAsync(session.Messages, toolDefList, session.Model, ct).ConfigureAwait(false))
+                await foreach (var chunk in _client.StreamChatAsync(session.Messages, toolDefList, session.Model, ct, turnReasoningEffort).ConfigureAwait(false))
                 {
                     switch (chunk)
                     {
@@ -646,10 +660,12 @@ public sealed class AgentLoop
                         await status.WriteLineAsync(Palette.Mute(
                             "  ↳ model emitted only internal reasoning — nudging it to write a visible answer."))
                             .ConfigureAwait(false);
-                        // Do NOT persist an empty assistant turn (some chat templates reject an
-                        // empty assistant message immediately followed by a user turn). Append a
-                        // synthetic nudge and retry ONE iteration; the flag prevents looping.
-                        session.AddUser(
+                        // Nudge and retry ONE iteration (the flag prevents looping). Fold the nudge
+                        // into the trailing user turn rather than appending a second user message:
+                        // an empty assistant turn OR two consecutive user turns both break strict-
+                        // alternation templates (Qwen/GLM via vLLM) — the very models this recovery
+                        // targets. NudgeAfterReasoningOnly picks the safe shape for the current tail.
+                        session.NudgeAfterReasoningOnly(
                             "You produced only internal reasoning and no visible answer. Write your " +
                             "final answer now, in plain text, without a thinking block.");
                         continue;
@@ -1417,6 +1433,21 @@ public sealed class AgentLoop
         toolName == "Bash" && specifier is not null
             ? _perms.EvaluateBash(specifier)
             : _perms.Evaluate(toolName, specifier);
+
+    /// <summary>
+    /// Detect a per-turn reasoning-escalation keyword in the user's message. "ultrathink" → the
+    /// top tier ("max"); any other "think" / "think hard(er)" / "think more" phrasing → "high".
+    /// Null when no keyword is present. Mirrors claude-code's magic-word convention; the caller only
+    /// applies it when the model already carries a base reasoning_effort. "thinking" does NOT match
+    /// (word-boundary anchored), so casual prose is mostly unaffected.
+    /// </summary>
+    internal static string? DetectThinkingEffortOverride(string? prompt)
+    {
+        if (string.IsNullOrEmpty(prompt)) return null;
+        if (prompt.Contains("ultrathink", StringComparison.OrdinalIgnoreCase)) return "max";
+        if (Regex.IsMatch(prompt, @"\bthink\b", RegexOptions.IgnoreCase)) return "high";
+        return null;
+    }
 
     private enum PermissionPrompt { AllowOnce, AllowAlways, Deny }
 
