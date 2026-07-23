@@ -510,6 +510,20 @@ internal static class Program
         // fresh session. Rendered with the same markdown path the REPL uses (TUI ANSI vs richConsole).
         PrintResumedTranscript(session, replOutput, richConsole, markdownAnsi);
 
+        // Seed ↑/↓ input history with this session's prior user turns so recall works IMMEDIATELY on
+        // a resumed session — without this, history only held messages submitted in the current run,
+        // so ↑ did nothing until you sent something new. Seed whichever driver is active (both are
+        // harmless to seed). Oldest→newest so ↑ walks back from the most recent.
+        var pastUserMessages = session.Messages
+            .Where(m => m.Role == "user" && !string.IsNullOrWhiteSpace(m.Content))
+            .Select(m => m.Content!)
+            .ToList();
+        if (pastUserMessages.Count > 0)
+        {
+            tui?.SeedHistory(pastUserMessages);
+            turnInput?.SeedHistory(pastUserMessages);
+        }
+
         var repl = new Repl(
             session,
             agent,

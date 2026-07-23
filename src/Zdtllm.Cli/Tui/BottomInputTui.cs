@@ -446,6 +446,24 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
         _historyDraft = "";
     }
 
+    /// <summary>
+    /// Pre-load prior submitted messages (oldest→newest, e.g. the user turns from a resumed session)
+    /// so ↑/↓ can recall them immediately — before any new submission this run.
+    /// </summary>
+    public void SeedHistory(IEnumerable<string> pastMessages)
+    {
+        lock (_render)
+        {
+            foreach (var m in pastMessages)
+            {
+                if (string.IsNullOrWhiteSpace(m)) continue;
+                if (_history.Count == 0 || !string.Equals(_history[^1], m, StringComparison.Ordinal))
+                    _history.Add(m);
+            }
+            _historyIndex = -1;
+        }
+    }
+
     private void SubmitOrExit(string? text)
     {
         // Ctrl+D on an empty box → EOF (exit). Otherwise submit the trimmed text.
