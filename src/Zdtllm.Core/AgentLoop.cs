@@ -59,6 +59,14 @@ public sealed class AgentLoop
     private readonly IAgentObserver? _observer;
 
     /// <summary>
+    /// When set (and no rich console is wired), the model's final/narration text is rendered
+    /// through this markdown→ANSI-string renderer and written to the plain output writer as one
+    /// block — instead of streaming raw markdown noise. Used by the bottom-input TUI, whose
+    /// scroll region accepts ANSI text lines but can't host Spectre renderables/spinners.
+    /// </summary>
+    private readonly Func<string, string>? _markdownAnsi;
+
+    /// <summary>
     /// Optional queue of user messages typed while THIS turn is already running (interactive
     /// REPL only). Drained between tool rounds so a queued follow-up is folded into the ongoing
     /// task rather than waiting for the whole turn to finish. Null for print mode, subagents,
@@ -178,7 +186,8 @@ public sealed class AgentLoop
         IAgentObserver? observer = null,
         IUserInputQueue? inputQueue = null,
         IPlanModeSwitch? planMode = null,
-        ITypeAheadStatus? typeAhead = null)
+        ITypeAheadStatus? typeAhead = null,
+        Func<string, string>? markdownAnsi = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(tools);
@@ -194,6 +203,7 @@ public sealed class AgentLoop
         _inputQueue = inputQueue;
         _planMode = planMode;
         _typeAhead = typeAhead;
+        _markdownAnsi = markdownAnsi;
     }
 
     public PermissionRuleSet Permissions => _perms;
@@ -362,8 +372,9 @@ public sealed class AgentLoop
                             await SafeNotifyAsync(_observer?.OnTextDeltaAsync(td.Text, ct)).ConfigureAwait(false);
                             // Rich console suppresses per-delta writes — markdown gets rendered as one block
                             // once the stream completes (or just before tool dispatch). Keeps terminal clean
-                            // while the thinking spinner runs.
-                            if (!xmlMode && _richConsole is null)
+                            // while the thinking spinner runs. Same deal for the markdown-ANSI path (TUI):
+                            // buffered, rendered at completion.
+                            if (!xmlMode && _richConsole is null && _markdownAnsi is null)
                             {
                                 await output.WriteAsync(td.Text.AsMemory(), ct).ConfigureAwait(false);
                                 await output.FlushAsync(ct).ConfigureAwait(false);
@@ -544,6 +555,12 @@ public sealed class AgentLoop
                     _richConsole.Write(MarkdownRenderer.Render(displayText));
                     _richConsole.WriteLine();
                 }
+                else if (_markdownAnsi is not null && displayText.Length > 0)
+                {
+                    // TUI path: text was buffered (deltas suppressed). Render markdown to ANSI
+                    // and hand it to the plain writer (the TUI's scroll region) as one block.
+                    await output.WriteLineAsync(_markdownAnsi(displayText)).ConfigureAwait(false);
+                }
                 else
                 {
                     if (xmlMode && displayText.Length > 0)
@@ -714,6 +731,11 @@ public sealed class AgentLoop
                 _richConsole.Write(MarkdownRenderer.Render(assistantText.ToString()));
                 _richConsole.WriteLine();
             }
+            else if (_markdownAnsi is not null)
+            {
+                // TUI path: narration deltas were suppressed — render the buffered text now.
+                await output.WriteLineAsync(_markdownAnsi(assistantText.ToString())).ConfigureAwait(false);
+            }
             else
             {
                 await output.WriteLineAsync().ConfigureAwait(false);
@@ -754,6 +776,11 @@ public sealed class AgentLoop
             {
                 _richConsole.Write(MarkdownRenderer.Render(cleaned));
                 _richConsole.WriteLine();
+            }
+            else if (_markdownAnsi is not null)
+            {
+                // TUI path: render the XML-mode narration as markdown-ANSI instead of raw text.
+                await output.WriteLineAsync(_markdownAnsi(cleaned)).ConfigureAwait(false);
             }
             else
             {

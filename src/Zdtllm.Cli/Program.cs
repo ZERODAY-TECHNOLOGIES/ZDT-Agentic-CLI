@@ -284,8 +284,13 @@ internal static class Program
         // Print mode pipes stdout through the shell so a spinner/markdown renderer would
         // mangle redirected output. Interactive mode benefits from rich rendering — EXCEPT under
         // the bottom-input TUI, which owns the screen with a scroll region and can't share it with
-        // Spectre's live spinner, so output there streams as plain lines into the scroll region.
+        // Spectre's live spinner. There the model's text is still rendered as markdown — but via
+        // MarkdownRenderer.RenderToAnsi into the scroll-region writer (plain ANSI lines, no
+        // renderables/spinners), so answers don't show up as raw ###/**/` noise.
         var richConsole = (parsed.PrintMode || tuiMode) ? null : AnsiConsole.Console;
+        Func<string, string>? markdownAnsi = tuiMode
+            ? md => Zdtllm.Core.MarkdownRenderer.RenderToAnsi(md, TerminalTextWidth())
+            : null;
 
         // Compose the agent observer based on --output-format / --verbose. stream-json owns
         // stdout in -p mode (delta events go through the observer); aggregating json captures
@@ -317,7 +322,8 @@ internal static class Program
             observer: observer,
             inputQueue: inputQueue,
             planMode: planMode,
-            typeAhead: turnInput);
+            typeAhead: turnInput,
+            markdownAnsi: formatOwnsStdout ? null : markdownAnsi);
 
         // Task tool needs the parent agent to spawn subagents from. Register it AFTER the
         // agent is built — the registry holds a live reference, so the parent agent will see
@@ -766,6 +772,14 @@ internal static class Program
     /// (resume by id), otherwise builds an ephemeral non-persistent session.
     /// Persistent sessions update the recent-tracker so a future -c finds them.
     /// </summary>
+    /// <summary>Wrap width for markdown rendered into the TUI scroll region: current terminal
+    /// width minus a safety column (the TUI clips at cols-1), floored for tiny windows.</summary>
+    private static int TerminalTextWidth()
+    {
+        try { return Math.Max(40, Console.WindowWidth - 2); }
+        catch { return 78; }
+    }
+
     private static string? TryReadMemoryFile(string cwd)
     {
         var path = Path.Combine(cwd, "ZDTLLM.md");

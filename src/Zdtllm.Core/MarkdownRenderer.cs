@@ -36,6 +36,30 @@ public static partial class MarkdownRenderer
     [GeneratedRegex(@"^\s*(-{3,}|\*{3,}|_{3,})\s*$")] private static partial Regex HorizontalRuleRegex();
     [GeneratedRegex(@"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")] private static partial Regex TableSeparatorRegex();
 
+    /// <summary>
+    /// Render markdown to a plain ANSI string (SGR colors, no cursor movement) at the given
+    /// width. For sinks that accept text lines but no Spectre renderables — e.g. the bottom-input
+    /// TUI's scroll-region writer, where the model's final answer should still look like markdown
+    /// instead of raw <c>### / ** / `</c> noise. Blank separator lines are emitted as a single
+    /// space so line-buffered sinks that drop empty lines keep the vertical rhythm.
+    /// </summary>
+    public static string RenderToAnsi(string markdown, int width)
+    {
+        ArgumentNullException.ThrowIfNull(markdown);
+        var sw = new StringWriter();
+        var console = AnsiConsole.Create(new AnsiConsoleSettings
+        {
+            Ansi = AnsiSupport.Yes,
+            ColorSystem = ColorSystemSupport.TrueColor,
+            Interactive = InteractionSupport.No,
+            Out = new AnsiConsoleOutput(sw),
+        });
+        console.Profile.Width = Math.Max(20, width);
+        console.Write(Render(markdown));
+        var lines = sw.ToString().Replace("\r\n", "\n").Split('\n');
+        return string.Join("\n", lines.Select(l => l.Length == 0 ? " " : l));
+    }
+
     public static IRenderable Render(string markdown)
     {
         ArgumentNullException.ThrowIfNull(markdown);
