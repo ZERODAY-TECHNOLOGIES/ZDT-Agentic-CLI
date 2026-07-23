@@ -505,6 +505,11 @@ internal static class Program
         var replInputSource = tui is not null ? (IReplInputSource)tui : richInputSource;
         var replCapture = tui is not null ? (ITurnInputCapture)tui : turnInput;
 
+        // Resumed a session (-c / -r / existing --session-id)? Replay the prior conversation so the
+        // user sees the context they're continuing, before the input box takes over. No-op for a
+        // fresh session. Rendered with the same markdown path the REPL uses (TUI ANSI vs richConsole).
+        PrintResumedTranscript(session, replOutput, richConsole, markdownAnsi);
+
         var repl = new Repl(
             session,
             agent,
@@ -785,6 +790,74 @@ internal static class Program
     /// (resume by id), otherwise builds an ephemeral non-persistent session.
     /// Persistent sessions update the recent-tracker so a future -c finds them.
     /// </summary>
+    /// <summary>
+    /// On resume, replay the prior conversation to the terminal so the user sees the context they're
+    /// continuing. Renders user prompts and assistant messages (as markdown); assistant tool-call
+    /// turns collapse to a one-line "used tools" note and raw tool results are omitted to keep the
+    /// transcript readable. No-op for a fresh session (no user/assistant messages yet).
+    /// </summary>
+    internal static void PrintResumedTranscript(
+        Zdtllm.Core.Sessions.Session session,
+        TextWriter output,
+        Spectre.Console.IAnsiConsole? richConsole,
+        Func<string, string>? markdownAnsi)
+    {
+        var history = session.Messages
+            .Where(m => m.Role is "user" or "assistant")
+            .ToList();
+        if (history.Count == 0) return;
+
+        // Raw ANSI (the transcript goes to a plain TextWriter — the TUI scroll region or stdout).
+        const string reset = "\x1b[0m";
+        const string cyan = "\x1b[38;2;27;234;205m";
+        const string body = "\x1b[38;2;232;237;242m";
+        const string mute = "\x1b[38;2;104;123;137m";
+
+        var userTurns = history.Count(m => m.Role == "user");
+        output.WriteLine();
+        output.WriteLine($"{mute}──── resumed conversation · {userTurns} turn{(userTurns == 1 ? "" : "s")} ────{reset}");
+        output.WriteLine();
+
+        foreach (var m in history)
+        {
+            if (m.Role == "user")
+            {
+                // Prompt marker on the first line; continuation lines indented under it.
+                var text = (m.Content ?? string.Empty).ReplaceLineEndings("\n");
+                output.WriteLine($"{cyan}> {reset}{body}{text.Replace("\n", "\n  ")}{reset}");
+            }
+            else // assistant
+            {
+                if (!string.IsNullOrWhiteSpace(m.Content))
+                {
+                    if (richConsole is not null)
+                    {
+                        richConsole.Write(Zdtllm.Core.MarkdownRenderer.Render(m.Content));
+                        richConsole.WriteLine();
+                    }
+                    else if (markdownAnsi is not null)
+                    {
+                        output.WriteLine(markdownAnsi(m.Content));
+                    }
+                    else
+                    {
+                        output.WriteLine(m.Content);
+                    }
+                }
+                if (!m.ToolCalls.IsDefaultOrEmpty)
+                {
+                    var names = string.Join(", ", m.ToolCalls.Select(t => t.FunctionName).Distinct());
+                    output.WriteLine($"{mute}  ⚙ {names}{reset}");
+                }
+            }
+        }
+
+        output.WriteLine();
+        output.WriteLine($"{mute}──── end of history · continue below ────{reset}");
+        output.WriteLine();
+        output.Flush();
+    }
+
     /// <summary>Wrap width for markdown rendered into the TUI scroll region: current terminal
     /// width minus a safety column (the TUI clips at cols-1), floored for tiny windows.</summary>
     private static int TerminalTextWidth()

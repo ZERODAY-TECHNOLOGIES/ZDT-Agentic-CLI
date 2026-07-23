@@ -45,6 +45,12 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
     private readonly LineEditorState _state = new();
     private int _lastRenderVisibleLen;
 
+    // Submitted-message history for shell-style ↑/↓ recall (mirrors the bottom-input TUI). Single
+    // logical line here, so navigation is unconditional. _historyIndex: -1 = editing a fresh draft.
+    private readonly List<string> _history = new();
+    private int _historyIndex = -1;
+    private string _historyDraft = "";
+
     // Set once the model is resolved (see Program). When true, dropped image files are attached as
     // vision content parts; when false they're inserted as a plain path (the model has no vision).
     public bool VisionCapable { get; set; }
@@ -138,8 +144,10 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
                     // Snapshot image attachments from the buffer NOW (chips backspaced away are
                     // gone) so TakePendingImages() hands the REPL exactly what's still attached.
                     _pendingImages = _state.Images();
+                    var resolved = _state.Resolve();
+                    PushHistory(resolved); // record for ↑/↓ recall
                     Console.Write(Environment.NewLine);
-                    return _state.Resolve();
+                    return resolved;
                 }
                 if (outcome == Outcome.Eof)
                 {
@@ -246,16 +254,15 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
         switch (k.Key)
         {
             case ConsoleKey.Enter: return Outcome.Submit;
-            case ConsoleKey.Backspace: _state.Backspace(); return Outcome.Continue;
-            case ConsoleKey.Delete: _state.Delete(); return Outcome.Continue;
+            case ConsoleKey.Backspace: _state.Backspace(); _historyIndex = -1; return Outcome.Continue;
+            case ConsoleKey.Delete: _state.Delete(); _historyIndex = -1; return Outcome.Continue;
             case ConsoleKey.LeftArrow: _state.MoveLeft(); return Outcome.Continue;
             case ConsoleKey.RightArrow: _state.MoveRight(); return Outcome.Continue;
             case ConsoleKey.Home: _state.Home(); return Outcome.Continue;
             case ConsoleKey.End: _state.End(); return Outcome.Continue;
-            case ConsoleKey.Escape:
-            case ConsoleKey.UpArrow:
-            case ConsoleKey.DownArrow:
-                return Outcome.Continue; // ignored (no history yet)
+            case ConsoleKey.Escape: return Outcome.Continue;
+            case ConsoleKey.UpArrow: HistoryUp(); return Outcome.Continue;
+            case ConsoleKey.DownArrow: HistoryDown(); return Outcome.Continue;
         }
 
         // Typing "/" on an empty prompt opens the slash-command autocomplete picker instead of
@@ -264,8 +271,43 @@ public sealed class ConsoleInput : IReplInputSource, ITurnInputCapture, IInterac
             return Outcome.OpenCommandMenu;
 
         if (k.KeyChar != '\0' && !char.IsControl(k.KeyChar))
+        {
             _state.InsertChar(k.KeyChar);
+            _historyIndex = -1; // typing commits to editing this text, not navigating history
+        }
         return Outcome.Continue;
+    }
+
+    // ↑/↓ submitted-message recall. The current draft is saved when you first step into history and
+    // restored when you step back past the newest entry.
+    private void HistoryUp()
+    {
+        if (_history.Count == 0) return;
+        if (_historyIndex == -1) { _historyDraft = _state.Resolve(); _historyIndex = _history.Count; }
+        if (_historyIndex > 0) { _historyIndex--; ReplaceState(_history[_historyIndex]); }
+    }
+
+    private void HistoryDown()
+    {
+        if (_historyIndex == -1) return;
+        _historyIndex++;
+        if (_historyIndex >= _history.Count) { _historyIndex = -1; ReplaceState(_historyDraft); }
+        else ReplaceState(_history[_historyIndex]);
+    }
+
+    private void ReplaceState(string text)
+    {
+        _state.Clear();
+        _state.InsertText(text);
+    }
+
+    private void PushHistory(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return;
+        if (_history.Count == 0 || !string.Equals(_history[^1], text, StringComparison.Ordinal))
+            _history.Add(text);
+        _historyIndex = -1;
+        _historyDraft = "";
     }
 
     // ================= slash-command autocomplete =================

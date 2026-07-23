@@ -65,6 +65,12 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     private readonly SemaphoreSlim _readerGate = new(1, 1); // held by the key reader; a prompt takes it to pause reading
 
     private volatile bool _openSlashPicker; // set by HandleKey ("/"), serviced by the reader loop
+    // Submitted-message history for shell-style ↑/↓ recall (all mutated under _render, like _editor).
+    // _historyIndex: -1 = editing a fresh draft; otherwise an index into _history. _historyDraft holds
+    // the in-progress text saved the moment recall began, so ↓ past the newest entry restores it.
+    private readonly List<string> _history = new();
+    private int _historyIndex = -1;
+    private string _historyDraft = "";
     private TaskCompletionSource<string?>? _pendingRead;
     private long _thinkingStartTicks; // 0 = idle; otherwise Stopwatch ticks at turn start
     private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
@@ -176,7 +182,7 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
                     foreach (var k in batch)
                         if (k.Key == ConsoleKey.Enter) sb.Append('\n');
                         else if (!char.IsControl(k.KeyChar)) sb.Append(k.KeyChar);
-                    lock (_render) _editor.InsertText(sb.ToString());
+                    lock (_render) { _editor.InsertText(sb.ToString()); _historyIndex = -1; }
                     handled = true;
                 }
 
@@ -364,22 +370,23 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
         {
             case ConsoleKey.Enter:
                 // Alt+Enter (or a trailing backslash) inserts a newline; a plain Enter submits.
-                if ((k.Modifiers & ConsoleModifiers.Alt) != 0) { _editor.Newline(); return; }
+                if ((k.Modifiers & ConsoleModifiers.Alt) != 0) { _editor.Newline(); _historyIndex = -1; return; }
                 var text = _editor.Text;
                 if (text.EndsWith("\\", StringComparison.Ordinal))
                 {
                     _editor.Backspace();     // drop the trailing backslash
                     _editor.Newline();
+                    _historyIndex = -1;
                     return;
                 }
                 SubmitOrExit(text);
                 return;
-            case ConsoleKey.Backspace: _editor.Backspace(); return;
-            case ConsoleKey.Delete: _editor.Delete(); return;
+            case ConsoleKey.Backspace: _editor.Backspace(); _historyIndex = -1; return;
+            case ConsoleKey.Delete: _editor.Delete(); _historyIndex = -1; return;
             case ConsoleKey.LeftArrow: _editor.Left(); return;
             case ConsoleKey.RightArrow: _editor.Right(); return;
-            case ConsoleKey.UpArrow: _editor.Up(); return;
-            case ConsoleKey.DownArrow: _editor.Down(); return;
+            case ConsoleKey.UpArrow: HistoryUp(); return;
+            case ConsoleKey.DownArrow: HistoryDown(); return;
             case ConsoleKey.Home: _editor.Home(); return;
             case ConsoleKey.End: _editor.End(); return;
             case ConsoleKey.Escape: return;
@@ -395,7 +402,48 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
         }
 
         if (k.KeyChar != '\0' && !char.IsControl(k.KeyChar))
+        {
             _editor.InsertChar(k.KeyChar);
+            _historyIndex = -1; // typing commits to editing this text, not navigating history
+        }
+    }
+
+    // ↑: inside a multi-line buffer, move up a line; on the FIRST line, recall the previous submitted
+    // message (shell / claude-code style). The current draft is saved the first time you step in.
+    // Holds _render (called from HandleKey under the lock).
+    private void HistoryUp()
+    {
+        if (_editor.CursorRow > 0) { _editor.Up(); return; }
+        if (_history.Count == 0) return;
+        if (_historyIndex == -1) { _historyDraft = _editor.Text; _historyIndex = _history.Count; }
+        if (_historyIndex > 0) { _historyIndex--; ReplaceEditorText(_history[_historyIndex]); }
+    }
+
+    // ↓: inside a multi-line buffer, move down a line; on the LAST line, walk forward through history
+    // and finally back to the draft you were composing. Holds _render.
+    private void HistoryDown()
+    {
+        if (_editor.CursorRow < _editor.LineCount - 1) { _editor.Down(); return; }
+        if (_historyIndex == -1) return;
+        _historyIndex++;
+        if (_historyIndex >= _history.Count) { _historyIndex = -1; ReplaceEditorText(_historyDraft); }
+        else ReplaceEditorText(_history[_historyIndex]);
+    }
+
+    // Holds _render.
+    private void ReplaceEditorText(string text)
+    {
+        _editor.Clear();
+        _editor.InsertText(text); // cursor lands at the end
+    }
+
+    // Holds _render. Record a just-submitted message for ↑/↓ recall (drop consecutive duplicates).
+    private void PushHistory(string text)
+    {
+        if (_history.Count == 0 || !string.Equals(_history[^1], text, StringComparison.Ordinal))
+            _history.Add(text);
+        _historyIndex = -1;
+        _historyDraft = "";
     }
 
     private void SubmitOrExit(string? text)
@@ -411,6 +459,8 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
         var trimmed = text.Trim();
         _editor.Clear();
         if (trimmed.Length == 0) { RedrawBox(); return; }
+
+        PushHistory(trimmed); // record for ↑/↓ recall (both idle-start and queued submissions)
 
         var pending = _pendingRead;
         if (pending is not null && pending.TrySetResult(trimmed))
