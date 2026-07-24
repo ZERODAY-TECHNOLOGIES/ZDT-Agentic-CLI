@@ -10,9 +10,29 @@ public sealed class GrepTool : ITool
 {
     private const int DefaultHeadLimit = 250;
 
+    // Build-output / VCS / IDE directories that ripgrep would skip via .gitignore. Scanning them
+    // buries real hits under compiled artefacts and thrashes I/O; prune them during enumeration.
+    private static readonly HashSet<string> IgnoredDirs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".git", ".hg", ".svn", "node_modules", "bin", "obj", ".vs", ".idea", ".vscode", "dist",
+    };
+
+    // Common ripgrep --type aliases → globs. Only the frequent ones; unknown types fall back to
+    // "scan everything" so the tool never errors on an unmapped alias.
+    private static readonly Dictionary<string, string[]> TypeGlobs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["cs"] = ["*.cs"], ["py"] = ["*.py"], ["js"] = ["*.js", "*.mjs", "*.cjs", "*.jsx"],
+        ["ts"] = ["*.ts", "*.tsx"], ["rust"] = ["*.rs"], ["go"] = ["*.go"], ["java"] = ["*.java"],
+        ["c"] = ["*.c", "*.h"], ["cpp"] = ["*.cpp", "*.hpp", "*.cc", "*.cxx", "*.hxx"],
+        ["json"] = ["*.json"], ["yaml"] = ["*.yaml", "*.yml"], ["md"] = ["*.md", "*.markdown"],
+        ["html"] = ["*.html", "*.htm"], ["css"] = ["*.css", "*.scss"], ["sh"] = ["*.sh", "*.bash"],
+        ["rb"] = ["*.rb"], ["php"] = ["*.php"], ["xml"] = ["*.xml"], ["sql"] = ["*.sql"],
+        ["toml"] = ["*.toml"], ["ps"] = ["*.ps1", "*.psm1"],
+    };
+
     public ToolSchema Schema { get; } = new(
         Name: "Grep",
-        Description: "Search file contents for a regex. Default output is the list of matching files (\"files_with_matches\"); set output_mode to \"content\" to see matching lines or \"count\" to see per-file match counts. Pattern is .NET regex syntax.",
+        Description: "Search file contents for a regex (.NET syntax). Skips .git/bin/obj/node_modules and binary files. Default output is matching file paths (\"files_with_matches\"); set output_mode to \"content\" for matching lines (with optional -A/-B/-C context) or \"count\" for per-file counts.",
         Parameters: JsonSerializer.SerializeToElement(new Dictionary<string, object>
         {
             ["type"] = "object",
@@ -21,10 +41,15 @@ public sealed class GrepTool : ITool
                 ["pattern"] = new { type = "string", description = ".NET regex pattern." },
                 ["path"] = new { type = "string", description = "Directory or file to search (default: current working directory)." },
                 ["glob"] = new { type = "string", description = "Optional file glob (e.g. \"*.cs\") that restricts which files are scanned." },
+                ["type"] = new { type = "string", description = "Optional file-type alias (cs, py, js, ts, rust, go, java, json, yaml, md, …). Ignored if 'glob' is set." },
                 ["output_mode"] = new { type = "string", description = "files_with_matches (default) | content | count." },
                 ["head_limit"] = new { type = "integer", description = "Max number of result lines (default 250)." },
+                ["multiline"] = new { type = "boolean", description = "Match across line boundaries ('.' matches newlines); reports each match's start line." },
                 ["-i"] = new { type = "boolean", description = "Case-insensitive match." },
                 ["-n"] = new { type = "boolean", description = "In content mode, prefix each line with its 1-based line number." },
+                ["-A"] = new { type = "integer", description = "content mode: lines of context to show AFTER each match." },
+                ["-B"] = new { type = "integer", description = "content mode: lines of context to show BEFORE each match." },
+                ["-C"] = new { type = "integer", description = "content mode: lines of context to show before AND after (overrides -A/-B when larger)." },
             },
             ["required"] = new[] { "pattern" },
         }));
@@ -48,18 +73,25 @@ public sealed class GrepTool : ITool
             : Path.GetFullPath(Path.Combine(ctx.Cwd, searchPath));
 
         var glob = args.TryGetProperty("glob", out var g) && g.ValueKind == JsonValueKind.String ? g.GetString() : null;
+        var typeAlias = args.TryGetProperty("type", out var ty) && ty.ValueKind == JsonValueKind.String ? ty.GetString() : null;
         var outputMode = (args.TryGetProperty("output_mode", out var om) && om.ValueKind == JsonValueKind.String
             ? om.GetString()!
             : "files_with_matches").ToLowerInvariant();
         var caseInsensitive = TryGetBool(args, "-i");
         var lineNumbers = TryGetBool(args, "-n");
+        var multiline = TryGetBool(args, "multiline");
         var headLimit = TryGetInt(args, "head_limit", DefaultHeadLimit);
+
+        var ctxC = TryGetInt(args, "-C", 0);
+        var after = Math.Max(ctxC, TryGetInt(args, "-A", 0));
+        var before = Math.Max(ctxC, TryGetInt(args, "-B", 0));
 
         Regex regex;
         try
         {
             var opts = RegexOptions.Compiled | RegexOptions.CultureInvariant;
             if (caseInsensitive) opts |= RegexOptions.IgnoreCase;
+            if (multiline) opts |= RegexOptions.Singleline; // '.' matches '\n' so a pattern can span lines
             regex = new Regex(pattern, opts);
         }
         catch (ArgumentException ex)
@@ -72,16 +104,24 @@ public sealed class GrepTool : ITool
         if (Directory.Exists(fullPath))
         {
             searchRoot = fullPath;
-            if (glob is not null)
+            var includes = glob is not null ? [glob]
+                : typeAlias is not null && TypeGlobs.TryGetValue(typeAlias, out var tg) ? tg
+                : null;
+
+            if (includes is not null)
             {
                 var matcher = new Matcher(StringComparison.Ordinal);
-                matcher.AddInclude(glob);
+                foreach (var inc in includes) matcher.AddInclude(inc);
                 var result = matcher.Execute(new DirectoryInfoWrapper(new DirectoryInfo(fullPath)));
-                files = result.Files.Select(f => Path.Combine(fullPath, f.Path));
+                // Matcher walks the whole tree — drop hits under an ignored dir so bin/obj/node_modules
+                // don't sneak back in via a glob/type filter.
+                files = result.Files
+                    .Where(f => !IsUnderIgnoredDir(f.Path))
+                    .Select(f => Path.Combine(fullPath, f.Path));
             }
             else
             {
-                files = Directory.EnumerateFiles(fullPath, "*", SearchOption.AllDirectories);
+                files = EnumerateFilesSkippingIgnored(fullPath);
             }
         }
         else if (File.Exists(fullPath))
@@ -95,47 +135,153 @@ public sealed class GrepTool : ITool
         }
 
         var perFileCounts = new Dictionary<string, int>();
-        var contentLines = new List<string>();
+        var contentBlocks = new List<string>();
+        var emittedContentLines = 0;
 
         foreach (var file in files)
         {
             if (ct.IsCancellationRequested) break;
 
-            int fileMatches = 0;
-            string[] lines;
-            try { lines = File.ReadAllLines(file); }
+            string text;
+            try
+            {
+                if (IsProbablyBinary(file)) continue;
+                text = File.ReadAllText(file);
+            }
             catch (IOException) { continue; }
             catch (UnauthorizedAccessException) { continue; }
 
-            for (var i = 0; i < lines.Length; i++)
-            {
-                if (!regex.IsMatch(lines[i])) continue;
+            var rel = Path.GetRelativePath(searchRoot, file);
 
-                fileMatches++;
+            if (multiline)
+            {
+                var matches = regex.Matches(text);
+                if (matches.Count == 0) continue;
+                perFileCounts[file] = matches.Count;
                 if (outputMode == "content")
                 {
-                    var rel = Path.GetRelativePath(searchRoot, file);
-                    contentLines.Add(lineNumbers
-                        ? $"{rel}:{i + 1}:{lines[i]}"
-                        : $"{rel}:{lines[i]}");
-                    if (headLimit > 0 && contentLines.Count >= headLimit) break;
+                    foreach (Match m in matches)
+                    {
+                        var startLine = 1 + CountNewlines(text, m.Index);
+                        var snippet = m.Value.Replace("\r", "").Replace('\n', '⏎');
+                        if (snippet.Length > 200) snippet = snippet[..200] + "…";
+                        contentBlocks.Add(lineNumbers ? $"{rel}:{startLine}:{snippet}" : $"{rel}:{snippet}");
+                        if (++emittedContentLines >= headLimit && headLimit > 0) break;
+                    }
+                }
+            }
+            else
+            {
+                var lines = SplitLines(text);
+                var matchLineIdx = new List<int>();
+                for (var i = 0; i < lines.Length; i++)
+                    if (regex.IsMatch(lines[i])) matchLineIdx.Add(i);
+
+                if (matchLineIdx.Count == 0) continue;
+                perFileCounts[file] = matchLineIdx.Count;
+
+                if (outputMode == "content")
+                {
+                    var block = FormatContextBlock(rel, lines, matchLineIdx, before, after, lineNumbers);
+                    contentBlocks.Add(block);
+                    emittedContentLines += block.Count(ch => ch == '\n') + 1;
                 }
             }
 
-            if (fileMatches > 0) perFileCounts[file] = fileMatches;
-
             if (outputMode == "files_with_matches" && headLimit > 0 && perFileCounts.Count >= headLimit) break;
-            if (outputMode == "content" && headLimit > 0 && contentLines.Count >= headLimit) break;
+            if (outputMode == "content" && headLimit > 0 && emittedContentLines >= headLimit) break;
         }
 
-        var output = FormatOutput(outputMode, perFileCounts, contentLines, searchRoot);
+        var output = FormatOutput(outputMode, perFileCounts, contentBlocks, searchRoot);
         return Task.FromResult(ToolResult.Success(output));
+    }
+
+    /// <summary>Emit a match's lines plus before/after context, ripgrep-style, merging overlapping
+    /// windows and separating disjoint groups with "--".</summary>
+    private static string FormatContextBlock(
+        string rel, string[] lines, List<int> matchIdx, int before, int after, bool lineNumbers)
+    {
+        var show = new SortedSet<int>();
+        foreach (var m in matchIdx)
+            for (var i = Math.Max(0, m - before); i <= Math.Min(lines.Length - 1, m + after); i++)
+                show.Add(i);
+
+        var sb = new StringBuilder();
+        int? prev = null;
+        foreach (var i in show)
+        {
+            if (prev is int pv && i > pv + 1) sb.AppendLine("--");
+            sb.AppendLine(lineNumbers ? $"{rel}:{i + 1}:{lines[i]}" : $"{rel}:{lines[i]}");
+            prev = i;
+        }
+        return sb.ToString().TrimEnd('\n', '\r');
+    }
+
+    private static IEnumerable<string> EnumerateFilesSkippingIgnored(string root)
+    {
+        var stack = new Stack<string>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            var dir = stack.Pop();
+            string[] subDirs;
+            try { subDirs = Directory.GetDirectories(dir); }
+            catch (IOException) { subDirs = []; }
+            catch (UnauthorizedAccessException) { subDirs = []; }
+
+            foreach (var sub in subDirs)
+            {
+                var name = Path.GetFileName(sub);
+                if (IgnoredDirs.Contains(name)) continue;
+                stack.Push(sub);
+            }
+
+            string[] filesInDir;
+            try { filesInDir = Directory.GetFiles(dir); }
+            catch (IOException) { continue; }
+            catch (UnauthorizedAccessException) { continue; }
+
+            foreach (var f in filesInDir) yield return f;
+        }
+    }
+
+    private static bool IsUnderIgnoredDir(string relativePath)
+    {
+        foreach (var seg in relativePath.Split('/', '\\'))
+            if (IgnoredDirs.Contains(seg)) return true;
+        return false;
+    }
+
+    /// <summary>Cheap binary sniff: a NUL byte in the first 8 KiB means "not text" — skip it so a
+    /// regex doesn't scan (and dump) a compiled artefact that slipped past the dir filter.</summary>
+    private static bool IsProbablyBinary(string file)
+    {
+        try
+        {
+            using var fs = File.OpenRead(file);
+            Span<byte> buf = stackalloc byte[8192];
+            var read = fs.Read(buf);
+            for (var i = 0; i < read; i++)
+                if (buf[i] == 0) return true;
+            return false;
+        }
+        catch { return true; } // unreadable → treat as skippable
+    }
+
+    private static string[] SplitLines(string text) => text.Split('\n').Select(l => l.TrimEnd('\r')).ToArray();
+
+    private static int CountNewlines(string text, int uptoIndex)
+    {
+        var n = 0;
+        for (var i = 0; i < uptoIndex && i < text.Length; i++)
+            if (text[i] == '\n') n++;
+        return n;
     }
 
     private static string FormatOutput(
         string mode,
         Dictionary<string, int> perFileCounts,
-        List<string> contentLines,
+        List<string> contentBlocks,
         string searchRoot)
     {
         if (mode == "count")
@@ -149,8 +295,8 @@ public sealed class GrepTool : ITool
 
         if (mode == "content")
         {
-            if (contentLines.Count == 0) return "(no matches)";
-            return string.Join('\n', contentLines);
+            if (contentBlocks.Count == 0) return "(no matches)";
+            return string.Join('\n', contentBlocks);
         }
 
         // default: files_with_matches

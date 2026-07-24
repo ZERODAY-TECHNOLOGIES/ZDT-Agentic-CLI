@@ -1136,38 +1136,60 @@ internal static class Program
         LiteLLMClient client,
         string resolvedModel)
     {
-        int? window = null;
+        int? settingsWindow = null;
 
         var alias = parsed.Model ?? settings.Model;
         if (!string.IsNullOrEmpty(alias)
             && settings.LiteLLM.ContextWindows.TryGetValue(alias, out var fromSettings)
             && fromSettings > 0)
         {
-            window = fromSettings;
+            settingsWindow = fromSettings;
         }
 
-        if (window is null)
+        // Ask the proxy what it actually serves. Best-effort (10 s timeout, [] on failure).
+        int? servedWindow = null;
+        var modelInfos = await client.GetModelInfoAsync().ConfigureAwait(false);
+        var match = modelInfos.FirstOrDefault(m =>
+            string.Equals(m.ModelName, resolvedModel, StringComparison.Ordinal));
+        if (match?.EffectiveContextWindow is int apiWindow && apiWindow > 0)
+            servedWindow = apiWindow;
+
+        int window;
+        if (settingsWindow is int sw)
         {
-            var modelInfos = await client.GetModelInfoAsync().ConfigureAwait(false);
-            var match = modelInfos.FirstOrDefault(m =>
-                string.Equals(m.ModelName, resolvedModel, StringComparison.Ordinal));
-            if (match?.EffectiveContextWindow is int apiWindow && apiWindow > 0)
-                window = apiWindow;
+            window = sw;
+            // Clamp + warn when the configured window materially exceeds what the route serves.
+            // Common failure: contextWindows=900000 on a hosted GLM/vLLM route that only serves
+            // ~131k — thresholds compute off 900k so auto-compaction fires at ~810k while the proxy
+            // already 400s near 131k, effectively disabling compaction. Clamp to the served size.
+            if (servedWindow is int served && sw > served + served / 10)
+            {
+                await Console.Error.WriteLineAsync(
+                    $"zdt: litellm.contextWindows for '{resolvedModel}' is {sw:N0} but the route serves only " +
+                    $"~{served:N0} (max_input_tokens); clamping to {served:N0} so auto-compaction fires before " +
+                    "the proxy rejects the request. Set contextWindows to the served size to silence this.")
+                    .ConfigureAwait(false);
+                window = served;
+            }
         }
-
-        // Default to 200k when neither settings nor /model/info provide a value. Reasoning:
-        // most modern frontier-class models ship with 128k+ contexts (Claude/GPT-4/Qwen3/etc),
-        // so 200k is a safe upper bound that keeps ContextManager active by default. Users with
-        // smaller-window deployments (e.g. vLLM with --max-model-len 16384) MUST set
-        // litellm.contextWindows.<alias> in settings.json — otherwise auto-compact won't fire
-        // before LiteLLM rejects the request with a 400.
-        window ??= 200_000;
+        else if (servedWindow is int served2)
+        {
+            window = served2;
+        }
+        else
+        {
+            // Default to 200k when neither settings nor /model/info provide a value. Most modern
+            // frontier-class models ship 128k+ contexts, so 200k keeps ContextManager active by
+            // default. Smaller-window deployments (vLLM --max-model-len 16384) MUST set
+            // litellm.contextWindows.<alias> — otherwise auto-compact won't fire before a 400.
+            window = 200_000;
+        }
 
         var mediumName = settings.LiteLLM.Models.TryGetValue("medium", out var m) && !string.IsNullOrEmpty(m)
             ? m
             : resolvedModel;
 
-        return new ContextManager(window.Value, mediumName);
+        return new ContextManager(window, mediumName);
     }
 
     private static async Task<EffectiveSettings?> MaybeRunWizardAsync(

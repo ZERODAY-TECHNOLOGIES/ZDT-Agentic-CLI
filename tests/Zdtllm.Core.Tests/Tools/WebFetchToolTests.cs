@@ -74,4 +74,36 @@ public sealed class WebFetchToolTests
 
         tool.GetSpecifierForPermissions(doc.RootElement).Should().Be("https://example.com/x");
     }
+
+    [Fact]
+    public async Task Html_is_reduced_to_readable_text()
+    {
+        const string html =
+            "<!doctype html><html><head><title>T</title><style>.a{color:red}</style></head>" +
+            "<body><h1>Heading</h1><p>First para.</p>" +
+            "<script>alert('x');</script><p>Second &amp; last.</p></body></html>";
+        var handler = new StubHandler(Ok(html, "text/html"));
+
+        var result = await FetchAsync(handler, "https://example.com/page");
+
+        result.Content.Should().Contain("Heading");
+        result.Content.Should().Contain("First para.");
+        result.Content.Should().Contain("Second & last."); // entity decoded
+        result.Content.Should().NotContain("<p>");
+        result.Content.Should().NotContain("alert(");        // script body dropped
+        result.Content.Should().NotContain("color:red");     // style body dropped
+    }
+
+    [Fact]
+    public void HtmlToText_strips_tags_scripts_and_decodes_entities()
+    {
+        var text = WebFetchTool.HtmlToText(
+            "<div>Hello<script>evil()</script> &lt;there&gt;</div><br><span>world</span>");
+
+        text.Should().Contain("Hello");
+        text.Should().Contain("<there>");
+        text.Should().Contain("world");
+        text.Should().NotContain("evil()");
+        text.Should().NotContain("<div>");
+    }
 }

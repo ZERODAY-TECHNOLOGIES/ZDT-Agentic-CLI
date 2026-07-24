@@ -133,4 +133,73 @@ public sealed class GrepToolTests : IDisposable
         using var doc = JsonDocument.Parse("""{"pattern":"TODO"}""");
         tool.GetSpecifierForPermissions(doc.RootElement).Should().Be("TODO");
     }
+
+    [Fact]
+    public async Task Skips_build_and_vcs_directories()
+    {
+        WriteFile("src/a.cs", "needle here\n");
+        WriteFile("bin/generated.cs", "needle here\n");
+        WriteFile("obj/Debug/gen.cs", "needle here\n");
+        WriteFile(".git/config", "needle here\n");
+        WriteFile("node_modules/pkg/index.js", "needle here\n");
+
+        var result = await GrepAsync(new() { ["pattern"] = "needle" });
+
+        result.Content.Should().Contain(Path.Combine("src", "a.cs"));
+        result.Content.Should().NotContain("bin");
+        result.Content.Should().NotContain("obj");
+        result.Content.Should().NotContain(".git");
+        result.Content.Should().NotContain("node_modules");
+    }
+
+    [Fact]
+    public async Task Skips_binary_files()
+    {
+        WriteFile("readme.txt", "plain needle text\n");
+        File.WriteAllBytes(Path.Combine(_tempDir, "blob.bin"), new byte[] { 0x6E, 0x00, 0x65, 0x65 }); // has NUL
+
+        var result = await GrepAsync(new() { ["pattern"] = "needle|nee" });
+
+        result.Content.Should().Contain("readme.txt");
+        result.Content.Should().NotContain("blob.bin");
+    }
+
+    [Fact]
+    public async Task Context_C_includes_surrounding_lines()
+    {
+        WriteFile("a.txt", "line1\nline2\nMATCH\nline4\nline5\n");
+
+        var result = await GrepAsync(new() { ["pattern"] = "MATCH", ["output_mode"] = "content", ["-C"] = 1 });
+
+        result.Content.Should().Contain("line2");
+        result.Content.Should().Contain("MATCH");
+        result.Content.Should().Contain("line4");
+        result.Content.Should().NotContain("line1");
+        result.Content.Should().NotContain("line5");
+    }
+
+    [Fact]
+    public async Task Type_alias_restricts_files_scanned()
+    {
+        WriteFile("a.cs", "needle\n");
+        WriteFile("b.py", "needle\n");
+
+        var result = await GrepAsync(new() { ["pattern"] = "needle", ["type"] = "cs" });
+
+        result.Content.Should().Contain("a.cs");
+        result.Content.Should().NotContain("b.py");
+    }
+
+    [Fact]
+    public async Task Multiline_matches_across_line_boundaries()
+    {
+        WriteFile("a.txt", "start\nfoo\nbar\nend\n");
+
+        // Without multiline this pattern can't match (spans lines); with it, it does.
+        var flat = await GrepAsync(new() { ["pattern"] = "foo.bar" });
+        flat.Content.Should().Be("(no matches)");
+
+        var ml = await GrepAsync(new() { ["pattern"] = "foo.bar", ["multiline"] = true });
+        ml.Content.Should().Contain("a.txt");
+    }
 }

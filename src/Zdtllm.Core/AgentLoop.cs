@@ -391,6 +391,8 @@ public sealed class AgentLoop
         // reasoning, we nudge the model to write a visible answer and retry. The flag (outside the
         // loop) stops that recovery from looping. See the no-calls block below.
         bool reasoningOnlyRecoveryTried = false;
+        // Native-mode XML-salvage warning is emitted at most once per run (see the salvage block).
+        bool nativeSalvageWarned = false;
 
         try
         {
@@ -562,6 +564,29 @@ public sealed class AgentLoop
             IReadOnlyList<ParsedXmlToolCall> xmlCalls = nativeCalls.Length == 0 && xmlMode
                 ? XmlToolCallParser.ExtractCalls(assistantText.ToString())
                 : [];
+
+            // Native-mode salvage: on a raw-passthrough LiteLLM route with no server-side GLM tool
+            // parser, GLM emits <tool_call>/<function_calls> markup in delta.content instead of
+            // JSON tool_calls. Without this the markup is rendered as the final answer while the
+            // task stalls silently. When native mode produced no calls but the content carries
+            // parseable tool-call markup, dispatch it via the XML round and warn once.
+            if (nativeCalls.Length == 0 && !xmlMode && xmlCalls.Count == 0)
+            {
+                var salvaged = XmlToolCallParser.ExtractCalls(assistantText.ToString());
+                if (salvaged.Count > 0)
+                {
+                    xmlCalls = salvaged;
+                    if (!nativeSalvageWarned)
+                    {
+                        nativeSalvageWarned = true;
+                        await status.WriteLineAsync(Palette.Red("  ⚠ native-mode salvage:") + " " + Palette.Mute(
+                            "the model emitted tool-call markup in its content, not as native tool_calls — " +
+                            "your LiteLLM route likely lacks a server-side tool parser (vLLM --tool-call-parser " +
+                            "glm45/glm47) or should run with --tool-calling xml. Dispatching the salvaged calls."))
+                            .ConfigureAwait(false);
+                    }
+                }
+            }
 
             // Format-breakdown detection: model produced XML-shaped markup but the strict
             // parser found 0 calls and the recovery path also failed. Almost always means an
