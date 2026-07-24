@@ -182,6 +182,17 @@ internal static class Program
             ? Array.Empty<SkillDefinition>()
             : new SkillsLoader().Discover(cwd);
 
+        // User-defined slash commands from .zdtllm/commands/*.md. Merged into the picker catalog (so
+        // both drivers advertise them) and handed to the REPL, which expands + runs them as turns.
+        var customCommands = parsed.Bare
+            ? (IReadOnlyList<Zdtllm.Core.Commands.CustomCommand>)Array.Empty<Zdtllm.Core.Commands.CustomCommand>()
+            : new Zdtllm.Core.Commands.CommandLoader().Discover(cwd);
+        var slashCatalog = customCommands.Count == 0
+            ? SlashCommandCatalog.All
+            : SlashCommandCatalog.All
+                .Concat(customCommands.Select(c => new SlashCommandInfo("/" + c.Name, c.Description)))
+                .ToList();
+
         var memoryFile = TryReadMemoryFile(cwd);
 
         // Interactive-only input plumbing: the message queue (type while the model works) and the
@@ -197,7 +208,7 @@ internal static class Program
         if (interactive) TerminalStatus.Enable();
         UserInputQueue? inputQueue = interactive ? new UserInputQueue() : null;
         ConsoleInput? turnInput = interactive
-            ? new ConsoleInput(inputQueue!, AnsiConsole.Console, SlashCommandCatalog.All)
+            ? new ConsoleInput(inputQueue!, AnsiConsole.Console, slashCatalog)
             : null;
         // The rich line editor (multi-line paste, drag & drop, in-line editing) needs an ANSI
         // terminal and can be turned off with ZDT_BASIC_INPUT for anyone whose terminal misbehaves.
@@ -236,7 +247,7 @@ internal static class Program
             && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ZDT_NO_TUI"));
         BottomInputTui? tui = tuiMode
             ? new BottomInputTui(inputQueue!, AnsiConsole.Console, parsed.DangerouslySkipPermissions,
-                SlashCommandCatalog.All, planMode)
+                slashCatalog, planMode)
             : null;
 
         var registry = new ToolRegistry();
@@ -580,7 +591,8 @@ internal static class Program
             planMode: planMode,
             richInput: replInputSource,
             mcpStatus: () => BuildMcpStatusText(mcpManager),
-            configDump: () => BuildConfigDump(settings));
+            configDump: () => BuildConfigDump(settings),
+            customCommands: customCommands);
 
         // Ctrl+C behaviour, matching claude-cli:
         //   • During a turn  → first press interrupts the turn (keeps the REPL alive) and clears

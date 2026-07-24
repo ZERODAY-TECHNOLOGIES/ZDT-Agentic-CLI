@@ -37,6 +37,9 @@ public sealed class Repl
     /// <summary>Renders the effective settings (secrets redacted) for <c>/config</c>. Supplied by the
     /// CLI, which owns the settings object. Null → /config reports it's unavailable.</summary>
     private readonly Func<string>? _configDump;
+    /// <summary>User-defined slash commands from <c>.zdtllm/commands/*.md</c>, keyed by name (no
+    /// leading slash). Invoking one expands its body and runs it as a turn.</summary>
+    private readonly IReadOnlyDictionary<string, Commands.CustomCommand> _customCommands;
     private IReplInputSource? _richInput;
     private CancellationTokenSource? _currentTurnCts;
 
@@ -55,7 +58,8 @@ public sealed class Repl
         IPlanModeSwitch? planMode = null,
         IReplInputSource? richInput = null,
         Func<string>? mcpStatus = null,
-        Func<string>? configDump = null)
+        Func<string>? configDump = null,
+        IReadOnlyList<Commands.CustomCommand>? customCommands = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(agent);
@@ -78,6 +82,8 @@ public sealed class Repl
         _planMode = planMode;
         _mcpStatus = mcpStatus;
         _configDump = configDump;
+        _customCommands = (customCommands ?? Array.Empty<Commands.CustomCommand>())
+            .ToDictionary(c => c.Name, StringComparer.Ordinal);
         _richInput = richInput;
     }
 
@@ -128,7 +134,16 @@ public sealed class Repl
 
                 if (trimmed.StartsWith('/'))
                 {
-                    _richInput?.TakePendingImages(); // a slash command carries no attachment
+                    // A user-defined command from .zdtllm/commands/<name>.md expands to a prompt and
+                    // runs as a turn (it may carry attached images, unlike a built-in slash command).
+                    if (TryExpandCustomCommand(trimmed, out var expanded))
+                    {
+                        var cmdImages = _richInput?.TakePendingImages();
+                        await RunTurnAndFollowupsAsync(expanded, ct, cmdImages).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    _richInput?.TakePendingImages(); // a built-in slash command carries no attachment
                     var slashResult = await HandleSlashAsync(trimmed, ct).ConfigureAwait(false);
                     if (slashResult == SlashOutcome.Exit) return 0;
                     continue;
@@ -418,6 +433,18 @@ public sealed class Repl
         var space = line.IndexOf(' ');
         if (space < 0) return (line.ToLowerInvariant(), string.Empty);
         return (line[..space].ToLowerInvariant(), line[(space + 1)..].Trim());
+    }
+
+    /// <summary>If <paramref name="line"/> names a user-defined command, expand its body (with
+    /// $ARGUMENTS / $1…$9 substitution) into <paramref name="expanded"/> and return true.</summary>
+    private bool TryExpandCustomCommand(string line, out string expanded)
+    {
+        expanded = string.Empty;
+        if (_customCommands.Count == 0) return false;
+        var (cmd, args) = SplitCommand(line);
+        if (!_customCommands.TryGetValue(cmd.TrimStart('/'), out var command)) return false;
+        expanded = command.Expand(args);
+        return expanded.Length > 0;
     }
 
     private async Task PrintHelpAsync()
