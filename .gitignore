@@ -46,3 +46,4 @@ Thumbs.db
 # zdtllmcli local
 .zdtllm/settings.local.json
 .zdtllm/sessions/
+.zdtllm/exports/

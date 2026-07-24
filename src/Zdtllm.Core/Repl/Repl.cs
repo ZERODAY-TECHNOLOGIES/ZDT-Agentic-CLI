@@ -34,6 +34,9 @@ public sealed class Repl
     /// <summary>Renders the current MCP server status for <c>/mcp</c>. Supplied by the CLI (which
     /// owns the McpManager) so Core needn't depend on Zdtllm.Mcp. Null when MCP is unavailable.</summary>
     private readonly Func<string>? _mcpStatus;
+    /// <summary>Renders the effective settings (secrets redacted) for <c>/config</c>. Supplied by the
+    /// CLI, which owns the settings object. Null → /config reports it's unavailable.</summary>
+    private readonly Func<string>? _configDump;
     private IReplInputSource? _richInput;
     private CancellationTokenSource? _currentTurnCts;
 
@@ -51,7 +54,8 @@ public sealed class Repl
         ITurnInputCapture? inputCapture = null,
         IPlanModeSwitch? planMode = null,
         IReplInputSource? richInput = null,
-        Func<string>? mcpStatus = null)
+        Func<string>? mcpStatus = null,
+        Func<string>? configDump = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(agent);
@@ -73,6 +77,7 @@ public sealed class Repl
         _inputCapture = inputCapture;
         _planMode = planMode;
         _mcpStatus = mcpStatus;
+        _configDump = configDump;
         _richInput = richInput;
     }
 
@@ -335,6 +340,22 @@ public sealed class Repl
                 await PrintStatusAsync().ConfigureAwait(false);
                 return SlashOutcome.Continue;
 
+            case "/cost":
+                await PrintCostAsync().ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
+            case "/export":
+                await HandleExportCommandAsync(args).ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
+            case "/doctor":
+                await PrintDoctorAsync().ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
+            case "/config":
+                await PrintConfigAsync().ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
             case "/init":
                 await InitMemoryFileAsync(ct).ConfigureAwait(false);
                 return SlashOutcome.Continue;
@@ -501,6 +522,135 @@ public sealed class Repl
                 Palette.Mute($"tokens ({ctx.UsagePercent}%)"))
                 .ConfigureAwait(false);
         }
+    }
+
+    private async Task PrintCostAsync()
+    {
+        var inTok = _agent.SessionInputTokens;
+        var outTok = _agent.SessionOutputTokens;
+        await _output.WriteLineAsync(
+            $"  {Palette.Mute("input tokens:")}  {Palette.Body($"{inTok:N0}")} " +
+            Palette.Mute("(billed — each turn re-sends the growing context)")).ConfigureAwait(false);
+        await _output.WriteLineAsync($"  {Palette.Mute("output tokens:")} {Palette.Body($"{outTok:N0}")}").ConfigureAwait(false);
+        await _output.WriteLineAsync($"  {Palette.Mute("total tokens:")}  {Palette.Body($"{inTok + outTok:N0}")}").ConfigureAwait(false);
+        if (inTok == 0 && outTok == 0)
+            await _output.WriteLineAsync(
+                Palette.Mute("  (no billed tokens yet — usage appears after the first model turn.)")).ConfigureAwait(false);
+    }
+
+    private async Task HandleExportCommandAsync(string args)
+    {
+        string path;
+        var arg = args.Trim();
+        if (arg.Length > 0)
+        {
+            path = Path.IsPathRooted(arg) ? arg : Path.Combine(_cwd, arg);
+        }
+        else
+        {
+            var dir = Path.Combine(_cwd, ".zdtllm", "exports");
+            Directory.CreateDirectory(dir);
+            path = Path.Combine(dir, $"{_session.Id}.md");
+        }
+
+        try
+        {
+            await File.WriteAllTextAsync(path, RenderTranscriptMarkdown()).ConfigureAwait(false);
+            await _output.WriteLineAsync(
+                Palette.Cyan("✓") + " " +
+                Palette.Body($"Exported {_session.Messages.Count} message(s) to ") + Palette.Body(path))
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await _error.WriteLineAsync(Palette.Red($"zdt: /export failed: {ex.Message}")).ConfigureAwait(false);
+        }
+    }
+
+    private string RenderTranscriptMarkdown()
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append("# zdt conversation — ").AppendLine(_session.Id);
+        sb.AppendLine();
+        sb.Append("- model: ").AppendLine(_session.Model);
+        sb.Append("- messages: ").AppendLine(_session.Messages.Count.ToString());
+        sb.AppendLine();
+
+        foreach (var m in _session.Messages)
+        {
+            switch (m.Role)
+            {
+                case "user" when !string.IsNullOrWhiteSpace(m.Content):
+                    sb.AppendLine("## 🧑 User").AppendLine();
+                    sb.AppendLine(m.Content!.Trim()).AppendLine();
+                    break;
+                case "assistant":
+                    if (!string.IsNullOrWhiteSpace(m.Content))
+                    {
+                        sb.AppendLine("## 🤖 Assistant").AppendLine();
+                        sb.AppendLine(m.Content!.Trim()).AppendLine();
+                    }
+                    if (!m.ToolCalls.IsDefaultOrEmpty)
+                    {
+                        sb.AppendLine("_used tools:_").AppendLine();
+                        foreach (var tc in m.ToolCalls)
+                            sb.Append("- `").Append(tc.FunctionName).Append('(').Append(tc.Arguments).AppendLine(")`");
+                        sb.AppendLine();
+                    }
+                    break;
+                // system prompt / summaries and raw tool output are omitted from the readable export.
+            }
+        }
+        return sb.ToString();
+    }
+
+    private async Task PrintDoctorAsync()
+    {
+        await _output.WriteLineAsync(Palette.Cyan("zdt doctor")).ConfigureAwait(false);
+        await _output.WriteLineAsync(
+            $"  {Palette.Mute("model:")} {Palette.Body(_session.Model)}   " +
+            $"{Palette.Mute("tool-calling:")} {Palette.Body(_session.Mode.ToString().ToLowerInvariant())}").ConfigureAwait(false);
+        if (_planMode is IPermissionModeSwitch pm)
+            await _output.WriteLineAsync(
+                $"  {Palette.Mute("permission mode:")} {Palette.Body(PermissionModeState.Label(pm.Mode))}").ConfigureAwait(false);
+
+        if (_richConsole is not null)
+        {
+            var caps = _richConsole.Profile.Capabilities;
+            await _output.WriteLineAsync(
+                $"  {Palette.Mute("terminal:")} {Palette.Body($"ansi={caps.Ansi} unicode={caps.Unicode} interactive={caps.Interactive} color={caps.ColorSystem}")}")
+                .ConfigureAwait(false);
+            await _output.WriteLineAsync(
+                $"  {Palette.Mute("size:")} {Palette.Body($"{_richConsole.Profile.Width}×{_richConsole.Profile.Height}")}").ConfigureAwait(false);
+        }
+        else
+        {
+            await _output.WriteLineAsync(
+                $"  {Palette.Mute("terminal:")} {Palette.Body("no rich console (plain or redirected output)")}").ConfigureAwait(false);
+        }
+
+        var envFlags = new[] { "ZDT_NO_TUI", "ZDT_BASIC_INPUT", "ZDT_SMALL_FAST_MODEL" }
+            .Where(n => !string.IsNullOrEmpty(Environment.GetEnvironmentVariable(n)))
+            .ToList();
+        await _output.WriteLineAsync(
+            $"  {Palette.Mute("env flags:")} {Palette.Body(envFlags.Count > 0 ? string.Join(", ", envFlags) : "(none)")}").ConfigureAwait(false);
+
+        if (_agent.Context is { } ctx)
+            await _output.WriteLineAsync(
+                $"  {Palette.Mute("context window:")} {Palette.Body($"{ctx.ContextWindow:N0}")} {Palette.Mute("tokens")}").ConfigureAwait(false);
+
+        if (_mcpStatus is not null)
+            await _output.WriteLineAsync(_mcpStatus()).ConfigureAwait(false);
+    }
+
+    private async Task PrintConfigAsync()
+    {
+        if (_configDump is null)
+        {
+            await _output.WriteLineAsync(Palette.Mute("  /config is unavailable in this run.")).ConfigureAwait(false);
+            return;
+        }
+        await _output.WriteLineAsync(_configDump()).ConfigureAwait(false);
     }
 
     private async Task HandleCompactCommandAsync(CancellationToken ct)

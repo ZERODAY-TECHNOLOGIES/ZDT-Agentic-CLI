@@ -131,6 +131,14 @@ public sealed class AgentLoop
     /// <summary>Call ids the user declined, mapped to the message handed back to the model.</summary>
     private readonly ConcurrentDictionary<string, string> _deniedWithMessage = new(StringComparer.Ordinal);
 
+    // Running billed-token totals across every request this AgentLoop has made (each turn's prompt
+    // re-sends the growing context, so these are the actually-billed sums, not unique tokens). Read
+    // by /cost. Subagents have their own AgentLoop, so these are per-agent.
+    private long _sessionInputTokens;
+    private long _sessionOutputTokens;
+    public long SessionInputTokens => Interlocked.Read(ref _sessionInputTokens);
+    public long SessionOutputTokens => Interlocked.Read(ref _sessionOutputTokens);
+
     /// <summary>
     /// Optional queue of user messages typed while THIS turn is already running (interactive
     /// REPL only). Drained between tool rounds so a queued follow-up is folded into the ongoing
@@ -546,6 +554,8 @@ public sealed class AgentLoop
                 _context?.RegisterTurn(p, c);
                 totalInputTokens += p;
                 totalOutputTokens += c;
+                Interlocked.Add(ref _sessionInputTokens, p);
+                Interlocked.Add(ref _sessionOutputTokens, c);
             }
 
             // GLM-5 (and likely other Ollama-Cloud models trained with looser tool-use data)

@@ -579,7 +579,8 @@ internal static class Program
             inputCapture: replCapture,
             planMode: planMode,
             richInput: replInputSource,
-            mcpStatus: () => BuildMcpStatusText(mcpManager));
+            mcpStatus: () => BuildMcpStatusText(mcpManager),
+            configDump: () => BuildConfigDump(settings));
 
         // Ctrl+C behaviour, matching claude-cli:
         //   • During a turn  → first press interrupts the turn (keeps the REPL alive) and clears
@@ -846,6 +847,44 @@ internal static class Program
     /// connected/failed state and tool count. Built here (not in Core's Repl) because the CLI owns
     /// the McpManager — Core stays free of a Zdtllm.Mcp dependency.
     /// </summary>
+    /// <summary>Render the effective settings for the <c>/config</c> command, with the API key
+    /// redacted. Built in the CLI (which owns the settings object) and passed to the REPL as a
+    /// delegate so Core stays free of a Zdtllm.Config dependency.</summary>
+    private static string BuildConfigDump(EffectiveSettings s)
+    {
+        const string reset = "\x1b[0m";
+        const string cyan = "\x1b[38;2;27;234;205m";
+        const string body = "\x1b[38;2;232;237;242m";
+        const string mute = "\x1b[38;2;104;123;137m";
+
+        static string Redact(string? key) =>
+            string.IsNullOrEmpty(key) ? "(unset)" : key.Length <= 6 ? "***" : $"{key[..3]}…{key[^2..]}";
+        string Row(string k, string? v) => $"  {mute}{k}:{reset} {body}{(string.IsNullOrEmpty(v) ? "(unset)" : v)}{reset}";
+
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"{cyan}effective settings{reset}");
+        sb.AppendLine().Append(Row("model", s.Model));
+        var l = s.LiteLLM;
+        sb.AppendLine().Append(Row("litellm.baseUrl", l.BaseUrl));
+        sb.AppendLine().Append(Row("litellm.apiKey", Redact(l.ApiKey)));
+        sb.AppendLine().Append(Row("litellm.toolCallingMode", l.ToolCallingMode));
+        sb.AppendLine().Append(Row("litellm.reasoningEffort", l.ReasoningEffort));
+        sb.AppendLine().Append(Row("litellm.temperature", l.Temperature?.ToString()));
+        sb.AppendLine().Append(Row("litellm.topP", l.TopP?.ToString()));
+        sb.AppendLine().Append(Row("litellm.maxTokens", l.MaxTokens?.ToString()));
+        sb.AppendLine().Append(Row("litellm.frequencyPenalty", l.FrequencyPenalty?.ToString()));
+        sb.AppendLine().Append(Row("litellm.presencePenalty", l.PresencePenalty?.ToString()));
+        sb.AppendLine().Append(Row("litellm.vision", l.Vision?.ToString()));
+        sb.AppendLine().Append(Row("litellm.models", l.Models.Count == 0 ? null : string.Join(", ", l.Models.Select(kv => $"{kv.Key}={kv.Value}"))));
+        sb.AppendLine().Append(Row("litellm.contextWindows", l.ContextWindows.Count == 0 ? null : string.Join(", ", l.ContextWindows.Select(kv => $"{kv.Key}={kv.Value:N0}"))));
+        sb.AppendLine().Append(Row("litellm.subagentModels", l.SubagentModels.Count == 0 ? null : string.Join(", ", l.SubagentModels.Select(kv => $"{kv.Key}={kv.Value}"))));
+        sb.AppendLine().Append(Row("permissions", $"allow={s.Permissions.Allow.Length} ask={s.Permissions.Ask.Length} deny={s.Permissions.Deny.Length}"));
+        sb.AppendLine().Append(Row("permissions.defaultMode", s.Permissions.DefaultMode));
+        sb.AppendLine().Append(Row("mcp.initTimeoutSeconds", s.Mcp.InitTimeoutSeconds?.ToString()));
+        sb.AppendLine().Append(Row("env keys", s.Env.Count == 0 ? null : string.Join(", ", s.Env.Keys)));
+        return sb.ToString();
+    }
+
     private static string BuildMcpStatusText(McpManager manager)
     {
         const string reset = "\x1b[0m";
