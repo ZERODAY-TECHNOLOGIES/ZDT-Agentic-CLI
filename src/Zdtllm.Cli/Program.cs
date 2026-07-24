@@ -1062,9 +1062,9 @@ internal static class Program
 
     private static string? TryReadMemoryFile(string cwd)
     {
-        var path = Path.Combine(cwd, "ZDTLLM.md");
-        if (!File.Exists(path)) return null;
-        try { return File.ReadAllText(path); }
+        // User ~/.zdtllm/ZDTLLM.md + every ZDTLLM.md from the repo root down to cwd, each with
+        // @import expansion. (Was: read only cwd/ZDTLLM.md.)
+        try { return Zdtllm.Core.MemoryLoader.Load(cwd); }
         catch { return null; }
     }
 
