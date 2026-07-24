@@ -6,7 +6,7 @@
     <AssemblyName>zdt</AssemblyName>
     <!-- Default dev-build version. The release workflow overrides this with the
          git tag (without the leading 'v') via -p:Version=0.1.0 at publish time. -->
-    <Version>0.8.21</Version>
+    <Version>0.8.22</Version>
 
     <!-- Publisher / product identity. A self-contained single-file exe with NO version
          metadata reads to AV heuristics (and SmartScreen) as an "unknown, unsigned" blob and

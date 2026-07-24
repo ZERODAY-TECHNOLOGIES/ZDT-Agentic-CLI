@@ -149,6 +149,15 @@ public sealed class Repl
                     continue;
                 }
 
+                // A single '#'-prefixed line appends a note to the project memory file (claude-cli's
+                // "#" quick-memory). Multi-line submissions are treated as normal prompts, not memory.
+                if (trimmed.StartsWith('#') && !trimmed.Contains('\n'))
+                {
+                    _richInput?.TakePendingImages();
+                    await AppendMemoryAsync(trimmed[1..].Trim()).ConfigureAwait(false);
+                    continue;
+                }
+
                 // Images the user dragged onto the prompt while composing this line (vision models).
                 var images = _richInput?.TakePendingImages();
                 var hasImages = images is { Count: > 0 };
@@ -267,9 +276,45 @@ public sealed class Repl
         return s.Length <= max ? s : string.Concat(s.AsSpan(0, max), "…");
     }
 
+    private async Task AppendMemoryAsync(string note)
+    {
+        if (string.IsNullOrWhiteSpace(note))
+        {
+            await _output.WriteLineAsync(Palette.Mute("  Nothing after '#' to remember.")).ConfigureAwait(false);
+            return;
+        }
+
+        var path = Path.Combine(_cwd, "ZDTLLM.md");
+        try
+        {
+            if (!File.Exists(path))
+            {
+                await File.WriteAllTextAsync(path,
+                    "# Project memory (ZDTLLM.md)\n\nNotes zdt should remember for this project.\n\n## Notes\n")
+                    .ConfigureAwait(false);
+            }
+
+            var existing = await File.ReadAllTextAsync(path).ConfigureAwait(false);
+            var sep = existing.EndsWith('\n') ? "" : "\n";
+            await File.AppendAllTextAsync(path, $"{sep}- {note}\n").ConfigureAwait(false);
+
+            await _output.WriteLineAsync(
+                Palette.Cyan("✓") + " " + Palette.Body("Saved to ZDTLLM.md: ") + Palette.Mute(note) + " " +
+                Palette.Mute("(applies on the next session)")).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await _error.WriteLineAsync(Palette.Red($"zdt: could not update ZDTLLM.md: {ex.Message}")).ConfigureAwait(false);
+        }
+    }
+
     private async Task ProcessUserTurnAsync(
         string prompt, CancellationToken ct, IReadOnlyList<string>? images = null)
     {
+        // Inline any @path mentions (resolved files/dirs) so the model gets the content without a
+        // Read round-trip. A no-op when the prompt has no @-mention that resolves to a real path.
+        prompt = AtMentionExpander.Expand(prompt, _cwd);
+
         // Mid-turn auto-compact (hard threshold) is now AgentLoop's responsibility — it
         // fires between iterations regardless of whether we're driving the parent here
         // or a subagent inside SubagentRunner. We keep ONLY the post-turn soft-threshold
