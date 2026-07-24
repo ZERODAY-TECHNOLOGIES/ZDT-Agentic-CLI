@@ -90,14 +90,20 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     public TextWriter Output { get; }
 
     public BottomInputTui(IUserInputQueue queue, IAnsiConsole spectre, bool bypassPermissions,
-        IReadOnlyList<SlashCommandInfo>? slashCommands = null)
+        IReadOnlyList<SlashCommandInfo>? slashCommands = null,
+        Zdtllm.Tools.IPermissionModeSwitch? permissionMode = null)
     {
         _queue = queue ?? throw new ArgumentNullException(nameof(queue));
         _spectre = spectre ?? throw new ArgumentNullException(nameof(spectre));
         _bypassPermissions = bypassPermissions;
         _slashCommands = slashCommands ?? Array.Empty<SlashCommandInfo>();
+        _permMode = permissionMode;
         Output = new LineBufferedWriter(EmitOutputLine);
     }
+
+    /// <summary>Shared permission mode; Shift+Tab cycles it and the footer reflects it. Null → the
+    /// static bypass/ask footer (non-interactive or no mode wired).</summary>
+    private readonly Zdtllm.Tools.IPermissionModeSwitch? _permMode;
 
     public bool IsAvailable => true;
 
@@ -390,6 +396,11 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
             case ConsoleKey.Home: _editor.Home(); return;
             case ConsoleKey.End: _editor.End(); return;
             case ConsoleKey.Escape: return;
+            case ConsoleKey.Tab when (k.Modifiers & ConsoleModifiers.Shift) != 0:
+                // Shift+Tab cycles the permission mode (Default → AcceptEdits → Plan). The footer
+                // repaints on the next frame; the shared switch is read live by the AgentLoop.
+                _permMode?.Cycle();
+                return;
         }
 
         // Typing "/" on an empty box opens the slash-command autocomplete picker (same list the REPL
@@ -643,9 +654,22 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
 
     private string FooterText()
     {
-        var mode = _bypassPermissions
-            ? $"{Red}⚠ bypass permissions ON{Reset}"
-            : $"{Mute}permissions: ask{Reset}";
+        string mode;
+        if (_permMode is not null)
+        {
+            mode = _permMode.Mode switch
+            {
+                Zdtllm.Tools.PermissionMode.Bypass => $"{Red}⚠ bypass{Reset}",
+                Zdtllm.Tools.PermissionMode.Plan => $"{Cyan}⏸ plan{Reset}",
+                Zdtllm.Tools.PermissionMode.AcceptEdits => $"{Cyan}✎ accept-edits{Reset}",
+                _ => $"{Mute}permissions: ask{Reset}",
+            };
+            mode += $"  {Mute}(⇧⇥ mode){Reset}";
+        }
+        else
+        {
+            mode = _bypassPermissions ? $"{Red}⚠ bypass permissions ON{Reset}" : $"{Mute}permissions: ask{Reset}";
+        }
         return $"{mode}  {Mute}·  / commands · Ctrl+C interrupt/exit{Reset}";
     }
 

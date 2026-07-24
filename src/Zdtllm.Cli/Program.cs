@@ -209,12 +209,20 @@ internal static class Program
             && AnsiConsole.Console.Profile.Capabilities.Ansi
             ? turnInput
             : null;
-        // Plan mode: read-only research + plan-for-approval. Interactive-only (ExitPlanMode needs
-        // a human to approve). Starts on when --plan is passed OR permissions.defaultMode is "plan"
-        // in settings.json (the CLI flag wins); toggled at runtime with /plan.
-        var startInPlanMode = parsed.Plan
-            || string.Equals(settings.Permissions.DefaultMode, "plan", StringComparison.OrdinalIgnoreCase);
-        PlanModeState? planMode = interactive ? new PlanModeState(startInPlanMode) : null;
+        // Permission mode (claude-cli's Shift+Tab cycle): Default → AcceptEdits → Plan, plus Bypass.
+        // Interactive-only (Plan's ExitPlanMode + the Ask prompt need a human). Seeded from --plan /
+        // --dangerously-skip-permissions / permissions.defaultMode; toggled at runtime via Shift+Tab
+        // (TUI) or /mode (both drivers). PermissionModeState implements IPlanModeSwitch, so all the
+        // existing plan-mode plumbing keeps working with Plan as one point on the cycle.
+        static bool Eq(string? a, string b) => string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+        var dm = settings.Permissions.DefaultMode;
+        var initialMode =
+            parsed.DangerouslySkipPermissions ? PermissionMode.Bypass
+            : parsed.Plan || Eq(dm, "plan") ? PermissionMode.Plan
+            : Eq(dm, "acceptEdits") ? PermissionMode.AcceptEdits
+            : Eq(dm, "bypassPermissions") ? PermissionMode.Bypass
+            : PermissionMode.Default;
+        PermissionModeState? planMode = interactive ? new PermissionModeState(initialMode) : null;
 
         // The persistent bottom-input TUI (claude-code layout: output scrolls above, a multi-line
         // input box stays pinned and writable during and between turns). Default for an interactive
@@ -228,7 +236,7 @@ internal static class Program
             && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ZDT_NO_TUI"));
         BottomInputTui? tui = tuiMode
             ? new BottomInputTui(inputQueue!, AnsiConsole.Console, parsed.DangerouslySkipPermissions,
-                SlashCommandCatalog.All)
+                SlashCommandCatalog.All, planMode)
             : null;
 
         var registry = new ToolRegistry();

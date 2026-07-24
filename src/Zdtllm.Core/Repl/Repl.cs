@@ -371,6 +371,10 @@ public sealed class Repl
                 await HandlePlanCommandAsync().ConfigureAwait(false);
                 return SlashOutcome.Continue;
 
+            case "/mode":
+                await HandleModeCommandAsync(args).ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
             case "/workflows":
                 await ListWorkflowsAsync().ConfigureAwait(false);
                 return SlashOutcome.Continue;
@@ -707,6 +711,53 @@ public sealed class Repl
                              "approve it (or run /plan again) to make changes."))
                 .ConfigureAwait(false);
         }
+    }
+
+    private async Task HandleModeCommandAsync(string args)
+    {
+        if (_planMode is not IPermissionModeSwitch pm)
+        {
+            await _output.WriteLineAsync(
+                Palette.Mute("/mode needs interactive mode (not available in -p / non-TTY runs)."))
+                .ConfigureAwait(false);
+            return;
+        }
+
+        var arg = args.Trim().ToLowerInvariant().Replace("-", "").Replace("_", "");
+        PermissionMode now;
+        if (arg.Length == 0)
+        {
+            now = pm.Cycle();
+        }
+        else
+        {
+            PermissionMode? target = arg switch
+            {
+                "default" or "ask" => PermissionMode.Default,
+                "acceptedits" or "edits" => PermissionMode.AcceptEdits,
+                "plan" => PermissionMode.Plan,
+                "bypass" or "bypasspermissions" or "yolo" => PermissionMode.Bypass,
+                _ => null,
+            };
+            if (target is null)
+            {
+                await _output.WriteLineAsync(Palette.Red($"Unknown mode '{args.Trim()}'.") + " " +
+                    Palette.Mute("Use: default | accept-edits | plan | bypass, or /mode with no argument to cycle."))
+                    .ConfigureAwait(false);
+                return;
+            }
+            pm.SetMode(target.Value);
+            now = target.Value;
+        }
+
+        var (glyph, note) = now switch
+        {
+            PermissionMode.Bypass => (Palette.Red("⚠ bypass"), "auto-allows everything except the dangerous-op floor."),
+            PermissionMode.Plan => (Palette.Gold("◆ plan"), "read-only; the agent proposes a plan for approval."),
+            PermissionMode.AcceptEdits => (Palette.Cyan("✎ accept-edits"), "auto-allows Edit/Write/NotebookEdit; other tools still ask."),
+            _ => (Palette.Cyan("permissions: ask"), "every permission-gated tool asks."),
+        };
+        await _output.WriteLineAsync($"{glyph} {Palette.Mute("— " + note)}").ConfigureAwait(false);
     }
 
     private async Task ListWorkflowsAsync()

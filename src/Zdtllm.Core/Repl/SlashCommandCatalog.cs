@@ -13,6 +13,10 @@ public static class SlashCommandCatalog
     public static IReadOnlyList<SlashCommandInfo> All { get; } = new[]
     {
         new SlashCommandInfo("/help", "show the command list"),
+        // /mode MUST precede /model: the autocomplete search highlights the first list entry that
+        // matches, and "mode" is a substring of both — listing /mode first means typing "mode" picks
+        // /mode, while "model" (which /mode does not contain) still uniquely picks /model.
+        new SlashCommandInfo("/mode", "show/cycle the permission mode (default | accept-edits | plan | bypass)"),
         new SlashCommandInfo("/model", "switch the model used by the next turn"),
         new SlashCommandInfo("/plan", "toggle plan mode (read-only; propose a plan before changes)"),
         new SlashCommandInfo("/workflow", "run a multi-agent workflow (/workflow <name> key=value …)"),

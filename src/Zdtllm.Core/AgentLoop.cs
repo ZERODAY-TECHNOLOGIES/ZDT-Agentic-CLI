@@ -1459,6 +1459,33 @@ public sealed class AgentLoop
             ? _perms.EvaluateBash(specifier)
             : _perms.Evaluate(toolName, specifier);
 
+    /// <summary>The active permission mode, when the plan-mode switch is a full mode switch.</summary>
+    private PermissionMode CurrentMode =>
+        _planMode is IPermissionModeSwitch pm ? pm.Mode : PermissionMode.Default;
+
+    /// <summary>
+    /// Fold the per-tool rule decision together with the interaction MODE and the dangerous-op
+    /// deny-floor into the decision actually enforced. An explicit Deny/Allow rule always wins. For
+    /// a call that would otherwise Ask: a dangerous shell op stays Ask even under bypass/accept-edits
+    /// (the floor); otherwise bypass/skip auto-allows everything and accept-edits auto-allows file
+    /// edits. Everything else still Asks.
+    /// </summary>
+    private PermissionDecision EffectiveDecision(string toolName, string? specifier)
+    {
+        var raw = DecisionFor(toolName, specifier);
+        if (raw != PermissionDecision.Ask) return raw;
+
+        if (toolName == "Bash" && DangerousOpDetector.IsDangerous(specifier))
+            return PermissionDecision.Ask; // deny-floor: never auto-allowed by a mode
+
+        var mode = CurrentMode;
+        if (_options.SkipPermissions || mode == PermissionMode.Bypass)
+            return PermissionDecision.Allow;
+        if (mode == PermissionMode.AcceptEdits && PermissionModeState.EditTools.Contains(toolName))
+            return PermissionDecision.Allow;
+        return PermissionDecision.Ask;
+    }
+
     /// <summary>
     /// Detect a per-turn reasoning-escalation keyword in the user's message. "ultrathink" → the
     /// top tier ("max"); any other "think" / "think hard(er)" / "think more" phrasing → "high".
@@ -1488,7 +1515,10 @@ public sealed class AgentLoop
     /// </summary>
     private async Task PreResolvePermissionsAsync(ImmutableArray<ToolCall> calls, TextWriter status, CancellationToken ct)
     {
-        if (_options.SkipPermissions || !_prompter.IsAvailable) return;
+        // No human reachable (print mode / subagents) → Core emits the text error. We do NOT early-
+        // out on SkipPermissions/Bypass here: a dangerous op still needs an interactive confirm even
+        // under bypass, and EffectiveDecision returns Ask for exactly those.
+        if (!_prompter.IsAvailable) return;
 
         foreach (var call in calls)
         {
@@ -1514,7 +1544,7 @@ public sealed class AgentLoop
             using (doc)
             {
                 var specifier = tool.GetSpecifierForPermissions(doc.RootElement);
-                if (DecisionFor(call.FunctionName, specifier) != PermissionDecision.Ask)
+                if (EffectiveDecision(call.FunctionName, specifier) != PermissionDecision.Ask)
                     continue;
 
                 PermissionPrompt outcome;
@@ -1608,16 +1638,17 @@ public sealed class AgentLoop
         {
             var args = argsDoc.RootElement;
             var specifier = tool.GetSpecifierForPermissions(args);
-            var decision = DecisionFor(call.FunctionName, specifier);
+            var decision = EffectiveDecision(call.FunctionName, specifier);
 
             if (decision == PermissionDecision.Deny)
                 return ($"[Permission denied: {call.FunctionName}({specifier ?? string.Empty})]", true);
 
-            if (decision == PermissionDecision.Ask && !_options.SkipPermissions)
+            if (decision == PermissionDecision.Ask)
             {
-                // An interactive pre-resolution pass (DispatchToolCallsAsync) may have already asked
-                // the user about this exact call. Honour that verdict; otherwise fall back to the
-                // text error — the print-mode / subagent / no-TTY case where no human is reachable.
+                // EffectiveDecision already accounts for mode + the dangerous-op deny-floor, so a
+                // remaining Ask genuinely needs a human. An interactive pre-resolution pass
+                // (DispatchToolCallsAsync) may have already asked; honour that verdict, else fall
+                // back to the text error (print-mode / subagent / no-TTY — no human reachable).
                 if (_approvedOnce.TryRemove(call.Id, out _))
                 {
                     // approved once — fall through and execute
