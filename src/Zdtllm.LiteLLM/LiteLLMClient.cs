@@ -257,6 +257,17 @@ public sealed class LiteLLMClient
                 lastException = ex;
                 lastWasRateLimit = false;
             }
+            catch (HttpRequestException ex)
+            {
+                // FINAL attempt failed at the transport layer (connection reset/refused, DNS,
+                // TLS). Without this the raw HttpRequestException escaped the retry loop and the
+                // user saw .NET's context-free "An error occurred while sending the request." —
+                // no endpoint, no attempt count, no hint that the proxy was never even reached.
+                // Mirror the TaskCanceledException path below so it falls through to the wrap.
+                lastException = ex;
+                lastWasRateLimit = false;
+                break;
+            }
             catch (TaskCanceledException ex) when (!ct.IsCancellationRequested && attempt < _options.MaxRetries)
             {
                 lastException = ex;
@@ -287,8 +298,32 @@ public sealed class LiteLLMClient
         }
 
         throw new LiteLLMException(
-            $"LiteLLM request failed after {_options.MaxRetries + 1} attempts: {lastException?.Message}",
+            $"LiteLLM request to {ChatCompletionsUrl} failed after {_options.MaxRetries + 1} " +
+            $"attempts: {DescribeFailure(lastException)}",
             lastException);
+    }
+
+    /// <summary>
+    /// Flatten an exception chain onto one line. A transport failure surfaces as
+    /// HttpRequestException("An error occurred while sending the request.") whose actual cause —
+    /// SocketException "Connection was reset", a DNS failure, a TLS handshake error — lives only
+    /// in the inner exception. Reporting just the outer message tells the user nothing they can
+    /// act on, so walk the chain and keep every distinct link.
+    /// </summary>
+    private static string DescribeFailure(Exception? ex)
+    {
+        if (ex is null) return "no exception was recorded";
+
+        var parts = new List<string>();
+        for (var e = ex; e is not null; e = e.InnerException)
+        {
+            if (string.IsNullOrWhiteSpace(e.Message)) continue;
+            // Skip a link whose message the previous one already quotes verbatim (common when a
+            // wrapper rethrows with the inner text appended) — repeating it adds no information.
+            if (parts.Count > 0 && parts[^1].Contains(e.Message, StringComparison.Ordinal)) continue;
+            parts.Add(e.Message);
+        }
+        return parts.Count == 0 ? ex.GetType().Name : string.Join(" -> ", parts);
     }
 
     /// <summary>
@@ -322,10 +357,13 @@ public sealed class LiteLLMClient
         return null;
     }
 
+    /// <summary>The chat endpoint this client posts to. Shared by the request builder and the
+    /// terminal failure message so a transport error names the host it could not reach.</summary>
+    private string ChatCompletionsUrl => $"{_options.BaseUrl.TrimEnd('/')}/v1/chat/completions";
+
     private HttpRequestMessage BuildRequest(string bodyJson)
     {
-        var url = $"{_options.BaseUrl.TrimEnd('/')}/v1/chat/completions";
-        var request = new HttpRequestMessage(HttpMethod.Post, url)
+        var request = new HttpRequestMessage(HttpMethod.Post, ChatCompletionsUrl)
         {
             Content = new StringContent(bodyJson, Encoding.UTF8, "application/json"),
         };

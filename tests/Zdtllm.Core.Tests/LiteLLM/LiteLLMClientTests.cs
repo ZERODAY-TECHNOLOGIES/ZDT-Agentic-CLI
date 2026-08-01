@@ -16,7 +16,7 @@ public sealed class LiteLLMClientTests
     private static HttpResponseMessage Status(HttpStatusCode code, string body = "") =>
         new(code) { Content = new StringContent(body, Encoding.UTF8, "text/plain") };
 
-    private static LiteLLMClient BuildClient(StubHandler handler, int maxRetries = 3) =>
+    private static LiteLLMClient BuildClient(HttpMessageHandler handler, int maxRetries = 3) =>
         new(
             new HttpClient(handler),
             new LiteLLMClientOptions
@@ -144,6 +144,30 @@ public sealed class LiteLLMClientTests
     }
 
     [Fact]
+    public async Task Transport_failure_on_final_attempt_is_wrapped_not_leaked_raw()
+    {
+        // Regression: the retry loop caught HttpRequestException only `when (attempt <
+        // MaxRetries)`, so the LAST attempt's exception escaped unwrapped and the user saw the
+        // bare .NET "An error occurred while sending the request." — no endpoint, no attempt
+        // count, no inner cause, nothing to tell an unreachable proxy apart from a rejected one.
+        var handler = new ThrowingHandler(new HttpRequestException(
+            "An error occurred while sending the request.",
+            new IOException("Connection was reset")));
+        var client = BuildClient(handler, maxRetries: 2);
+
+        var act = async () => await CollectAsync(
+            client.StreamChatAsync([ChatMessage.User("x")], tools: null, model: "m"));
+
+        var ex = await act.Should().ThrowAsync<LiteLLMException>();
+        ex.Which.Message.Should().Contain("http://localhost:4000/v1/chat/completions");
+        ex.Which.Message.Should().Contain("after 3 attempts");
+        // The inner cause is the actionable half — surface it, don't swallow it.
+        ex.Which.Message.Should().Contain("Connection was reset");
+        ex.Which.InnerException.Should().BeOfType<HttpRequestException>();
+        handler.Attempts.Should().Be(3);
+    }
+
+    [Fact]
     public async Task Cancellation_token_propagates()
     {
         var handler = new StubHandler(Status(HttpStatusCode.InternalServerError, "x"));
@@ -157,6 +181,21 @@ public sealed class LiteLLMClientTests
                 [ChatMessage.User("x")], tools: null, model: "m", ct: cts.Token));
 
         await act.Should().ThrowAsync<OperationCanceledException>();
+    }
+}
+
+/// <summary>Fails every send with the same transport-layer exception, counting attempts so a
+/// test can assert the retry loop ran to exhaustion instead of bailing on the first throw.</summary>
+internal sealed class ThrowingHandler(Exception toThrow) : HttpMessageHandler
+{
+    public int Attempts { get; private set; }
+
+    protected override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken ct)
+    {
+        Attempts++;
+        throw toThrow;
     }
 }
 
