@@ -19,6 +19,27 @@ internal static class SpectreChoice
     private static readonly PromptChoice FreeTextChoice =
         new("✎ Something else…", "Type your own answer");
 
+    /// <summary>
+    /// How many choices fit on one page of a Spectre prompt.
+    ///
+    /// Spectre sizes a page in CHOICES, but every converter here renders a choice on TWO rows
+    /// (name, then an indented description). A page of 15 therefore costs 30 rows plus the title
+    /// and the "move up and down to reveal more choices" hint — over 30 rows total, which is taller
+    /// than a default terminal. The prompt then paints past the bottom, scrolling the conversation
+    /// (and the TUI's input box) off screen on every keystroke. Budget from the real window height
+    /// instead. Spectre rejects a page size below 3, so that is the floor even on a tiny terminal.
+    /// </summary>
+    private static int PageSizeFor(int choiceCount, int rowsPerChoice = 2, int chrome = 6)
+    {
+        int height;
+        try { height = Console.WindowHeight; }
+        catch { height = 24; }                       // redirected/unknown: assume the classic 80x24
+        if (height < 8) height = 24;
+
+        var budget = (height - chrome) / rowsPerChoice;
+        return Math.Clamp(choiceCount, 3, Math.Max(3, budget));
+    }
+
     public static async Task<IReadOnlyList<string>> SelectAsync(
         IAnsiConsole console,
         string question,
@@ -30,7 +51,7 @@ internal static class SpectreChoice
     {
         var title = BuildTitle(question, header);
         var choices = allowFreeText ? options.Append(FreeTextChoice).ToList() : options.ToList();
-        var pageSize = Math.Clamp(choices.Count + 1, 3, 16);
+        var pageSize = PageSizeFor(choices.Count);
 
         if (multiSelect)
         {
@@ -89,7 +110,7 @@ internal static class SpectreChoice
         var choices = commands.Append(SlashCancelSentinel).ToList();
         var prompt = new SelectionPrompt<SlashCommandInfo>()
             .Title($"[bold {Cyan}]/ commands[/]  [{Mute}](type to filter · ↑/↓ · Enter to pick)[/]")
-            .PageSize(Math.Clamp(choices.Count + 1, 4, 15))
+            .PageSize(PageSizeFor(choices.Count))
             .HighlightStyle(new Style(new Color(0x1B, 0xEA, 0xCD)))
             .UseConverter(FormatSlash)
             .EnableSearch()
