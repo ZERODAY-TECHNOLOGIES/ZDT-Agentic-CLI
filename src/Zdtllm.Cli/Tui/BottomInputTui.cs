@@ -92,19 +92,25 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
 
     public BottomInputTui(IUserInputQueue queue, IAnsiConsole spectre, bool bypassPermissions,
         IReadOnlyList<SlashCommandInfo>? slashCommands = null,
-        Zdtllm.Tools.IPermissionModeSwitch? permissionMode = null)
+        Zdtllm.Tools.IPermissionModeSwitch? permissionMode = null,
+        Zdtllm.Core.Agents.ITeamModeSwitch? teamMode = null)
     {
         _queue = queue ?? throw new ArgumentNullException(nameof(queue));
         _spectre = spectre ?? throw new ArgumentNullException(nameof(spectre));
         _bypassPermissions = bypassPermissions;
         _slashCommands = slashCommands ?? Array.Empty<SlashCommandInfo>();
         _permMode = permissionMode;
+        _teamMode = teamMode;
         Output = new LineBufferedWriter(EmitOutputLine);
     }
 
     /// <summary>Shared permission mode; Shift+Tab cycles it and the footer reflects it. Null → the
     /// static bypass/ask footer (non-interactive or no mode wired).</summary>
     private readonly Zdtllm.Tools.IPermissionModeSwitch? _permMode;
+
+    /// <summary>Shared team-mode switch; when active the footer shows a "⚇ team" marker so the user
+    /// always sees they're in orchestrator-only mode. Null → no marker.</summary>
+    private readonly Zdtllm.Core.Agents.ITeamModeSwitch? _teamMode;
 
     public bool IsAvailable => true;
 
@@ -588,13 +594,31 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     // Holds _render. Move the visible cursor back into the input box without repainting the box.
     private void AppendParkCursorLocked(StringBuilder sb)
     {
-        var boxH = BoxHeight();
-        var top = _rows - boxH + 1;
-        var inputRows = Math.Clamp(_editor.LineCount, 1, MaxInputRows);
-        var firstLine = Math.Max(0, Math.Min(_editor.CursorRow - (inputRows - 1), _editor.LineCount - inputRows));
-        var curScreenRow = top + 1 + (_editor.CursorRow - firstLine);
-        var curCol = 2 + Math.Min(_editor.CursorCol, _cols - 4) + 1;
+        var top = _rows - BoxHeight() + 1;
+        var w = InputWindow();
+        var curScreenRow = top + 1 + (w.CursorIndex - w.FirstVisual);
+        var curCol = 3 + Math.Min(w.CursorCol, ContentWidth); // 1-based: 2-char prefix, then the column
         sb.Append($"\x1b[{curScreenRow};{curCol}H");
+    }
+
+    /// <summary>Visible content columns per input row — the box width minus the 2-char prefix and a
+    /// one-column right margin (autowrap is off, so we never let content reach the last cell).</summary>
+    private int ContentWidth => Math.Max(1, _cols - 4);
+
+    /// <summary>
+    /// The soft-wrapped input box geometry for the current editor + terminal width: every visual row
+    /// (long logical lines wrapped onto continuations), how many fit (capped at <see cref="MaxInputRows"/>),
+    /// the scroll offset that keeps the cursor visible, and the cursor's visual index + column. All three
+    /// paint paths (box height, full redraw, cursor park) go through this so they can never disagree.
+    /// </summary>
+    private (IReadOnlyList<Zdtllm.Core.Tui.VisualRow> Rows, int InputRows, int FirstVisual, int CursorIndex, int CursorCol)
+        InputWindow()
+    {
+        var (rows, cursorIndex, cursorCol) =
+            Zdtllm.Core.Tui.SoftWrap.Layout(_editor.Lines, ContentWidth, _editor.CursorRow, _editor.CursorCol);
+        var inputRows = Math.Clamp(rows.Count, 1, MaxInputRows);
+        var firstVisual = Math.Max(0, Math.Min(cursorIndex - (inputRows - 1), rows.Count - inputRows));
+        return (rows, inputRows, firstVisual, cursorIndex, cursorCol);
     }
 
     private void EchoQueuedLine(string text) =>
@@ -633,8 +657,7 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
 
         var boxH = BoxHeight();
         var top = _rows - boxH + 1;           // first box row (1-based)
-        var lines = _editor.Lines;
-        var inputRows = Math.Clamp(lines.Count, 1, MaxInputRows);
+        var w = InputWindow();
 
         // If the box shrank (its top moved DOWN), the vacated rows above the new top are now part
         // of the scroll region and still hold old status/input content — clear them, or they scroll
@@ -648,23 +671,24 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
         // Status line.
         AppendRowLocked(sb, top, StatusText());
 
-        // Input lines (first prefixed "> ", continuations "  "). Show a window if there are more
-        // lines than fit, keeping the cursor row visible.
-        var firstLine = Math.Max(0, Math.Min(_editor.CursorRow - (inputRows - 1), lines.Count - inputRows));
-        for (var i = 0; i < inputRows; i++)
+        // Input rows: the very first visual row gets the "> " prompt, wrapped/continuation rows get
+        // "  ". A logical line wider than the box is soft-wrapped across several visual rows (see
+        // SoftWrap); when there are more visual rows than fit, we scroll the window to keep the cursor
+        // row visible. Segments are already ≤ ContentWidth, so no clipping is needed here.
+        for (var i = 0; i < w.InputRows; i++)
         {
-            var li = firstLine + i;
-            var prefix = li == 0 ? $"{Cyan}>{Reset} " : "  ";
-            var content = li < lines.Count ? lines[li] : "";
-            AppendRowLocked(sb, top + 1 + i, prefix + Clip(content, _cols - 3));
+            var vi = w.FirstVisual + i;
+            var prefix = vi == 0 ? $"{Cyan}>{Reset} " : "  ";
+            var content = vi < w.Rows.Count ? w.Rows[vi].Text : "";
+            AppendRowLocked(sb, top + 1 + i, prefix + content);
         }
 
         // Footer.
-        AppendRowLocked(sb, top + 1 + inputRows, FooterText());
+        AppendRowLocked(sb, top + 1 + w.InputRows, FooterText());
 
         // Park the visible cursor at the editor position inside the input area.
-        var curScreenRow = top + 1 + (_editor.CursorRow - firstLine);
-        var curCol = 2 /* "> " */ + Math.Min(_editor.CursorCol, _cols - 4) + 1; // 1-based
+        var curScreenRow = top + 1 + (w.CursorIndex - w.FirstVisual);
+        var curCol = 3 + Math.Min(w.CursorCol, ContentWidth); // 1-based: 2-char prefix, then the column
         sb.Append($"\x1b[{curScreenRow};{curCol}H");
     }
 
@@ -707,7 +731,8 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
         {
             mode = _bypassPermissions ? $"{Red}⚠ bypass permissions ON{Reset}" : $"{Mute}permissions: ask{Reset}";
         }
-        return $"{mode}  {Mute}·  / commands · Ctrl+C interrupt/exit{Reset}";
+        var team = _teamMode?.InTeamMode == true ? $"{Gold}⚇ team{Reset}  {Mute}·  {Reset}" : "";
+        return $"{team}{mode}  {Mute}·  / commands · Ctrl+C interrupt/exit{Reset}";
     }
 
     // Holds _render. Write a full box row: position, content, then reset + clear-to-EOL. Writing
@@ -723,7 +748,11 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
 
     private int BoxHeight()
     {
-        var inputRows = Math.Clamp(_editor.LineCount, 1, MaxInputRows);
+        // Count VISUAL rows (long logical lines wrap onto continuations), so the box grows to show a
+        // long line instead of clipping it — capped at MaxInputRows, beyond which the window scrolls.
+        var visualRows = Zdtllm.Core.Tui.SoftWrap
+            .Layout(_editor.Lines, ContentWidth, _editor.CursorRow, _editor.CursorCol).Rows.Count;
+        var inputRows = Math.Clamp(visualRows, 1, MaxInputRows);
         return 1 /*status*/ + inputRows + 1 /*footer*/;
     }
 

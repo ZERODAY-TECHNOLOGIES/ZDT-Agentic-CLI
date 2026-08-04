@@ -32,6 +32,8 @@ public static class SlashCommandCatalog
         new SlashCommandInfo("/permissions", "show the current permission rule set"),
         new SlashCommandInfo("/mcp", "show connected MCP servers and their tool counts"),
         new SlashCommandInfo("/agents", "list available subagent types and their tool sets"),
+        new SlashCommandInfo("/team", "orchestrator mode: define project subagents and delegate all work to them"),
+        new SlashCommandInfo("/end-team", "leave team mode (the only way to turn it off)"),
         new SlashCommandInfo("/clear", "drop conversation history (system prompt kept)"),
         new SlashCommandInfo("/init", "create ZDTLLM.md (project memory file) in the cwd"),
         new SlashCommandInfo("/exit", "leave the REPL"),

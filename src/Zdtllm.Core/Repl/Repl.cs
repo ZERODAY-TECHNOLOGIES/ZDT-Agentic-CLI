@@ -1,4 +1,5 @@
 using Spectre.Console;
+using Zdtllm.Core.Agents;
 using Zdtllm.Core.Sessions;
 using Zdtllm.Core.Workflows;
 using Zdtllm.Tools;
@@ -31,6 +32,15 @@ public sealed class Repl
     private readonly IUserInputQueue? _inputQueue;
     private readonly ITurnInputCapture? _inputCapture;
     private readonly IPlanModeSwitch? _planMode;
+    /// <summary>Team-mode switch (orchestrator-only). Null in non-interactive runs. Toggled by
+    /// <c>/team</c> (on, via the wizard) and <c>/end-team</c> (off).</summary>
+    private readonly ITeamModeSwitch? _teamMode;
+    /// <summary>Live project-subagent roster the <c>/team</c> wizard writes into. Shared with the
+    /// SubagentRunner so a newly-defined agent is dispatchable at once.</summary>
+    private readonly TeamAgentRegistry? _teamAgents;
+    /// <summary>The interactive prompter that powers the <c>/team</c> wizard (same one behind
+    /// AskUserQuestion). Null when no human is reachable.</summary>
+    private readonly IInteractivePrompter? _prompter;
     /// <summary>Renders the current MCP server status for <c>/mcp</c>. Supplied by the CLI (which
     /// owns the McpManager) so Core needn't depend on Zdtllm.Mcp. Null when MCP is unavailable.</summary>
     private readonly Func<string>? _mcpStatus;
@@ -59,7 +69,10 @@ public sealed class Repl
         IReplInputSource? richInput = null,
         Func<string>? mcpStatus = null,
         Func<string>? configDump = null,
-        IReadOnlyList<Commands.CustomCommand>? customCommands = null)
+        IReadOnlyList<Commands.CustomCommand>? customCommands = null,
+        ITeamModeSwitch? teamMode = null,
+        TeamAgentRegistry? teamAgents = null,
+        IInteractivePrompter? prompter = null)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(agent);
@@ -85,6 +98,9 @@ public sealed class Repl
         _customCommands = (customCommands ?? Array.Empty<Commands.CustomCommand>())
             .ToDictionary(c => c.Name, StringComparer.Ordinal);
         _richInput = richInput;
+        _teamMode = teamMode;
+        _teamAgents = teamAgents;
+        _prompter = prompter;
     }
 
     /// <summary>
@@ -440,6 +456,14 @@ public sealed class Repl
                 await PrintAgentsAsync().ConfigureAwait(false);
                 return SlashOutcome.Continue;
 
+            case "/team":
+                await HandleTeamCommandAsync(ct).ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
+            case "/end-team":
+                await HandleEndTeamCommandAsync().ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
             case "/compact":
                 await HandleCompactCommandAsync(ct).ConfigureAwait(false);
                 return SlashOutcome.Continue;
@@ -509,6 +533,8 @@ public sealed class Repl
         await WriteCommandRowAsync("/workflows", "list declarative workflows in .zdtllm/workflows/").ConfigureAwait(false);
         await WriteCommandRowAsync("/workflow <name> [k=v]", "run a multi-agent workflow").ConfigureAwait(false);
         await WriteCommandRowAsync("/agents", "list available subagent types and their tool sets").ConfigureAwait(false);
+        await WriteCommandRowAsync("/team", "orchestrator mode — define project subagents; the model delegates all work").ConfigureAwait(false);
+        await WriteCommandRowAsync("/end-team", "leave team mode (the only way to turn it off)").ConfigureAwait(false);
     }
 
     private async Task PrintAgentsAsync()
@@ -583,6 +609,10 @@ public sealed class Repl
         await _output.WriteLineAsync($"  {Palette.Mute("mode:")} {Palette.Body(_session.Mode.ToString().ToLowerInvariant())}").ConfigureAwait(false);
         if (_planMode?.InPlanMode == true)
             await _output.WriteLineAsync($"  {Palette.Mute("plan:")} {Palette.Gold("ON (read-only)")}").ConfigureAwait(false);
+        if (_teamMode?.InTeamMode == true)
+            await _output.WriteLineAsync(
+                $"  {Palette.Mute("team:")} {Palette.Gold($"ON (orchestrator; {_teamAgents?.Count ?? 0} subagent(s))")}")
+                .ConfigureAwait(false);
         await _output.WriteLineAsync($"  {Palette.Mute("messages:")} {Palette.Body(_session.Messages.Count.ToString())}").ConfigureAwait(false);
         await _output.WriteLineAsync($"  {Palette.Mute("cwd:")} {Palette.Body(_cwd)}").ConfigureAwait(false);
 
@@ -934,6 +964,113 @@ public sealed class Repl
                              "approve it (or run /plan again) to make changes."))
                 .ConfigureAwait(false);
         }
+    }
+
+    private async Task HandleTeamCommandAsync(CancellationToken ct)
+    {
+        if (_teamMode is null || _teamAgents is null || _prompter is null || !_prompter.IsAvailable)
+        {
+            await _output.WriteLineAsync(
+                Palette.Mute("/team needs interactive mode (it's not available in -p / non-TTY runs)."))
+                .ConfigureAwait(false);
+            return;
+        }
+
+        var wizard = new AgentWizard(_prompter, _teamAgents, _cwd, _output);
+
+        // Already on → this run is "add another subagent to the team".
+        if (_teamMode.InTeamMode)
+        {
+            await _output.WriteLineAsync(
+                Palette.Gold("⚇ team mode is already ON") + " " + Palette.Mute("— defining another subagent…"))
+                .ConfigureAwait(false);
+            await DefineAgentSafelyAsync(wizard, ct).ConfigureAwait(false);
+            await PrintTeamRosterAsync().ConfigureAwait(false);
+            return;
+        }
+
+        // Off with no agents defined yet → the wizard runs FIRST; we don't activate until one exists.
+        if (_teamAgents.Count == 0)
+        {
+            await _output.WriteLineAsync(
+                Palette.Gold("⚇ team mode") + " " +
+                Palette.Mute("— define at least one subagent to activate. The model will orchestrate them, not do the work itself."))
+                .ConfigureAwait(false);
+            await DefineAgentSafelyAsync(wizard, ct).ConfigureAwait(false);
+            if (_teamAgents.Count == 0)
+            {
+                await _output.WriteLineAsync(
+                    Palette.Mute("Team mode not activated (no subagent was defined). Run ") +
+                    Palette.Cyan("/team") + Palette.Mute(" again when you're ready."))
+                    .ConfigureAwait(false);
+                return;
+            }
+        }
+
+        _teamMode.Enter();
+        await _output.WriteLineAsync(
+            Palette.Gold("⚇ Team mode ON") + " " +
+            Palette.Mute("— the model now ORCHESTRATES only; Write/Edit/Bash/NotebookEdit are delegated to subagents."))
+            .ConfigureAwait(false);
+        await PrintTeamRosterAsync().ConfigureAwait(false);
+        await _output.WriteLineAsync(
+            Palette.Mute("Add more subagents with ") + Palette.Cyan("/team") +
+            Palette.Mute(", list them with ") + Palette.Cyan("/agents") +
+            Palette.Mute(", turn it off with ") + Palette.Cyan("/end-team") + Palette.Mute("."))
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>Run one wizard definition, translating a cancelled picker into a clean "(cancelled)"
+    /// note rather than tearing down the REPL.</summary>
+    private async Task DefineAgentSafelyAsync(AgentWizard wizard, CancellationToken ct)
+    {
+        try
+        {
+            await wizard.RunAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            await _output.WriteLineAsync(Palette.Mute("  (definition cancelled)")).ConfigureAwait(false);
+        }
+    }
+
+    private async Task PrintTeamRosterAsync()
+    {
+        var agents = _teamAgents?.All ?? Array.Empty<AgentDefinition>();
+        if (agents.Count == 0)
+        {
+            await _output.WriteLineAsync(Palette.Mute("  (no project subagents defined yet)")).ConfigureAwait(false);
+            return;
+        }
+        await _output.WriteLineAsync(Palette.Mute($"  team ({agents.Count}):")).ConfigureAwait(false);
+        foreach (var a in agents)
+            await _output.WriteLineAsync(
+                $"    {Palette.GoldBold(a.Name)}  {Palette.Mute(a.Description)}").ConfigureAwait(false);
+    }
+
+    private async Task HandleEndTeamCommandAsync()
+    {
+        if (_teamMode is null)
+        {
+            await _output.WriteLineAsync(
+                Palette.Mute("/end-team needs interactive mode (not available in -p / non-TTY runs)."))
+                .ConfigureAwait(false);
+            return;
+        }
+
+        if (!_teamMode.InTeamMode)
+        {
+            await _output.WriteLineAsync(
+                Palette.Mute("Team mode is not on. Start it with ") + Palette.Cyan("/team") + Palette.Mute("."))
+                .ConfigureAwait(false);
+            return;
+        }
+
+        _teamMode.End();
+        await _output.WriteLineAsync(
+            Palette.Cyan("✓") + " " + Palette.Body("Team mode OFF") + " " +
+            Palette.Mute("— the model may implement directly again. Your defined subagents are kept."))
+            .ConfigureAwait(false);
     }
 
     private async Task HandleModeCommandAsync(string args)

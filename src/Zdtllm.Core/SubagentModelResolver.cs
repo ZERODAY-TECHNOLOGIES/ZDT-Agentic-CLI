@@ -97,6 +97,17 @@ public static class SubagentModelResolver
     }
 
     /// <summary>
+    /// Public entry to the alias-expansion rule so callers resolving a model outside the tiered
+    /// <see cref="Resolve"/> path (notably a project subagent's <c>model:</c> field) get identical
+    /// semantics: an alias name expands through <paramref name="aliases"/>, a literal id passes through.
+    /// </summary>
+    public static string? ExpandAlias(string? value, IReadOnlyDictionary<string, string> aliases)
+    {
+        ArgumentNullException.ThrowIfNull(aliases);
+        return ExpandAliasOrLiteral(value, aliases);
+    }
+
+    /// <summary>
     /// If <paramref name="value"/> matches an alias key in <paramref name="aliases"/>, expand
     /// to the mapped model id. Otherwise treat the value as a literal model id. Returns null
     /// only when <paramref name="value"/> itself is null/empty (so the caller can fall back).

@@ -158,6 +158,18 @@ public sealed class AgentLoop
     private readonly IPlanModeSwitch? _planMode;
 
     /// <summary>
+    /// Optional team-mode switch. When on, the model becomes a pure orchestrator: the mutating tools
+    /// (Write/Edit/Bash/NotebookEdit) are hidden from its schema AND hard-blocked at dispatch, and each
+    /// user prompt is grounded with a reminder to delegate everything to subagents via the Agent tool.
+    /// Null (the common case, and always for subagents) disables it. Paired with <see cref="_teamAgents"/>.
+    /// </summary>
+    private readonly Agents.ITeamModeSwitch? _teamMode;
+
+    /// <summary>The project-subagent roster used to build the team-mode reminder's live agent list.
+    /// Null when team mode is unavailable. Only read while <see cref="_teamMode"/> is active.</summary>
+    private readonly Agents.TeamAgentRegistry? _teamAgents;
+
+    /// <summary>
     /// Optional view of the user's mid-turn typing, surfaced in the live spinner so queued input
     /// is visible instead of feeling like the terminal froze. Null in print mode / tests.
     /// </summary>
@@ -265,7 +277,9 @@ public sealed class AgentLoop
         ITypeAheadStatus? typeAhead = null,
         Func<string, string>? markdownAnsi = null,
         IInteractivePrompter? prompter = null,
-        ITurnInputCapture? inputCapture = null)
+        ITurnInputCapture? inputCapture = null,
+        Agents.ITeamModeSwitch? teamMode = null,
+        Agents.TeamAgentRegistry? teamAgents = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(tools);
@@ -284,6 +298,8 @@ public sealed class AgentLoop
         _markdownAnsi = markdownAnsi;
         _prompter = prompter ?? UnavailablePrompter.Instance;
         _inputCapture = inputCapture;
+        _teamMode = teamMode;
+        _teamAgents = teamAgents;
     }
 
     public PermissionRuleSet Permissions => _perms;
@@ -357,15 +373,28 @@ public sealed class AgentLoop
         // Plan mode grounding: fold a reminder into the user turn so any model — however long the
         // context has grown — keeps behaving read-only until the user approves a plan. The
         // hard guarantee is the tool-dispatch block below; this just keeps the model cooperative.
-        var effectivePrompt = _planMode?.InPlanMode == true
-            ? userPrompt + "\n\n" + PlanModeState.Reminder
-            : userPrompt;
+        var effectivePrompt = userPrompt;
+        if (_planMode?.InPlanMode == true)
+            effectivePrompt += "\n\n" + PlanModeState.Reminder;
+        // Team mode grounding: fold the orchestrator reminder (with the CURRENT subagent roster) into
+        // the turn. Dynamic because the wizard can add agents mid-session. The hard guarantee is the
+        // schema filter + dispatch block below; this keeps the model cooperative.
+        if (_teamMode?.InTeamMode == true)
+            effectivePrompt += "\n\n" +
+                Agents.TeamModeState.BuildReminder(_teamAgents?.All ?? Array.Empty<Agents.AgentDefinition>());
         session.AddUser(effectivePrompt, images);
 
         IReadOnlyList<ToolDef>? toolDefList = null;
         if (!xmlMode)
         {
-            var defs = _tools.Schemas
+            // In team mode, drop the mutating tools from the advertised schema so the orchestrator
+            // literally has no Write/Edit/Bash/NotebookEdit to call — it must delegate. (The dispatch
+            // block below is the backstop for XML mode, where the tool list lives in the frozen system
+            // prompt instead of per-turn defs.)
+            var schemas = _teamMode?.InTeamMode == true
+                ? _tools.Schemas.Where(s => !Agents.TeamModeState.BlockedTools.Contains(s.Name))
+                : _tools.Schemas;
+            var defs = schemas
                 .Select(s => new ToolDef(s.Name, s.Description, s.Parameters))
                 .ToList();
             toolDefList = defs.Count > 0 ? defs : null;
@@ -1557,6 +1586,10 @@ public sealed class AgentLoop
             if (_planMode?.InPlanMode == true && PlanModeState.BlockedTools.Contains(call.FunctionName))
                 continue;
 
+            // Team mode likewise refuses mutating tools — they get delegated, not run here.
+            if (_teamMode?.InTeamMode == true && Agents.TeamModeState.BlockedTools.Contains(call.FunctionName))
+                continue;
+
             JsonDocument doc;
             try
             {
@@ -1649,6 +1682,11 @@ public sealed class AgentLoop
             return ($"[blocked: plan mode is ON] `{call.FunctionName}` modifies the workspace and is " +
                     "not allowed while planning. Finish investigating with read-only tools, then call " +
                     "ExitPlanMode with your plan to get the user's approval before making changes.", true);
+
+        // Team-mode hard guard: the orchestrator must delegate mutating work to a subagent. This is
+        // the backstop for the schema filter (which already hides these tools in native mode).
+        if (_teamMode?.InTeamMode == true && Agents.TeamModeState.BlockedTools.Contains(call.FunctionName))
+            return (Agents.TeamModeState.BlockedMessage(call.FunctionName), true);
 
         JsonDocument argsDoc;
         try

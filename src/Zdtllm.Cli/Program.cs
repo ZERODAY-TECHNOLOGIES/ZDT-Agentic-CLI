@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using Spectre.Console;
 using Zdtllm.Config;
 using Zdtllm.Core;
+using Zdtllm.Core.Agents;
 using Zdtllm.Core.Observers;
 using Zdtllm.Cli.Input;
 using Zdtllm.Cli.Tui;
@@ -193,6 +194,13 @@ internal static class Program
                 .Concat(customCommands.Select(c => new SlashCommandInfo("/" + c.Name, c.Description)))
                 .ToList();
 
+        // Project subagents (team mode): discovered from .zdtllm/agents/*.md at startup and held in a
+        // live registry the /team wizard can extend mid-session. --bare skips them like skills/commands.
+        var teamAgents = new TeamAgentRegistry(
+            parsed.Bare
+                ? Array.Empty<AgentDefinition>()
+                : new AgentDefinitionLoader().Discover(cwd));
+
         var memoryFile = TryReadMemoryFile(cwd);
 
         // Interactive-only input plumbing: the message queue (type while the model works) and the
@@ -235,6 +243,11 @@ internal static class Program
             : PermissionMode.Default;
         PermissionModeState? planMode = interactive ? new PermissionModeState(initialMode) : null;
 
+        // Team mode (orchestrator-only, sticky): a runtime switch like plan mode, off at startup and
+        // toggled by /team (on, via the wizard) and /end-team (off). Interactive only — the wizard and
+        // the delegation loop need a human. Shared with AgentLoop (gating), the REPL (toggle), and the TUI.
+        TeamModeState? teamMode = interactive ? new TeamModeState() : null;
+
         // The persistent bottom-input TUI (claude-code layout: output scrolls above, a multi-line
         // input box stays pinned and writable during and between turns). Default for an interactive
         // ANSI TTY; ZDT_NO_TUI or ZDT_BASIC_INPUT falls back to the line-based REPL. When on it
@@ -247,7 +260,7 @@ internal static class Program
             && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ZDT_NO_TUI"));
         BottomInputTui? tui = tuiMode
             ? new BottomInputTui(inputQueue!, AnsiConsole.Console, parsed.DangerouslySkipPermissions,
-                slashCatalog, planMode)
+                slashCatalog, planMode, teamMode)
             : null;
 
         var registry = new ToolRegistry();
@@ -392,7 +405,11 @@ internal static class Program
             prompter: prompter,
             // The TUI (when on) animates mid-turn auto-compact on its status row. Null in rich mode,
             // where AgentLoop falls back to a Spectre status spinner via the rich console instead.
-            inputCapture: tui);
+            inputCapture: tui,
+            // Team mode: when active, the orchestrator's mutating tools are hidden + blocked and each
+            // turn is grounded with the delegation reminder (built from the live project-agent roster).
+            teamMode: teamMode,
+            teamAgents: teamAgents);
 
         // Task tool needs the parent agent to spawn subagents from. Register it AFTER the
         // agent is built — the registry holds a live reference, so the parent agent will see
@@ -430,12 +447,20 @@ internal static class Program
             : tui is not null
                 ? tui.Output
                 : (parsed.PrintMode && !parsed.Verbose ? null : Console.Error);
-        var subagentRunner = new SubagentRunner(agent, subagentSink, fleetView);
+        var subagentRunner = new SubagentRunner(agent, subagentSink, fleetView, teamAgents);
         var modelAliases = settings.LiteLLM.Models;
         var subagentOverrides = settings.LiteLLM.SubagentModels;
         var smallFastModel = settings.LiteLLM.SmallFastModel;
         Func<string, string?, string?> tieredModelResolver = (subagentType, _parent) =>
-            SubagentModelResolver.Resolve(subagentType, modelAliases, subagentOverrides, smallFastModel);
+        {
+            // A project subagent is authoritative about its own model: an explicit model: wins, and
+            // model: inherit (normalised to null by the loader) means "inherit the parent". We must
+            // NOT fall through to the tiered resolver in the inherit case — a project agent named
+            // e.g. "explore" would otherwise pick up the builtin light-tier default and never inherit.
+            if (teamAgents.TryGet(subagentType, out var def))
+                return def.Model is null ? null : SubagentModelResolver.ExpandAlias(def.Model, modelAliases);
+            return SubagentModelResolver.Resolve(subagentType, modelAliases, subagentOverrides, smallFastModel);
+        };
         registry.Register(new TaskTool(subagentRunner, tieredModelResolver));
 
         // --tools filter: applied last so it can drop builtins, MCP tools, and Task uniformly.
@@ -595,7 +620,12 @@ internal static class Program
             richInput: replInputSource,
             mcpStatus: () => BuildMcpStatusText(mcpManager),
             configDump: () => BuildConfigDump(settings),
-            customCommands: customCommands);
+            customCommands: customCommands,
+            // Team mode: /team runs the define-a-subagent wizard through this same prompter (TUI or
+            // console), writes it into teamAgents, and flips teamMode on; /end-team flips it off.
+            teamMode: teamMode,
+            teamAgents: teamAgents,
+            prompter: prompter);
 
         // Ctrl+C behaviour, matching claude-cli:
         //   • During a turn  → first press interrupts the turn (keeps the REPL alive) and clears

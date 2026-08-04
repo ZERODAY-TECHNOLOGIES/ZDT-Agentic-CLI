@@ -1,3 +1,4 @@
+using Zdtllm.Core.Agents;
 using Zdtllm.Core.Sessions;
 using Zdtllm.Tools;
 
@@ -65,27 +66,63 @@ public sealed class SubagentRunner : ISubagentRunner
     /// </summary>
     private readonly AgentFleet.IAgentFleetMonitor? _fleetMonitor;
 
+    /// <summary>
+    /// Optional project-subagent roster (team mode). When set, its definitions are dispatchable
+    /// alongside the three built-ins and take precedence on a name clash (the user's project config
+    /// wins). Null keeps the classic built-ins-only behaviour. Read live on every dispatch so an
+    /// agent the wizard adds mid-session is immediately usable.
+    /// </summary>
+    private readonly TeamAgentRegistry? _teamAgents;
+
     public SubagentRunner(
         AgentLoop parent,
         TextWriter? activitySink = null,
-        AgentFleet.IAgentFleetMonitor? fleetMonitor = null)
+        AgentFleet.IAgentFleetMonitor? fleetMonitor = null,
+        TeamAgentRegistry? teamAgents = null)
     {
         ArgumentNullException.ThrowIfNull(parent);
         _parent = parent;
         _activitySink = activitySink;
         _fleetMonitor = fleetMonitor;
+        _teamAgents = teamAgents;
     }
 
-    public IReadOnlyList<string> AvailableTypes => AvailableTypeNames;
+    public IReadOnlyList<string> AvailableTypes
+    {
+        get
+        {
+            if (_teamAgents is null || _teamAgents.Count == 0) return AvailableTypeNames;
+            // Project agents first (they shadow a same-named built-in), then the built-ins.
+            var names = new List<string>(_teamAgents.Names);
+            foreach (var b in AvailableTypeNames)
+                if (!_teamAgents.Contains(b)) names.Add(b);
+            return names;
+        }
+    }
 
     public bool SupportsType(string type) =>
+        (_teamAgents?.Contains(type) ?? false) ||
         AvailableTypeNames.Contains(type, StringComparer.Ordinal);
 
     public IReadOnlyList<SubagentTypeInfo> GetTypeInfo()
     {
-        var infos = new List<SubagentTypeInfo>(AvailableTypeNames.Length);
+        var infos = new List<SubagentTypeInfo>();
+
+        // Project agents first so /agents surfaces the user's own team at the top.
+        if (_teamAgents is not null)
+        {
+            foreach (var def in _teamAgents.All)
+            {
+                var allowed = def.AllowedTools is { Count: > 0 }
+                    ? (IReadOnlyList<string>)def.AllowedTools.OrderBy(n => n, StringComparer.Ordinal).ToList()
+                    : new[] { "*" };
+                infos.Add(new SubagentTypeInfo(def.Name, def.Description, allowed));
+            }
+        }
+
         foreach (var type in AvailableTypeNames)
         {
+            if (_teamAgents?.Contains(type) == true) continue; // shadowed by a project agent
             var allowed = ToolPolicyByType.TryGetValue(type, out var set)
                 ? (IReadOnlyList<string>)set.OrderBy(n => n, StringComparer.Ordinal).ToList()
                 : new[] { "*" };
@@ -169,7 +206,7 @@ public sealed class SubagentRunner : ISubagentRunner
 
     private async Task<SubagentResult> RunOnceAsync(SubagentRequest request, string label, int fleetId, CancellationToken ct)
     {
-        var subRegistry = BuildRegistryForType(request.Type, _parent.Tools);
+        var subRegistry = BuildRegistryFor(request.Type);
         // Resolve which model the subagent runs on. Priority:
         //   1. request.OverrideModel — set by TaskTool when SubagentModelResolver picked a
         //      tiered model for the requested subagent_type (e.g. code-reviewer → light tier).
@@ -188,7 +225,7 @@ public sealed class SubagentRunner : ISubagentRunner
         var subOptions = _parent.Options with
         {
             Model = resolvedModel,
-            SystemPrompt = SystemPromptForType(request.Type),
+            SystemPrompt = SystemPromptFor(request.Type),
             MaxTurns = request.MaxTurns,
         };
 
@@ -256,6 +293,40 @@ public sealed class SubagentRunner : ISubagentRunner
             output.Dispose();
             status.Dispose();
         }
+    }
+
+    /// <summary>Registry-first tool set: a project agent's own tool policy wins over a built-in of the
+    /// same name; otherwise fall through to the built-in profiles.</summary>
+    private ToolRegistry BuildRegistryFor(string type) =>
+        _teamAgents?.TryGet(type, out var def) == true
+            ? BuildRegistryForDefinition(def, _parent.Tools)
+            : BuildRegistryForType(type, _parent.Tools);
+
+    /// <summary>Registry-first system prompt: a project agent's own prompt wins; else the built-in.</summary>
+    private string SystemPromptFor(string type) =>
+        _teamAgents?.TryGet(type, out var def) == true
+            ? def.SystemPrompt
+            : SystemPromptForType(type);
+
+    /// <summary>
+    /// Builds a registry from a project <see cref="AgentDefinition"/>. A null AllowedTools means the
+    /// general-purpose profile (every parent tool except Agent); a non-null set restricts to exactly
+    /// those tools. The Agent tool is always excluded (no recursive sub-spawning), and stateful tools
+    /// are cloned per subagent so parallel agents don't share mutable state.
+    /// </summary>
+    internal static ToolRegistry BuildRegistryForDefinition(AgentDefinition def, ToolRegistry parent)
+    {
+        if (def.AllowedTools is null)
+            return BuildRegistryForType("general-purpose", parent);
+
+        var result = new ToolRegistry();
+        foreach (var tool in parent.All)
+        {
+            if (tool.Schema.Name == Zdtllm.Tools.TaskTool.ToolName) continue; // never the Agent tool
+            if (def.AllowedTools.Contains(tool.Schema.Name))
+                result.Register(tool.CloneForSubagent());
+        }
+        return result;
     }
 
     /// <summary>
