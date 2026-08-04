@@ -125,8 +125,22 @@ internal static class SpectreChoice
 
     private static string FormatSlash(SlashCommandInfo c) =>
         ReferenceEquals(c, SlashCancelSentinel)
-            ? $"[{Mute}]{Markup.Escape(c.Name)}[/]"
-            : $"[bold {Cyan}]{Markup.Escape(c.Name)}[/]\n    [{Mute}]{Markup.Escape(c.Description)}[/]";
+            ? $"[{Mute}]{SearchSafe(c.Name)}[/]"
+            : $"[bold {Cyan}]{SearchSafe(c.Name)}[/]\n    [{Mute}]{SearchSafe(c.Description)}[/]";
+
+    /// <summary>
+    /// Escape user text for markup AND swap square brackets for angle brackets. This is the
+    /// slash picker's converter, and the picker has <c>EnableSearch()</c>. <see cref="Markup.Escape"/>
+    /// alone protects only the FIRST paint: Spectre 0.49's SelectionPrompt search highlighter
+    /// re-parses each item's plain (un-escaped) display text as markup to underline the match, so a
+    /// literal <c>[path]</c> in a description (e.g. "/export [path]") is read as a style token and
+    /// throws <c>Could not find color or style 'path'</c> the moment you type to filter. The picker
+    /// then dies mid-render, the keystroke is swallowed, and the rest of what you type lands in the
+    /// message box — a slash command gets sent as a message. Removing '[' from the VISIBLE text is
+    /// what makes the search path safe; '&lt;name&gt;' also matches the placeholder style already used by
+    /// "/workflow &lt;name&gt; key=value".
+    /// </summary>
+    private static string SearchSafe(string s) => Markup.Escape(s.Replace('[', '<').Replace(']', '>'));
 
     private static async Task<string> ReadFreeTextAsync(IAnsiConsole console, CancellationToken ct) =>
         await new TextPrompt<string>($"[{Cyan}]Your answer:[/]").AllowEmpty().ShowAsync(console, ct)
