@@ -192,15 +192,30 @@ public static partial class XmlToolCallParser
     }
 
     /// <summary>
-    /// Returns the input text with reasoning preambles and both flavors of tool-call
-    /// blocks (function_calls and tool_call) removed. Used to clean assistant text
-    /// before showing it to the user.
+    /// Returns the input text with reasoning preambles AND both flavors of tool-call
+    /// markup removed. Used to clean assistant text before showing it to the user in XML mode.
+    /// Native mode uses <see cref="StripToolCallMarkup"/> instead, so a leading &lt;think&gt; block
+    /// survives for reasoning capture.
     /// </summary>
     public static string Strip(string text)
     {
         if (string.IsNullOrEmpty(text)) return text;
-        var s = StripThinkingPreamble(text);
-        s = OpenHandsBlockRegex().Replace(s, string.Empty);
+        return StripToolCallMarkup(StripThinkingPreamble(text));
+    }
+
+    /// <summary>
+    /// Remove tool-call markup — complete blocks of either dialect, truncated-open residue, AND any
+    /// orphaned open/close tags (e.g. a bare <c>&lt;/parameter&gt;&lt;/function&gt;&lt;/tool_call&gt;</c>
+    /// left behind when a lenient server-side parser consumes the call but not its closing tags) —
+    /// WITHOUT touching a thinking preamble. That last part matters in native mode, where the caller
+    /// still needs to see and capture a leading <c>&lt;think&gt;</c> block; <see cref="Strip"/> layers
+    /// the thinking-preamble removal on top for XML mode.
+    /// </summary>
+    public static string StripToolCallMarkup(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+
+        var s = OpenHandsBlockRegex().Replace(text, string.Empty);
         s = HermesBlockRegex().Replace(s, string.Empty);
 
         // Salvage strip: same broken-open-tag case the recovery extractor handles. Without
@@ -212,6 +227,12 @@ public static partial class XmlToolCallParser
         s = OrphanInvokeRegex().Replace(s, string.Empty);
         s = OrphanHermesFunctionRegex().Replace(s, string.Empty);
         s = TruncatedOpenSignatureRegex().Replace(s, string.Empty);
+
+        // Final sweep: any lone tool-call-vocabulary tag (open or close, with or without attributes)
+        // that the paired strips above didn't catch — the exact fragments a jinja/vLLM parser leaves
+        // in `content` after extracting a native call (</parameter></function></tool_call>). These tag
+        // names are tool-call syntax, effectively never legitimate prose in an agent's answer.
+        s = OrphanToolTagRegex().Replace(s, string.Empty);
 
         return s;
     }
@@ -238,6 +259,16 @@ public static partial class XmlToolCallParser
     /// </summary>
     [GeneratedRegex(@"(?:^|\n)_calls?>\s*", RegexOptions.None)]
     private static partial Regex TruncatedOpenSignatureRegex();
+
+    /// <summary>
+    /// Any single tool-call-vocabulary tag — open or close, bare or with attributes / the Hermes
+    /// <c>=name</c> form — for the tag names that only ever appear in tool-call syntax. Deliberately
+    /// scoped to that vocabulary so it can't eat ordinary markup an answer might legitimately contain.
+    /// </summary>
+    [GeneratedRegex(
+        @"<\s*/?\s*(?:function_calls|tool_call|invoke|function|parameter|arg_key|arg_value)(?:\s*=\s*[^>]*|\s+[^>]*)?\s*>",
+        RegexOptions.None)]
+    private static partial Regex OrphanToolTagRegex();
 
     private static string StripThinkingPreamble(string text)
     {

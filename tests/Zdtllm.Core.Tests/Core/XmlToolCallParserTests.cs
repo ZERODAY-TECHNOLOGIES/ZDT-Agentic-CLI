@@ -338,6 +338,54 @@ public sealed class XmlToolCallParserTests
         stripped.Should().NotContain("function_calls");
     }
 
+    [Fact]
+    public void StripToolCallMarkup_removes_orphan_closing_tags_left_after_a_parsed_call()
+    {
+        // The exact leak: a lenient server parsed the native call and left only the closing tags in
+        // content. Neither the block nor the paired-orphan strips catch bare closes — this must.
+        var text = "Let me write the fixed Common.h and source files.\n</parameter>\n</function>\n</tool_call>";
+
+        var stripped = XmlToolCallParser.StripToolCallMarkup(text).Trim();
+
+        stripped.Should().Be("Let me write the fixed Common.h and source files.");
+        stripped.Should().NotContain("</parameter>");
+        stripped.Should().NotContain("</function>");
+        stripped.Should().NotContain("</tool_call>");
+    }
+
+    [Fact]
+    public void StripToolCallMarkup_removes_lone_open_tags_of_the_tool_vocabulary()
+    {
+        var text = "before <tool_call> <function=Write> <parameter name=\"p\"> <arg_key> after";
+        var stripped = XmlToolCallParser.StripToolCallMarkup(text);
+
+        stripped.Should().Contain("before");
+        stripped.Should().Contain("after");
+        stripped.Should().NotContain("<tool_call>");
+        stripped.Should().NotContain("<function=");
+        stripped.Should().NotContain("<parameter");
+        stripped.Should().NotContain("<arg_key>");
+    }
+
+    [Fact]
+    public void StripToolCallMarkup_preserves_a_thinking_block_unlike_Strip()
+    {
+        // Native mode captures a leading <think> into reasoning AFTER stripping tool markup, so the
+        // markup-only strip must NOT drop the think block (Strip, used by XML mode, still does).
+        var text = "<think>planning</think>the answer</tool_call>";
+
+        XmlToolCallParser.StripToolCallMarkup(text).Should().Contain("<think>planning</think>");
+        XmlToolCallParser.StripToolCallMarkup(text).Should().NotContain("</tool_call>");
+        XmlToolCallParser.Strip(text).Should().NotContain("<think>"); // Strip drops the preamble
+    }
+
+    [Fact]
+    public void StripToolCallMarkup_leaves_ordinary_prose_untouched()
+    {
+        const string prose = "Here is the plan: fix the include order, then rebuild. No markup here.";
+        XmlToolCallParser.StripToolCallMarkup(prose).Should().Be(prose);
+    }
+
     // ─── Format-breakdown / corrupted-open-tag recovery ───────────────────────────────────
 
     [Fact]

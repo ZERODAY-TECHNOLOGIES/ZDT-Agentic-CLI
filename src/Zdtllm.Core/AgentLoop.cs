@@ -435,6 +435,8 @@ public sealed class AgentLoop
         bool reasoningOnlyRecoveryTried = false;
         // Native-mode XML-salvage warning is emitted at most once per run (see the salvage block).
         bool nativeSalvageWarned = false;
+        // Native-mode "tool-call tags leaked into content and were stripped" hint — once per run.
+        bool nativeLeakWarned = false;
         // Auto-compact "can't free anything" notice is printed at most once per context level, not
         // every iteration — otherwise a single long task that sits above the threshold spams the
         // identical "[context ~X%]" line on every tool round. Reset to -1 whenever a pass frees space.
@@ -701,9 +703,28 @@ public sealed class AgentLoop
 
             if (nativeCalls.Length == 0 && xmlCalls.Count == 0)
             {
+                // Strip tool-call markup from what we SHOW the user. XML mode uses the full Strip
+                // (which also drops a leading think block); native mode uses StripToolCallMarkup so a
+                // leading <think> survives for the reasoning capture below — but any tool-call tags a
+                // lenient server leaked into content (e.g. </parameter></function></tool_call> left
+                // after the call was parsed) are removed either way, instead of shown as garbage.
+                var rawAssistant = assistantText.ToString();
                 var displayText = xmlMode
-                    ? XmlToolCallParser.Strip(assistantText.ToString()).TrimEnd()
-                    : assistantText.ToString();
+                    ? XmlToolCallParser.Strip(rawAssistant).TrimEnd()
+                    : XmlToolCallParser.StripToolCallMarkup(rawAssistant).TrimEnd();
+
+                // If native-mode content actually carried tool-call markup, the model's tool calls are
+                // not being parsed cleanly by the server. Point the user at the durable fix, once.
+                if (!xmlMode && !nativeLeakWarned
+                    && XmlToolCallParser.StripToolCallMarkup(rawAssistant).Length != rawAssistant.Length)
+                {
+                    nativeLeakWarned = true;
+                    await status.WriteLineAsync(Palette.Mute(
+                        "  ↳ cleaned tool-call markup leaking into the model's text — the server isn't parsing " +
+                        "this model's tool calls cleanly (add a server-side tool parser, or run this model " +
+                        "with /tool-calling xml)."))
+                        .ConfigureAwait(false);
+                }
 
                 // Some deployments inline reasoning as a LEADING <think>…</think> in content
                 // instead of the reasoning_content channel. Strip a leading think block only
@@ -745,8 +766,9 @@ public sealed class AgentLoop
                     }
 
                     // Recovery already tried and still empty → surface the captured reasoning as a
-                    // labeled last resort instead of returning a blank answer.
-                    var fallback = reasoningText.ToString().Trim();
+                    // labeled last resort instead of returning a blank answer. Strip any tool-call
+                    // markup the reasoning carried so the fallback shows prose, not </tool_call> junk.
+                    var fallback = XmlToolCallParser.StripToolCallMarkup(reasoningText.ToString()).Trim();
                     if (fallback.Length > 0)
                     {
                         displayText = fallback;
