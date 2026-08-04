@@ -81,6 +81,21 @@ public interface ITurnInputCapture
 
     /// <summary>Stop capturing and wait for the reader to fully quiesce.</summary>
     Task EndCaptureAsync();
+
+    /// <summary>
+    /// Show an animated "compacting…" indicator for the lifetime of the returned handle, while a
+    /// blocking <see cref="ContextManager.CompactAsync"/> runs. Front-ends that render compaction
+    /// another way (rich-console spinner) or not at all (tests) keep the default no-op.
+    /// </summary>
+    IDisposable BeginCompacting() => NoopDisposable.Instance;
+}
+
+/// <summary>A do-nothing <see cref="IDisposable"/> for optional-hook defaults.</summary>
+public sealed class NoopDisposable : IDisposable
+{
+    public static readonly NoopDisposable Instance = new();
+    private NoopDisposable() { }
+    public void Dispose() { }
 }
 
 /// <inheritdoc cref="IUserInputQueue"/>

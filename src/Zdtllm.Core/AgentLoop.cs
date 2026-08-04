@@ -104,6 +104,9 @@ public sealed class AgentLoop
     private readonly ContextManager? _context;
     private readonly IAnsiConsole? _richConsole;
     private readonly IAgentObserver? _observer;
+    // Front-end hook used to animate mid-turn auto-compact in the bottom-input TUI (where there is
+    // no rich console). Null in rich/print/test modes — CompactionUx falls back accordingly.
+    private readonly ITurnInputCapture? _inputCapture;
 
     /// <summary>
     /// When set (and no rich console is wired), the model's final/narration text is rendered
@@ -261,7 +264,8 @@ public sealed class AgentLoop
         IPlanModeSwitch? planMode = null,
         ITypeAheadStatus? typeAhead = null,
         Func<string, string>? markdownAnsi = null,
-        IInteractivePrompter? prompter = null)
+        IInteractivePrompter? prompter = null,
+        ITurnInputCapture? inputCapture = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(tools);
@@ -279,6 +283,7 @@ public sealed class AgentLoop
         _typeAhead = typeAhead;
         _markdownAnsi = markdownAnsi;
         _prompter = prompter ?? UnavailablePrompter.Instance;
+        _inputCapture = inputCapture;
     }
 
     public PermissionRuleSet Permissions => _perms;
@@ -797,7 +802,8 @@ public sealed class AgentLoop
                     .ConfigureAwait(false);
                 try
                 {
-                    await _context.CompactAsync(session, _client, ct).ConfigureAwait(false);
+                    await CompactionUx.RunAsync(_richConsole, _inputCapture,
+                        () => _context.CompactAsync(session, _client, ct)).ConfigureAwait(false);
 
                     // Summarisation keeps the last K *user* turns verbatim and only collapses whole
                     // turns in between. Inside one long agentic turn there is a single user message,

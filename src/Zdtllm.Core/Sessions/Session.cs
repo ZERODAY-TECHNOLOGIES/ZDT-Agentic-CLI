@@ -105,9 +105,35 @@ public sealed class Session : IDisposable
             throw new InvalidOperationException(
                 $"Session file '{store.Path}' has no meta event; cannot resume.");
 
+        // Heal sessions compacted by an older build. Chat templates for Qwen3.x / GLM reject any
+        // system message that is not the first ("System message must be at the beginning"); a stale
+        // compaction snapshot stored the summary as a SECOND system message, so merge every system
+        // message into the first before the replayed history is ever sent.
+        CoalesceSystemMessages(msgs);
+
         var session = new Session(store.SessionId, model, name, mode, store);
         session._messages.AddRange(msgs);
         return session;
+    }
+
+    /// <summary>
+    /// Collapse multiple system messages into a single leading one (contents joined, order kept).
+    /// A no-op when there are 0 or 1 system messages. Needed because some chat templates raise
+    /// "System message must be at the beginning" for any non-leading system message.
+    /// </summary>
+    private static void CoalesceSystemMessages(List<ChatMessage> msgs)
+    {
+        var idx = new List<int>();
+        for (var i = 0; i < msgs.Count; i++)
+            if (msgs[i].Role == "system") idx.Add(i);
+        if (idx.Count <= 1) return;
+
+        var merged = string.Join("\n\n",
+            idx.Select(i => msgs[i].Content).Where(c => !string.IsNullOrEmpty(c)));
+        // Remove the trailing system messages first so earlier indices stay valid, then fold all
+        // content into the first system slot (its index is unaffected by the later removals).
+        for (var k = idx.Count - 1; k >= 1; k--) msgs.RemoveAt(idx[k]);
+        msgs[idx[0]] = msgs[idx[0]] with { Content = merged };
     }
 
     public void AddSystem(string content)

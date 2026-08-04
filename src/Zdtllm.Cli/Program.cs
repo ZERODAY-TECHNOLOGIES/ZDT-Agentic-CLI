@@ -389,7 +389,10 @@ internal static class Program
             // Same human-facing prompter that backs AskUserQuestion/ExitPlanMode: drives the
             // interactive allow / always-allow / deny prompt when a tool call needs permission.
             // Null in print mode (no TTY) → the loop keeps the text-error fallback.
-            prompter: prompter);
+            prompter: prompter,
+            // The TUI (when on) animates mid-turn auto-compact on its status row. Null in rich mode,
+            // where AgentLoop falls back to a Spectre status spinner via the rich console instead.
+            inputCapture: tui);
 
         // Task tool needs the parent agent to spawn subagents from. Register it AFTER the
         // agent is built — the registry holds a live reference, so the parent agent will see

@@ -190,13 +190,16 @@ public sealed class ContextManagerTests : IDisposable
         var collapsed = await ctx.CompactAsync(session, client);
 
         collapsed.Should().Be(4); // u1+a1+u2+a2
-        // After compaction: system + summary + last 4 user turns and their assistants (8 messages).
-        session.Messages.Should().HaveCount(1 + 1 + 8);
-        session.Messages[0].Content.Should().Be("you are zdt");
-        session.Messages[1].Role.Should().Be("system");
-        session.Messages[1].Content.Should().Contain("conversation_summary");
-        session.Messages[1].Content.Should().Contain("Synthetic recap");
-        session.Messages[2].Content.Should().Be("u3");
+        // After compaction: ONE leading system message (prompt + summary folded together, so the
+        // Qwen/GLM "system must be first" template constraint holds) + the last 4 user turns and
+        // their assistants (8 messages).
+        session.Messages.Should().HaveCount(1 + 8);
+        session.Messages.Count(m => m.Role == "system").Should().Be(1);
+        session.Messages[0].Role.Should().Be("system");
+        session.Messages[0].Content.Should().Contain("you are zdt");
+        session.Messages[0].Content.Should().Contain("conversation_summary");
+        session.Messages[0].Content.Should().Contain("Synthetic recap");
+        session.Messages[1].Content.Should().Be("u3");
         session.Messages[^1].Content.Should().Be("a6");
 
         // The summarisation request hit the medium model with the compaction system prompt.
@@ -247,9 +250,34 @@ public sealed class ContextManagerTests : IDisposable
 
         using var resumed = Session.Resume(SessionStore.OpenForResume(_tempDir, sessionId));
 
-        resumed.Messages.Should().HaveCount(1 + 1 + 8);
-        resumed.Messages[1].Content.Should().Contain("conversation_summary");
-        resumed.Messages[2].Content.Should().Be("u3");
+        resumed.Messages.Should().HaveCount(1 + 8);
+        resumed.Messages.Count(m => m.Role == "system").Should().Be(1);
+        resumed.Messages[0].Content.Should().Contain("conversation_summary");
+        resumed.Messages[1].Content.Should().Be("u3");
+    }
+
+    [Fact]
+    public void Resume_heals_an_older_double_system_compaction_into_one_leading_system()
+    {
+        // A build before the "system must be first" fix persisted the summary as a SECOND system
+        // message. Resume must coalesce the two so the replayed history is valid to send again.
+        var store = SessionStore.Create(_tempDir);
+        var sessionId = store.SessionId;
+
+        using (var session = Session.NewPersistent(store, "m"))
+        {
+            session.AddSystem("base prompt");
+            session.AddSystem("<conversation_summary>\nrecap\n</conversation_summary>"); // old broken shape
+            session.AddUser("hi again");
+        }
+
+        using var resumed = Session.Resume(SessionStore.OpenForResume(_tempDir, sessionId));
+
+        resumed.Messages.Count(m => m.Role == "system").Should().Be(1);
+        resumed.Messages[0].Role.Should().Be("system");
+        resumed.Messages[0].Content.Should().Contain("base prompt");
+        resumed.Messages[0].Content.Should().Contain("conversation_summary");
+        resumed.Messages[1].Content.Should().Be("hi again");
     }
 
     [Fact]

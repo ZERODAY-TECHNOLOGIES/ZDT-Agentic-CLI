@@ -73,6 +73,7 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     private string _historyDraft = "";
     private TaskCompletionSource<string?>? _pendingRead;
     private long _thinkingStartTicks; // 0 = idle; otherwise Stopwatch ticks at turn start
+    private long _compactingStartTicks; // 0 = not compacting; otherwise Stopwatch ticks at compaction start
     private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
 
     private CancellationTokenSource? _cts;
@@ -162,6 +163,32 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
         return Task.CompletedTask;
     }
 
+    // Animated "compacting…" indicator for the status row, for the lifetime of the returned handle.
+    // Works whether or not a turn is active: the reader loop already redraws the status row on a
+    // timer while thinking OR compacting, and StatusText shows compacting with priority. During
+    // manual /compact the box is idle (no thinking), so this is the only thing animating; during
+    // mid-turn auto-compact it briefly supersedes the "thinking" label, which resumes on dispose.
+    public IDisposable BeginCompacting()
+    {
+        Interlocked.Exchange(ref _compactingStartTicks, _clock.ElapsedTicks == 0 ? 1 : _clock.ElapsedTicks);
+        TerminalStatus.Working();
+        RedrawStatusRow();
+        return new CompactingScope(this);
+    }
+
+    private void EndCompacting()
+    {
+        Interlocked.Exchange(ref _compactingStartTicks, 0);
+        RedrawStatusRow();
+    }
+
+    private sealed class CompactingScope : IDisposable
+    {
+        private BottomInputTui? _tui;
+        public CompactingScope(BottomInputTui tui) => _tui = tui;
+        public void Dispose() { var t = _tui; _tui = null; t?.EndCompacting(); }
+    }
+
     // ---- reader loop ----
 
     private void ReaderLoop(CancellationToken ct)
@@ -198,9 +225,10 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
                     RedrawBox();
                     lastTick = now;
                 }
-                else if (Volatile.Read(ref _thinkingStartTicks) != 0 && now - lastTick > 180)
+                else if ((Volatile.Read(ref _thinkingStartTicks) != 0
+                          || Volatile.Read(ref _compactingStartTicks) != 0) && now - lastTick > 180)
                 {
-                    // ~5x/sec while thinking: only the status row changes — repaint just it.
+                    // ~5x/sec while thinking or compacting: only the status row changes — repaint just it.
                     RedrawStatusRow();
                     lastTick = now;
                 }
@@ -642,6 +670,15 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
 
     private string StatusText()
     {
+        // Compacting takes priority: it can run mid-turn (thinking also set) and is the more
+        // specific thing happening. Same animated-dots + elapsed style as the thinking indicator.
+        var compacting = Volatile.Read(ref _compactingStartTicks);
+        if (compacting != 0)
+        {
+            var secs = (int)TimeSpan.FromTicks(_clock.ElapsedTicks - compacting + 1).TotalSeconds;
+            var dots = new string('.', 1 + (int)((_clock.ElapsedMilliseconds / 400) % 3));
+            return $"{Cyan}⏺ compacting conversation{dots}{Reset} {Mute}({secs}s · summarising older turns){Reset}";
+        }
         var thinking = Volatile.Read(ref _thinkingStartTicks);
         if (thinking != 0)
         {

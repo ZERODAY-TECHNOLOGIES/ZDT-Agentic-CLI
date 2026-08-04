@@ -738,7 +738,8 @@ public sealed class Repl
 
         try
         {
-            var collapsed = await ctx.CompactAsync(_session, _agent.Client, ct).ConfigureAwait(false);
+            var collapsed = await CompactionUx.RunAsync(_richConsole, _inputCapture,
+                () => ctx.CompactAsync(_session, _agent.Client, ct)).ConfigureAwait(false);
             if (collapsed == 0)
             {
                 await _output.WriteLineAsync(

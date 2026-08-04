@@ -112,9 +112,22 @@ public sealed class ContextManager
 
         var summary = await SummarizeAsync(summarizable, client, ct).ConfigureAwait(false);
 
-        var rebuilt = new List<ChatMessage>(systemPart.Count + 1 + tail.Count);
-        rebuilt.AddRange(systemPart);
-        rebuilt.Add(ChatMessage.System($"<conversation_summary>\n{summary.Trim()}\n</conversation_summary>"));
+        // Fold the summary into a SINGLE leading system message. Chat templates for Qwen3.x
+        // (and GLM via vLLM) hard-require the only system message to be first and raise
+        // "System message must be at the beginning" for any other — so the summary must NOT be
+        // its own second system message, or every turn after compaction 400s. Concatenate the
+        // original system prompt with the <conversation_summary> block instead.
+        var summaryBlock = $"<conversation_summary>\n{summary.Trim()}\n</conversation_summary>";
+        var systemText = string.Join("\n\n", systemPart
+            .Where(m => m.Role == "system" && !string.IsNullOrEmpty(m.Content))
+            .Select(m => m.Content!)
+            .Append(summaryBlock));
+
+        var rebuilt = new List<ChatMessage>(1 + tail.Count) { ChatMessage.System(systemText) };
+        // Preserve any non-system head messages (there are none in a normal session, whose head
+        // is just the system prompt) after the single system line.
+        foreach (var m in systemPart)
+            if (m.Role != "system") rebuilt.Add(m);
         rebuilt.AddRange(tail);
 
         session.Compact(rebuilt);
