@@ -406,6 +406,10 @@ public sealed class AgentLoop
         bool reasoningOnlyRecoveryTried = false;
         // Native-mode XML-salvage warning is emitted at most once per run (see the salvage block).
         bool nativeSalvageWarned = false;
+        // Auto-compact "can't free anything" notice is printed at most once per context level, not
+        // every iteration — otherwise a single long task that sits above the threshold spams the
+        // identical "[context ~X%]" line on every tool round. Reset to -1 whenever a pass frees space.
+        int autoCompactQuietPct = -1;
 
         try
         {
@@ -796,27 +800,35 @@ public sealed class AgentLoop
             if (_context is not null
                 && (_context.IsBeyondHardThreshold || _context.IsProjectedBeyondHardThreshold(session)))
             {
-                await status.WriteLineAsync(
-                    Palette.Red($"[auto-compact at {_context.UsagePercent}%]") + " " +
-                    Palette.Mute("summarising older turns mid-task to free context"))
-                    .ConfigureAwait(false);
                 try
                 {
-                    await CompactionUx.RunAsync(_richConsole, _inputCapture,
-                        () => _context.CompactAsync(session, _client, ct)).ConfigureAwait(false);
+                    // Summarise past user turns, then escalate tool-result truncation until under
+                    // the threshold — animated as one "compacting…" operation.
+                    var freed = await CompactionUx.RunAsync(_richConsole, _inputCapture,
+                        () => _context.CompactToFitAsync(session, _client, ct)).ConfigureAwait(false);
 
-                    // Summarisation keeps the last K *user* turns verbatim and only collapses whole
-                    // turns in between. Inside one long agentic turn there is a single user message,
-                    // so it can free nothing — yet the tool results just appended may still overflow
-                    // the window. Fall back to truncating the oldest tool results in place so the
-                    // next request doesn't 400. (No-op when summarisation already brought us under.)
-                    if (_context.IsProjectedBeyondHardThreshold(session))
+                    var after = ContextManager.EstimateSessionTokens(session);
+                    var pct = (int)Math.Round(100.0 * after / _context.ContextWindow);
+
+                    if (freed > 500)
                     {
-                        var truncated = _context.TruncateOldToolResults(session);
-                        if (truncated > 0)
-                            await status.WriteLineAsync(
-                                Palette.Mute($"  ↳ truncated {truncated} older tool result(s) to free context"))
-                                .ConfigureAwait(false);
+                        // Made progress — report the new level and re-arm the stuck notice.
+                        await status.WriteLineAsync(
+                            Palette.Cyan("  ↳ auto-compacted") + " " +
+                            Palette.Mute($"freed ~{freed:N0} tokens · context now ~{pct}%"))
+                            .ConfigureAwait(false);
+                        autoCompactQuietPct = -1;
+                    }
+                    else if (autoCompactQuietPct != pct)
+                    {
+                        // Nothing could be freed (the bulk is in the newest results we keep verbatim,
+                        // or in assistant text). Say so ONCE per level, not every iteration, and note
+                        // the run continues — requests still succeed while they fit the real window.
+                        await status.WriteLineAsync(
+                            Palette.Gold($"[context ~{pct}%]") + " " +
+                            Palette.Mute("can't compact further this turn (single long task) — continuing"))
+                            .ConfigureAwait(false);
+                        autoCompactQuietPct = pct;
                     }
                 }
                 catch (Exception ex)

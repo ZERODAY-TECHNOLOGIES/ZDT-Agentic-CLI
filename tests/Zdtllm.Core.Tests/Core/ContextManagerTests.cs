@@ -375,4 +375,47 @@ public sealed class ContextManagerTests : IDisposable
         ctx.TruncateOldToolResults(session, keepLastToolResults: 3).Should().Be(0);
         session.Messages.Single(m => m.Role == "tool").Content!.Length.Should().Be(9_000);
     }
+
+    private static Session BigSingleTurnSession()
+    {
+        // One user turn, then 6 assistant⇄tool rounds with 16 KB of tool output each (~24k tokens
+        // total) — the single-long-turn shape where summarisation frees nothing.
+        var session = Session.NewEphemeral("m");
+        session.AddSystem("sys");
+        session.AddUser("do the big task");
+        for (var i = 0; i < 6; i++)
+        {
+            session.AddAssistant(null, ImmutableArray.Create(new ToolCall($"c{i}", "Read", "{}")));
+            session.AddTool($"c{i}", new string((char)('a' + i), 16_000));
+        }
+        return session;
+    }
+
+    [Fact]
+    public async Task CompactToFitAsync_escalates_truncation_to_get_a_single_long_turn_under_threshold()
+    {
+        var ctx = new ContextManager(contextWindow: 10_000, mediumModel: "med"); // hard threshold ≈ 9k tokens
+
+        // A single fixed-cap pass is NOT enough: the newest results kept verbatim still overflow.
+        using (var oneShot = BigSingleTurnSession())
+        {
+            ctx.TruncateOldToolResults(oneShot, keepLastToolResults: 3, perResultCap: 2_000);
+            ctx.IsProjectedBeyondHardThreshold(oneShot)
+                .Should().BeTrue("one truncation pass at a fixed cap leaves the big recent results in place");
+        }
+
+        // CompactToFitAsync escalates (keep 3→2→1, cap 2000→1000→500) until under the threshold.
+        using var session = BigSingleTurnSession();
+        ctx.IsProjectedBeyondHardThreshold(session).Should().BeTrue();
+
+        // One user turn short-circuits summarisation, so the client is never called.
+        var client = BuildClient(new StubHandler());
+        var freed = await ctx.CompactToFitAsync(session, client);
+
+        freed.Should().BeGreaterThan(0);
+        ctx.IsProjectedBeyondHardThreshold(session)
+            .Should().BeFalse("escalating truncation brings a single long turn back under the window");
+        session.Messages.Last(m => m.Role == "tool").Content!.Length
+            .Should().Be(16_000, "the newest tool result stays verbatim even at the most aggressive level");
+    }
 }

@@ -53,11 +53,20 @@ public sealed class ContextManager
     /// crossed 90% would not auto-compact and the next request would hit the LiteLLM 400.
     /// </summary>
     public bool IsProjectedBeyondHardThreshold(Session session)
+        => EstimateSessionTokens(session) >= ContextWindow * HardThreshold;
+
+    /// <summary>
+    /// Approximate total token count for the whole session (sum of <see cref="EstimateTokensByRole"/>,
+    /// at 4 chars/token). Used to measure how much a compaction pass freed and to project the next
+    /// prompt's size independently of the server's last reported <see cref="LastPromptTokens"/>
+    /// (which is reset to 0 right after a compaction).
+    /// </summary>
+    public static int EstimateSessionTokens(Session session)
     {
         ArgumentNullException.ThrowIfNull(session);
-        var totalTokens = 0;
-        foreach (var (_, t) in EstimateTokensByRole(session)) totalTokens += t;
-        return totalTokens >= ContextWindow * HardThreshold;
+        var total = 0;
+        foreach (var (_, t) in EstimateTokensByRole(session)) total += t;
+        return total;
     }
 
     /// <summary>
@@ -136,6 +145,35 @@ public sealed class ContextManager
         // server response updates it.
         LastPromptTokens = 0;
         return summarizable.Count;
+    }
+
+    /// <summary>
+    /// Free as much context as possible for the current session and return the estimated number of
+    /// tokens freed. First <see cref="CompactAsync"/> (summarise whole past user turns), then trim
+    /// old tool results in place with ESCALATING aggressiveness (keep fewer verbatim, cap smaller)
+    /// until under the hard threshold or nothing is left to trim.
+    ///
+    /// <para>
+    /// The escalation is the fix for the single-long-turn loop: summarisation is a no-op when there
+    /// is only one user message, and a single fixed-cap truncation pass often can't get under the
+    /// threshold, so the old auto-compact printed the same warning every iteration while the context
+    /// never shrank. Returns 0 when nothing could be freed (the bulk lives in the newest results we
+    /// keep verbatim, or in assistant text, neither of which this touches).
+    /// </para>
+    /// </summary>
+    public async Task<int> CompactToFitAsync(Session session, LiteLLMClient client, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(client);
+
+        var before = EstimateSessionTokens(session);
+        await CompactAsync(session, client, ct).ConfigureAwait(false);
+        foreach (var (keep, cap) in new[] { (3, 2000), (2, 1000), (1, 500) })
+        {
+            if (!IsProjectedBeyondHardThreshold(session)) break;
+            TruncateOldToolResults(session, keep, cap);
+        }
+        return Math.Max(0, before - EstimateSessionTokens(session));
     }
 
     /// <summary>
