@@ -622,4 +622,34 @@ public sealed class XmlToolCallParserTests
         using var doc = JsonDocument.Parse(calls[0].ArgumentsJson);
         doc.RootElement.TryGetProperty("foo", out _).Should().BeFalse("the fallback dialect must not run once the primary matched");
     }
+
+    [Fact]
+    public void Unescaped_ampersands_in_a_value_round_trip_verbatim()
+    {
+        // The parser is regex-based, not a real XML reader, and does NO entity decoding — a bare &
+        // (or &&, a query string) needs no escaping and is captured verbatim. Both dialects.
+        var openHands =
+            """
+            <function_calls>
+            <invoke name="Bash"><parameter name="command">grep foo && curl http://x?a=1&b=2</parameter></invoke>
+            </function_calls>
+            """;
+        using var d1 = JsonDocument.Parse(XmlToolCallParser.ExtractCalls(openHands).Single().ArgumentsJson);
+        d1.RootElement.GetProperty("command").GetString().Should().Be("grep foo && curl http://x?a=1&b=2");
+
+        var hermes = "<tool_call><function=Bash><parameter=command>a & b && c</parameter></function></tool_call>";
+        using var d2 = JsonDocument.Parse(XmlToolCallParser.ExtractCalls(hermes).Single().ArgumentsJson);
+        d2.RootElement.GetProperty("command").GetString().Should().Be("a & b && c");
+    }
+
+    [Fact]
+    public void Xml_entities_in_a_value_are_kept_literal_not_decoded()
+    {
+        // Consequence of the same design: if a value contains "&amp;" it stays "&amp;" (NOT decoded
+        // to "&"). This model's Qwen3-Coder template emits RAW values (no escaping), so this is
+        // correct in practice — decoding would corrupt content that legitimately contains entities.
+        var text = "<tool_call><function=Echo><parameter=text>Tom &amp; Jerry &lt;3</parameter></function></tool_call>";
+        using var doc = JsonDocument.Parse(XmlToolCallParser.ExtractCalls(text).Single().ArgumentsJson);
+        doc.RootElement.GetProperty("text").GetString().Should().Be("Tom &amp; Jerry &lt;3");
+    }
 }

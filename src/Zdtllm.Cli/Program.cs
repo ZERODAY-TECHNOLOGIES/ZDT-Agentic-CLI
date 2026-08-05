@@ -1475,13 +1475,14 @@ internal static class Program
 
         // Mode resolution prioritises an explicit choice (CLI flag, then settings.json). When
         // neither is set, infer from the model name via ModelHeuristics: open-weights chat
-        // templates (qwen / deepseek / hermes / kimi / yi / mistral-nemo / local) generally don't
+        // templates (deepseek / hermes / kimi / yi / mistral-nemo / local) generally don't
         // expose OpenAI-shaped function-calling on LiteLLM and fall back to text — Native mode would
         // silently drop tool calls every turn. Auto-switching to XML + a one-line stderr note keeps
-        // them working out of the box. GLM is deliberately NOT in that set: GLM-4.5/4.6/5.2 serve
-        // native tool_calls through an OpenAI-compatible endpoint (vLLM glm47/glm45 parser), so it
-        // defaults to native; a raw-passthrough GLM endpoint with no server-side tool parser must
-        // set toolCallingMode=xml explicitly.
+        // them working out of the box. GLM and Qwen are deliberately NOT in that set: both serve
+        // native tool_calls through a modern OpenAI-compatible endpoint (vLLM glm47/glm45 for GLM;
+        // llama.cpp --jinja / vLLM hermes parser for Qwen — verified live against a Qwen3.6-A3B route),
+        // so they default to native; a raw-passthrough endpoint with no server-side tool parser sets
+        // toolCallingMode=xml explicitly.
         var explicitMode = parsed.ToolCallingMode ?? settings.LiteLLM.ToolCallingMode;
         ToolCallingMode mode;
         if (string.IsNullOrEmpty(explicitMode) && LooksLikeXmlOnlyModel(modelName))
@@ -1503,7 +1504,8 @@ internal static class Program
     /// Heuristic: does <paramref name="modelName"/> look like an open-weights model that
     /// doesn't reliably support OpenAI-shaped native tool-calling on LiteLLM? Matched against
     /// substrings (case-insensitive) so versioned ids like
-    /// <c>Qwen/Qwen3-Coder-30B-A3B-Instruct</c> or <c>glm-5.1:cloud</c> still trigger.
+    /// <c>deepseek/deepseek-r1</c> or <c>mistral-nemo-12b</c> still trigger. GLM and Qwen are
+    /// excluded — they serve native tool_calls on a modern runtime (see ModelHeuristics).
     /// Wrong matches just push a model that supports both modes onto XML — slightly more
     /// verbose tool calls, no functional regression. Missed matches leave the existing
     /// "explicit-or-native" behaviour, which is the conservative default.

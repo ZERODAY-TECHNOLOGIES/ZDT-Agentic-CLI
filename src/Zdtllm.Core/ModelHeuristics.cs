@@ -20,18 +20,31 @@ namespace Zdtllm.Core;
 /// parser must set <c>toolCallingMode=xml</c> explicitly — the same opt-in every non-marker model needs.
 /// </para>
 ///
+/// <para>
+/// Qwen is ALSO deliberately NOT a marker (removed 2026-08): a modern llama.cpp (<c>--jinja</c>) or vLLM
+/// (<c>--tool-call-parser hermes</c>) returns clean OpenAI <c>tool_calls</c> for Qwen3 — verified LIVE
+/// against a Qwen3.6-A3B route on llama.cpp b10210, including pathological argument values (a
+/// <c>&lt;/tool_call&gt;</c> nested inside a parameter). And even on a raw-passthrough Qwen server,
+/// native mode's salvage path (AgentLoop re-parses <c>&lt;tool_call&gt;</c> markup that leaks into
+/// content) covers the no-parser case. So native is the strictly-better default; forcing XML made zdt
+/// DISCARD the server's clean <c>tool_calls</c> and regex-parse text instead — which broke exactly on
+/// tool-call markup nested in a parameter value. A Qwen server that genuinely needs XML sets
+/// <c>toolCallingMode=xml</c> explicitly.
+/// </para>
+///
 /// Matched as case-insensitive substrings so versioned ids
-/// (<c>Qwen/Qwen3-Coder-30B-A3B-Instruct</c>, <c>mistral-nemo-12b</c>, <c>my-local-llama</c>) still trigger.
+/// (<c>deepseek/deepseek-r1</c>, <c>mistral-nemo-12b</c>, <c>my-local-llama</c>) still trigger.
 /// Wrong matches only push a dual-mode model onto XML (slightly more verbose tool calls, no functional
 /// regression); missed matches leave the conservative "explicit-or-native" default.
 /// </summary>
 public static class ModelHeuristics
 {
-    // Union of the two historical marker sets, minus "glm". "local" covers self-hosted / template-only
+    // Historical marker set minus "glm" and "qwen" — both parse native tool_calls on a modern runtime
+    // (see the type doc for the live Qwen evidence). "local" covers self-hosted / template-only
     // deployments in both call paths (a deliberate, low-risk widening of the runtime path).
     private static readonly string[] XmlOnlyMarkers =
     [
-        "qwen", "deepseek", "hermes", "kimi", "yi-", "nemo", "local",
+        "deepseek", "hermes", "kimi", "yi-", "nemo", "local",
     ];
 
     public static bool LooksLikeXmlOnly(string? modelName)

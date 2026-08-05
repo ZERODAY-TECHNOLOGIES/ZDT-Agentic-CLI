@@ -188,8 +188,7 @@ public sealed class SetupWizardTests : IDisposable
     }
 
     [Theory]
-    [InlineData("qwen-local", "xml")]
-    [InlineData("Qwen/Qwen3-Coder-30B", "xml")]
+    [InlineData("qwen-local", "xml")]           // matches "local" (NOT "qwen") — self-hosted id stays XML
     [InlineData("deepseek-r1", "xml")]
     [InlineData("ollama-local-llama", "xml")]
     [InlineData("hermes-3", "xml")]      // now unified with the runtime marker set
@@ -197,7 +196,9 @@ public sealed class SetupWizardTests : IDisposable
     [InlineData("gpt-4o", "native")]
     [InlineData("claude-sonnet-4", "native")]
     [InlineData("glm-5.2:cloud", "native")]   // GLM defaults to native (OpenAI-compatible endpoint)
-    public void Mode_suggestion_picks_xml_for_local_qwen_deepseek_else_native(string model, string expected)
+    [InlineData("Qwen/Qwen3-Coder-30B", "native")] // Qwen now defaults to native (live-verified on llama.cpp --jinja)
+    [InlineData("qwen36", "native")]
+    public void Mode_suggestion_picks_xml_for_local_open_weights_else_native(string model, string expected)
     {
         SetupWizard.SuggestMode(model).Should().Be(expected);
     }
