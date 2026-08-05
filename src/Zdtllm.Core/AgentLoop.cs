@@ -303,6 +303,15 @@ public sealed class AgentLoop
     /// the precise fix for the reported same-task loop.</summary>
     private const int MaxDispatchesPerTurn = 50;
 
+    // ── Grup B: cross-generation continuity ──────────────────────────────────────────────────────
+    // Subagents are ephemeral (fresh, empty context each spawn), so a re-dispatched task otherwise
+    // starts from zero and redoes the same work. Keyed by the SAME dispatch fingerprint as the guard
+    // above, this remembers the last subagent's report so the next same-task dispatch inherits it — the
+    // new subagent is told "here's what the previous attempt found, build on it". Shares _dispatchLock.
+    private readonly Dictionary<string, string> _dispatchReports = new(StringComparer.Ordinal);
+    /// <summary>Cap on how much of a prior report is folded into the next dispatch's prompt.</summary>
+    private const int DispatchReportDigestChars = 4000;
+
     /// <summary>Compiled once — used by <see cref="HashResult"/> to collapse cosmetic whitespace differences.</summary>
     private static readonly Regex WhitespaceRun = new(@"\s+", RegexOptions.Compiled);
 
@@ -403,8 +412,9 @@ public sealed class AgentLoop
         Interlocked.Exchange(ref _consecutiveLoopBreaks, 0);
         lock (_recentToolCallsLock) _recentToolCalls.Clear();
 
-        // Dispatch-loop guard is per-turn too: a fresh user intent gets a fresh dispatch budget.
-        lock (_dispatchLock) { _dispatchCounts.Clear(); _totalDispatches = 0; }
+        // Dispatch-loop guard is per-turn too: a fresh user intent gets a fresh dispatch budget and a
+        // clean continuity store (last turn's subagent reports shouldn't bleed into a new task).
+        lock (_dispatchLock) { _dispatchCounts.Clear(); _totalDispatches = 0; _dispatchReports.Clear(); }
         _dispatchHardStop = false;
 
         // Bootstrap system prompt the first time the session is touched.
@@ -1419,22 +1429,36 @@ public sealed class AgentLoop
             return msg;
         }
 
-        // Dispatch-loop guard (Agent tool only): the exact-repeat check above is blind to re-dispatch
-        // (subagent reports differ every time), so this catches an orchestrator handing out the same
-        // task over and over BEFORE a whole new subagent is spawned — the expensive part of the loop.
-        var dispatchBreak = CheckDispatchLoop(call);
-        if (dispatchBreak is not null)
+        // Dispatch-loop guard + continuity (Agent tool only). The exact-repeat check above is blind to
+        // re-dispatch (subagent reports differ every time), so this catches an orchestrator handing out
+        // the same task over and over BEFORE a whole new subagent is spawned — the expensive part.
+        string? dispatchFingerprint = null;
+        if (string.Equals(call.FunctionName, Zdtllm.Tools.TaskTool.ToolName, StringComparison.Ordinal))
         {
-            sw.Stop();
-            Interlocked.Increment(ref _turnToolErrorCount);
-            await SafeNotifyAsync(_observer?.OnToolResultAsync(call.FunctionName, dispatchBreak, true, sw.Elapsed, ct))
-                .ConfigureAwait(false);
-            return dispatchBreak;
+            var (type, fp) = DispatchFingerprint(call.Arguments);
+            dispatchFingerprint = fp;
+            var dispatchBreak = CheckDispatchLoop(type, fp);
+            if (dispatchBreak is not null)
+            {
+                sw.Stop();
+                Interlocked.Increment(ref _turnToolErrorCount);
+                await SafeNotifyAsync(_observer?.OnToolResultAsync(call.FunctionName, dispatchBreak, true, sw.Elapsed, ct))
+                    .ConfigureAwait(false);
+                return dispatchBreak;
+            }
+            // Grup B — continuity: if an earlier subagent already worked this same task, fold its report
+            // into the prompt so the new, fresh-context subagent continues instead of starting from 0.
+            call = WithPriorDispatchReport(call, fp);
         }
 
         var (content, isError) = await ExecuteToolCoreAsync(call, ctx, ct).ConfigureAwait(false);
         sw.Stop();
         if (isError) Interlocked.Increment(ref _turnToolErrorCount);
+
+        // Grup B — remember this subagent's report, keyed by the task fingerprint, so the next same-task
+        // dispatch inherits it. Only successful dispatches (a malformed-args error isn't useful context).
+        if (dispatchFingerprint is not null && !isError)
+            RememberDispatchReport(dispatchFingerprint, content);
 
         var resultHash = HashResult(content);
         EnqueueTrace(new ToolCallTrace(call.FunctionName, argsHash, resultHash));
@@ -1627,19 +1651,16 @@ public sealed class AgentLoop
         "gathered. Do not call any more tools this turn.";
 
     /// <summary>
-    /// Pre-execute dispatch-loop guard for the Agent tool. Fingerprints the dispatch by
-    /// (subagent_type + normalised prompt) and counts it against this turn's budget. Returns a
+    /// Pre-execute dispatch-loop guard for the Agent tool. The caller supplies the precomputed
+    /// <paramref name="type"/> + <paramref name="fingerprint"/> (subagent_type + normalised prompt) and
+    /// gates this to the Agent tool. Counts the dispatch against this turn's budget and returns a
     /// short-circuit message (the subagent is NOT spawned) when the same task is re-dispatched past
     /// <see cref="DispatchRepeatThreshold"/>, or null to let it run. Escalates to a hard-stop (drops
     /// all tools next round) when a fingerprint is hammered past <see cref="DispatchHardStopCount"/> or
-    /// the per-turn total exceeds <see cref="MaxDispatchesPerTurn"/>. Non-Agent tools return null.
+    /// the per-turn total exceeds <see cref="MaxDispatchesPerTurn"/>.
     /// </summary>
-    private string? CheckDispatchLoop(ToolCall call)
+    private string? CheckDispatchLoop(string type, string fingerprint)
     {
-        if (!string.Equals(call.FunctionName, Zdtllm.Tools.TaskTool.ToolName, StringComparison.Ordinal))
-            return null;
-
-        var (type, fingerprint) = DispatchFingerprint(call.Arguments);
         int fpCount, total;
         lock (_dispatchLock)
         {
@@ -1723,6 +1744,60 @@ public sealed class AgentLoop
         $"[dispatch-budget] You have dispatched {total} subagents this turn without converging. No more " +
         "will be spawned. Write your final summary to the user now: what is done, what is blocked, and " +
         "what you recommend.";
+
+    /// <summary>Grup B (continuity): remember a subagent's report keyed by task fingerprint, truncated so
+    /// it can be folded into a later same-task dispatch without bloating the prompt. Latest wins.</summary>
+    private void RememberDispatchReport(string fingerprint, string report)
+    {
+        if (string.IsNullOrWhiteSpace(report)) return;
+        var digest = report.Length > DispatchReportDigestChars
+            ? report[..DispatchReportDigestChars] + "\n…(report truncated)"
+            : report;
+        lock (_dispatchLock) _dispatchReports[fingerprint] = digest;
+    }
+
+    /// <summary>
+    /// Grup B (continuity): if a prior subagent already ran this exact task, prepend its report to the
+    /// dispatch prompt so the new subagent — which boots with an empty context — continues from where the
+    /// last one got to instead of redoing the work. Only the <c>prompt</c> field is rewritten; every other
+    /// field the model sent (subagent_type, description) is preserved. No prior report, a non-object args
+    /// blob, or unparseable JSON → the call is returned unchanged.
+    /// </summary>
+    private ToolCall WithPriorDispatchReport(ToolCall call, string fingerprint)
+    {
+        string? prior;
+        lock (_dispatchLock) { _dispatchReports.TryGetValue(fingerprint, out prior); }
+        if (string.IsNullOrEmpty(prior)) return call;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(call.Arguments) ? "{}" : call.Arguments);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return call;
+
+            var prompt = root.TryGetProperty("prompt", out var p) && p.ValueKind == JsonValueKind.String
+                ? (p.GetString() ?? "") : "";
+            var augmented =
+                "[CONTINUING A TASK ALREADY ATTEMPTED] A previous subagent worked this same task and " +
+                "reported back below. You start with a FRESH context and cannot see its steps — build on " +
+                "this instead of redoing it. If it hit a wall, take a genuinely different approach; do not " +
+                "repeat what already failed.\n\n--- previous attempt's report ---\n" + prior +
+                "\n--- end previous report ---\n\n" + prompt;
+
+            var fields = new Dictionary<string, object?>(StringComparer.Ordinal);
+            foreach (var prop in root.EnumerateObject())
+            {
+                if (prop.NameEquals("prompt")) continue;
+                fields[prop.Name] = prop.Value.Clone();
+            }
+            fields["prompt"] = augmented;
+            return call with { Arguments = JsonSerializer.Serialize(fields) };
+        }
+        catch (JsonException)
+        {
+            return call; // unparseable args — leave the dispatch untouched
+        }
+    }
 
     /// <summary>
     /// Recursive JSON normaliser: sorts object keys lexicographically, preserves array

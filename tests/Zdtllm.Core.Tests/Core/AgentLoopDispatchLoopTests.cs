@@ -123,6 +123,49 @@ public sealed class AgentLoopDispatchLoopTests
         result.FinalText.Should().Contain("summary");
     }
 
+    [Fact]
+    public async Task Second_dispatch_inherits_the_first_subagents_report()
+    {
+        // Grup B (continuity): re-dispatching the same task folds the first subagent's report into the
+        // second's prompt, so the fresh-context subagent continues instead of starting from zero.
+        const string args = "{\"subagent_type\":\"general-purpose\",\"prompt\":\"fix the build\"}";
+        var handler = new StubHandler(
+            Sse(AgentCall(args)),  // #1 — untouched prompt
+            Sse(AgentCall(args)),  // #2 — inherits #1's report
+            Sse(Final("done")));
+
+        var tool = new RecordingAgentTool();
+        var registry = new ToolRegistry();
+        registry.Register(tool);
+
+        await Build(handler, registry).RunOneShotAsync("go", new StringWriter(), new StringWriter());
+
+        tool.Prompts.Should().HaveCount(2);
+        tool.Prompts[0].Should().Be("fix the build");                            // first: verbatim
+        tool.Prompts[0].Should().NotContain("CONTINUING");
+        tool.Prompts[1].Should().Contain("CONTINUING A TASK ALREADY ATTEMPTED"); // second: continuity header
+        tool.Prompts[1].Should().Contain("REPORT-1");                            // ...carries the prior report
+        tool.Prompts[1].Should().Contain("fix the build");                       // ...and the original instructions
+    }
+
+    private sealed class RecordingAgentTool : ITool
+    {
+        public List<string> Prompts { get; } = new();
+
+        public ToolSchema Schema => new("Agent", "Agent tool.",
+            JsonSerializer.SerializeToElement(new { type = "object", properties = new { } }));
+
+        public string? GetSpecifierForPermissions(JsonElement args) => null;
+
+        public Task<ToolResult> ExecuteAsync(JsonElement args, ToolContext ctx, CancellationToken ct)
+        {
+            var prompt = args.TryGetProperty("prompt", out var p) && p.ValueKind == JsonValueKind.String
+                ? (p.GetString() ?? "") : "";
+            Prompts.Add(prompt);
+            return Task.FromResult(ToolResult.Success($"REPORT-{Prompts.Count}"));
+        }
+    }
+
     private sealed class CountingTool : ITool
     {
         private readonly string _name;
