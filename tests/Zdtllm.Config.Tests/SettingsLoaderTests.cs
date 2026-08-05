@@ -250,6 +250,16 @@ public sealed class SettingsLoaderTests : IDisposable
     }
 
     [Fact]
+    public void MaxReasoningChars_loads_and_defaults_to_null()
+    {
+        WriteUser("""{ "litellm": { "maxReasoningChars": 250000 } }""");
+        SettingsLoader.LoadEffectiveSettings(ProjectDir, Options()).LiteLLM.MaxReasoningChars.Should().Be(250000);
+
+        WriteUser("""{ "litellm": { "baseUrl": "http://x" } }""");
+        SettingsLoader.LoadEffectiveSettings(ProjectDir, Options()).LiteLLM.MaxReasoningChars.Should().BeNull();
+    }
+
+    [Fact]
     public void Subagent_models_load_from_litellm_section()
     {
         WriteUser("""

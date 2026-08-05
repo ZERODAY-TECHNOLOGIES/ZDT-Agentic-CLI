@@ -127,6 +127,12 @@ public sealed record LiteLLMSettings(
     /// timeout. Resets on every chunk, so it trips only on a genuine stall. Null = client default
     /// (240s); &lt;= 0 = disabled (wait forever, the legacy behaviour).</summary>
     int? StreamIdleTimeoutSeconds = null,
+    /// <summary>Reasoning-runaway budget (characters). Abort a turn that streams this much pure
+    /// <c>reasoning_content</c> without producing any visible text or tool call — some fine-tuned
+    /// reasoning models get stuck "thinking" forever (tokens keep flowing, so the idle watchdog never
+    /// fires). Null = the agent-loop default (~100k chars ≈ 25k tokens); &lt;= 0 = disabled (unbounded
+    /// reasoning). See <c>AgentLoopOptions.MaxReasoningChars</c>.</summary>
+    int? MaxReasoningChars = null,
     /// <summary>
     /// Generic escape hatch: arbitrary top-level request fields emitted VERBATIM (no snake_case
     /// rename), forwarded under <c>drop_params:false</c>. Absorbs provider-specific param drift
@@ -155,6 +161,7 @@ public sealed record LiteLLMSettings(
         FrequencyPenalty: null,
         PresencePenalty: null,
         StreamIdleTimeoutSeconds: null,
+        MaxReasoningChars: null,
         ExtraParams: ImmutableDictionary<string, JsonElement>.Empty);
 
     public LiteLLMSettings Merge(LiteLLMSettings higher) => new(
@@ -176,6 +183,7 @@ public sealed record LiteLLMSettings(
         FrequencyPenalty: higher.FrequencyPenalty ?? FrequencyPenalty,
         PresencePenalty: higher.PresencePenalty ?? PresencePenalty,
         StreamIdleTimeoutSeconds: higher.StreamIdleTimeoutSeconds ?? StreamIdleTimeoutSeconds,
+        MaxReasoningChars: higher.MaxReasoningChars ?? MaxReasoningChars,
         ExtraParams: EffectiveSettings.MergeOverride(
             ExtraParams ?? ImmutableDictionary<string, JsonElement>.Empty,
             higher.ExtraParams ?? ImmutableDictionary<string, JsonElement>.Empty));

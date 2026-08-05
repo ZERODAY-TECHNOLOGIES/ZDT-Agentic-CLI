@@ -414,6 +414,9 @@ internal static class Program
                 // ceiling (CI / scripts that want a hard guard against runaway loops).
                 MaxTurns = parsed.MaxTurns ?? int.MaxValue,
                 MaxParallel = parsed.MaxParallel ?? 0,
+                // Reasoning-runaway guard: null → the built-in default; a configured value (0 disables)
+                // wins. Propagates to subagents via `_parent.Options with { … }` in SubagentRunner.
+                MaxReasoningChars = settings.LiteLLM.MaxReasoningChars ?? AgentLoopOptions.DefaultMaxReasoningChars,
                 SkipPermissions = parsed.DangerouslySkipPermissions,
                 ToolCallingMode = session.Mode,
                 SystemPrompt = SystemPromptComposer.Compose(

@@ -80,6 +80,23 @@ public sealed record AgentLoopOptions
     /// own LiteLLM stream, and most proxies enforce per-key rate limits.
     /// </summary>
     public int MaxParallel { get; init; } = 0;
+
+    /// <summary>Default for <see cref="MaxReasoningChars"/>: ~100k chars ≈ 25k tokens of solid,
+    /// uninterrupted chain-of-thought — far past any productive agentic turn, yet high enough not to
+    /// clip a genuinely hard think on a reasoning model (GLM-5.2 / DeepSeek).</summary>
+    public const int DefaultMaxReasoningChars = 100_000;
+
+    /// <summary>
+    /// Hard ceiling on how many characters of pure <c>reasoning_content</c> a single turn may stream
+    /// while producing NO visible text and NO tool-call args. Some fine-tuned reasoning models (notably
+    /// the "aggressive" uncensored Qwen3.x variants) get stuck emitting chain-of-thought forever: tokens
+    /// keep flowing so the stream never idles — the idle watchdog can't fire — and the turn hangs, the
+    /// model visibly "sitting on thinking" for tens of minutes. When a turn crosses this budget having
+    /// produced only reasoning, the stream is aborted and routed into the reasoning-only recovery (nudge
+    /// once, then surface the captured reasoning) so the turn always terminates. 0 or negative disables
+    /// the guard (unbounded reasoning). See <see cref="DefaultMaxReasoningChars"/>.
+    /// </summary>
+    public int MaxReasoningChars { get; init; } = DefaultMaxReasoningChars;
 }
 
 public sealed record AgentResult(
@@ -465,6 +482,10 @@ public sealed class AgentLoop
             // char count drives telemetry + the empty-answer detector.
             var reasoningCharsThisTurn = 0;
             var reasoningText = new StringBuilder();
+            // Set by the reasoning-runaway guard in the stream loop when this turn produces only
+            // chain-of-thought past MaxReasoningChars — it aborts the read so the reasoning-only
+            // recovery below can end the turn instead of hanging on endless "thinking".
+            var reasoningRunawayAborted = false;
 
             // Live spinner counters: number of characters streamed (for a tokens-approximation
             // since servers don't send incremental usage), and total chunks (debug-style metric).
@@ -539,6 +560,18 @@ public sealed class AgentLoop
                             if (reasoningText.Length < 16_384) reasoningText.Append(rd.Text);
                             charsStreamed += rd.Text.Length;
                             UpdateSpinnerThrottled(statusCtx, streamSw, charsStreamed, ref lastSpinnerUpdate);
+                            // Reasoning-runaway guard: some fine-tuned reasoning models get stuck
+                            // emitting chain-of-thought forever. Because tokens keep flowing the stream
+                            // never idles, so the idle watchdog can't fire and the turn hangs (the model
+                            // "sits on thinking" indefinitely). If this turn has produced ONLY reasoning —
+                            // no visible text, no tool-call args — past the budget, stop reading; the
+                            // reasoning-only recovery below nudges then falls back so the turn terminates.
+                            if (_options.MaxReasoningChars > 0
+                                && reasoningCharsThisTurn >= _options.MaxReasoningChars
+                                && assistantText.Length == 0 && pending.Count == 0)
+                            {
+                                reasoningRunawayAborted = true;
+                            }
                             break;
 
                         case ChatChunk.ToolCallDelta tcd:
@@ -567,6 +600,11 @@ public sealed class AgentLoop
                             turnFinishReason = done.FinishReason;
                             break;
                     }
+
+                    // Reasoning-runaway guard tripped inside the switch — stop reading now. Breaking the
+                    // await-foreach disposes the SSE enumerator (cancelling the HTTP read), which is the
+                    // abort we want; the post-stream reasoning-only recovery then ends the turn.
+                    if (reasoningRunawayAborted) break;
                 }
                 }
                 finally
@@ -716,6 +754,15 @@ public sealed class AgentLoop
                 var truncNote = turnFinishReason == "length" ? " · finish_reason=length (truncated)" : "";
                 await status.WriteLineAsync(
                     Palette.Mute($"  ↳ reasoning: {reasoningCharsThisTurn} chars (dropped from context){truncNote}"))
+                    .ConfigureAwait(false);
+            }
+
+            if (reasoningRunawayAborted)
+            {
+                await status.WriteLineAsync(Palette.Red("  ⚠ reasoning runaway:") + " " + Palette.Mute(
+                    $"stopped the model after {reasoningCharsThisTurn:N0} chars of uninterrupted reasoning with " +
+                    "no visible answer or tool call — it was stuck 'thinking' with no end. Recovering below " +
+                    "(raise litellm.maxReasoningChars for a longer think, or set it to 0 to disable the guard)."))
                     .ConfigureAwait(false);
             }
 
