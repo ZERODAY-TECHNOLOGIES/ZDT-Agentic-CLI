@@ -163,9 +163,22 @@ public sealed class Session : IDisposable
         }
     }
 
+    /// <summary>
+    /// Stand-in content for a degenerate assistant turn — no visible text AND no tool calls. This
+    /// happens with a thinking model that emits only <c>reasoning_content</c> (dropped) when the
+    /// reasoning-only recovery also finds nothing to surface. An assistant message with neither
+    /// content nor tool_calls is INVALID on an OpenAI-compatible endpoint — the server 400s with
+    /// "assistant message must contain either 'content' or 'tool_calls'", which then breaks EVERY
+    /// turn of a resumed session. Substituting a placeholder keeps the turn well-formed.
+    /// </summary>
+    private const string EmptyAssistantPlaceholder = "(no response)";
+
     public void AddAssistant(string? content, ImmutableArray<ToolCall> toolCalls = default)
     {
         var calls = toolCalls.IsDefault ? ImmutableArray<ToolCall>.Empty : toolCalls;
+        // Never persist/send a content-less, tool-call-less assistant turn (see EmptyAssistantPlaceholder).
+        if (string.IsNullOrEmpty(content) && calls.IsEmpty)
+            content = EmptyAssistantPlaceholder;
         _messages.Add(new ChatMessage(
             Role: "assistant",
             Content: content,
@@ -281,9 +294,12 @@ public sealed class Session : IDisposable
         var calls = ev.ToolCalls is null || ev.ToolCalls.Count == 0
             ? ImmutableArray<ToolCall>.Empty
             : ev.ToolCalls.Select(tc => new ToolCall(tc.Id, tc.Name, tc.Arguments)).ToImmutableArray();
+        // Heal a degenerate empty assistant turn persisted by an older/interrupted run — replaying it
+        // verbatim would 400 the first post-resume request (see EmptyAssistantPlaceholder / AddAssistant).
+        var content = string.IsNullOrEmpty(ev.Content) && calls.IsEmpty ? EmptyAssistantPlaceholder : ev.Content;
         return new ChatMessage(
             Role: "assistant",
-            Content: ev.Content,
+            Content: content,
             ToolCalls: calls,
             ToolCallId: null);
     }

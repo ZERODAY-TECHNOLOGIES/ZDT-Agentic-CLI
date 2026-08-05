@@ -229,6 +229,9 @@ internal sealed class RawLiteLLM
     /// <summary>presence_penalty passthrough — see <see cref="LiteLLMSettings.PresencePenalty"/>.</summary>
     public double? PresencePenalty { get; set; }
 
+    /// <summary>Stream idle-watchdog timeout (seconds) — see <see cref="LiteLLMSettings.StreamIdleTimeoutSeconds"/>.</summary>
+    public int? StreamIdleTimeoutSeconds { get; set; }
+
     /// <summary>Verbatim extra request fields — see <see cref="LiteLLMSettings.ExtraParams"/>.</summary>
     public Dictionary<string, JsonElement>? ExtraParams { get; set; }
 
@@ -253,6 +256,7 @@ internal sealed class RawLiteLLM
         MaxTokens: MaxTokens,
         FrequencyPenalty: FrequencyPenalty,
         PresencePenalty: PresencePenalty,
+        StreamIdleTimeoutSeconds: StreamIdleTimeoutSeconds,
         ExtraParams: ToJsonElementDict(ExtraParams));
 
     private static ImmutableDictionary<string, string> ToStringDict(

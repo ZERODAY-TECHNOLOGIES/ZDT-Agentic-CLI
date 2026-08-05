@@ -122,6 +122,11 @@ public sealed record LiteLLMSettings(
     double? FrequencyPenalty = null,
     /// <summary>presence_penalty passthrough. Null = omit.</summary>
     double? PresencePenalty = null,
+    /// <summary>Stream idle-watchdog timeout in seconds: abort the streaming read if the server sends
+    /// no bytes for this long, instead of hanging forever under the (intentionally infinite) HTTP
+    /// timeout. Resets on every chunk, so it trips only on a genuine stall. Null = client default
+    /// (240s); &lt;= 0 = disabled (wait forever, the legacy behaviour).</summary>
+    int? StreamIdleTimeoutSeconds = null,
     /// <summary>
     /// Generic escape hatch: arbitrary top-level request fields emitted VERBATIM (no snake_case
     /// rename), forwarded under <c>drop_params:false</c>. Absorbs provider-specific param drift
@@ -149,6 +154,7 @@ public sealed record LiteLLMSettings(
         MaxTokens: null,
         FrequencyPenalty: null,
         PresencePenalty: null,
+        StreamIdleTimeoutSeconds: null,
         ExtraParams: ImmutableDictionary<string, JsonElement>.Empty);
 
     public LiteLLMSettings Merge(LiteLLMSettings higher) => new(
@@ -169,6 +175,7 @@ public sealed record LiteLLMSettings(
         MaxTokens: higher.MaxTokens ?? MaxTokens,
         FrequencyPenalty: higher.FrequencyPenalty ?? FrequencyPenalty,
         PresencePenalty: higher.PresencePenalty ?? PresencePenalty,
+        StreamIdleTimeoutSeconds: higher.StreamIdleTimeoutSeconds ?? StreamIdleTimeoutSeconds,
         ExtraParams: EffectiveSettings.MergeOverride(
             ExtraParams ?? ImmutableDictionary<string, JsonElement>.Empty,
             higher.ExtraParams ?? ImmutableDictionary<string, JsonElement>.Empty));

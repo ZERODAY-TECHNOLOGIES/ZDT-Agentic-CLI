@@ -40,6 +40,17 @@ public sealed record LiteLLMClientOptions
     public int MaxRetries { get; init; } = 3;
     public TimeSpan InitialBackoff { get; init; } = TimeSpan.FromSeconds(1);
 
+    /// <summary>
+    /// Idle watchdog for the streaming read: if the server sends NO bytes for this long, the stream
+    /// is aborted with a <see cref="TimeoutException"/> instead of hanging forever (the HttpClient's
+    /// own timeout is intentionally infinite so a slow model isn't cut off mid-generation). The clock
+    /// resets on every chunk, so it trips only on a genuine stall — a thinking model streams
+    /// <c>reasoning_content</c> continuously while it works. Covers the initial silent prompt-eval too
+    /// (time-to-first-byte). Set &lt;= <see cref="TimeSpan.Zero"/> or <see cref="Timeout.InfiniteTimeSpan"/>
+    /// to disable. Default 240s — more than a full cold-cache prompt eval of the largest contexts.
+    /// </summary>
+    public TimeSpan StreamIdleTimeout { get; init; } = TimeSpan.FromSeconds(240);
+
     /// <summary>Optional request-shaping passthroughs. All null/empty by default so an
     /// unconfigured client serializes a byte-for-byte identical request body (the actual
     /// safety guarantee — <c>drop_params:false</c> forwards unknown params, it does not drop
@@ -190,8 +201,40 @@ public sealed class LiteLLMClient
         try
         {
             await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            await foreach (var chunk in SseParser.ParseAsync(stream, ct).ConfigureAwait(false))
-                yield return chunk;
+
+            var idle = _options.StreamIdleTimeout;
+            if (idle <= TimeSpan.Zero || idle == Timeout.InfiniteTimeSpan)
+            {
+                // Watchdog disabled — only the caller's token can stop the read (legacy behaviour).
+                await foreach (var chunk in SseParser.ParseAsync(stream, ct).ConfigureAwait(false))
+                    yield return chunk;
+                yield break;
+            }
+
+            // Idle watchdog: a linked token that trips if NO chunk arrives within `idle`. Reset on
+            // every chunk. Distinguished from a caller cancel so a genuine server stall surfaces as a
+            // TimeoutException (recoverable) rather than a permanent hang under the infinite HTTP timeout.
+            using var idleCts = new CancellationTokenSource();
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, idleCts.Token);
+            idleCts.CancelAfter(idle);
+            await using var e = SseParser.ParseAsync(stream, linked.Token).GetAsyncEnumerator(linked.Token);
+            while (true)
+            {
+                bool moved;
+                try
+                {
+                    moved = await e.MoveNextAsync().ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (idleCts.IsCancellationRequested && !ct.IsCancellationRequested)
+                {
+                    throw new TimeoutException(
+                        $"The model stream produced no data for {idle.TotalSeconds:0}s (stream idle timeout). " +
+                        "The server may be stalled — retry, or adjust litellm.streamIdleTimeoutSeconds.");
+                }
+                if (!moved) break;
+                idleCts.CancelAfter(idle); // fresh deadline for the next chunk
+                yield return e.Current;
+            }
         }
         finally
         {

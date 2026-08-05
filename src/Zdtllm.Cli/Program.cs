@@ -174,10 +174,20 @@ internal static class Program
             minP ??= 0;
         }
 
+        // Stream idle watchdog: the HTTP timeout is intentionally infinite (a slow model must not be
+        // cut off mid-generation), so without this a wedged/stalled backend hangs the CLI forever.
+        // null → the client's built-in 240s default; <= 0 → disabled (wait forever, legacy behaviour).
+        var streamIdleSeconds = settings.LiteLLM.StreamIdleTimeoutSeconds;
+        var streamIdle =
+            streamIdleSeconds is null ? TimeSpan.FromSeconds(240) :
+            streamIdleSeconds.Value <= 0 ? Timeout.InfiniteTimeSpan :
+            TimeSpan.FromSeconds((double)streamIdleSeconds.Value);
+
         var client = new LiteLLMClient(http, new LiteLLMClientOptions
         {
             BaseUrl = settings.LiteLLM.BaseUrl!,
             ApiKey = settings.LiteLLM.ApiKey!,
+            StreamIdleTimeout = streamIdle,
             // Optional request-shaping passthroughs (all null/empty unless set in settings.json or
             // supplied by a per-model default above). For GLM-5.2: reasoningEffort defaults to "high",
             // temperature stays UNSET (GLM is trained at 1.0 — do not lower it). For Qwen3: temp/top_p/

@@ -135,6 +135,48 @@ public sealed class SessionTests : IDisposable
     }
 
     [Fact]
+    public void AddAssistant_with_no_content_and_no_tool_calls_gets_a_placeholder()
+    {
+        // A thinking model can emit only reasoning_content (dropped) with no visible text and no tool
+        // call. Persisting/sending that empty assistant turn 400s an OpenAI-compatible server
+        // ("must contain either content or tool_calls") and breaks every turn of a resumed session.
+        var store = SessionStore.Create(_tempDir);
+        var sessionId = store.SessionId;
+        using (var session = Session.NewPersistent(store, "m"))
+        {
+            session.AddUser("hi");
+            session.AddAssistant(null, ImmutableArray<ToolCall>.Empty);
+
+            session.Messages.Last().Role.Should().Be("assistant");
+            session.Messages.Last().Content.Should().Be("(no response)");
+        }
+
+        // And it's persisted with the placeholder, so a later resume is well-formed too.
+        File.ReadAllText(Path.Combine(_tempDir, $"{sessionId}.jsonl")).Should().Contain("(no response)");
+    }
+
+    [Fact]
+    public void Resume_heals_an_empty_assistant_turn_written_by_an_older_build()
+    {
+        var store = SessionStore.Create(_tempDir);
+        var sessionId = store.SessionId;
+        using (var session = Session.NewPersistent(store, "m"))
+        {
+            session.AddSystem("sys");
+            session.AddUser("u1");
+        }
+        // Simulate a degenerate empty assistant turn an older/interrupted build could have persisted.
+        var path = Path.Combine(_tempDir, $"{sessionId}.jsonl");
+        File.AppendAllText(path, "{\"type\":\"assistant\"}\n");
+
+        using var resumed = Session.Resume(SessionStore.OpenForResume(_tempDir, sessionId));
+
+        var asst = resumed.Messages.Single(m => m.Role == "assistant");
+        asst.Content.Should().Be("(no response)", "the empty assistant must be healed so the first post-resume request doesn't 400");
+        asst.ToolCalls.Should().BeEmpty();
+    }
+
+    [Fact]
     public void Resume_preserves_mode_recorded_in_meta()
     {
         var store = SessionStore.Create(_tempDir);

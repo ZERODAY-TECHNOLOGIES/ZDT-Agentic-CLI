@@ -240,6 +240,16 @@ public sealed class SettingsLoaderTests : IDisposable
     }
 
     [Fact]
+    public void StreamIdleTimeoutSeconds_loads_and_defaults_to_null()
+    {
+        WriteUser("""{ "litellm": { "streamIdleTimeoutSeconds": 90 } }""");
+        SettingsLoader.LoadEffectiveSettings(ProjectDir, Options()).LiteLLM.StreamIdleTimeoutSeconds.Should().Be(90);
+
+        WriteUser("""{ "litellm": { "baseUrl": "http://x" } }""");
+        SettingsLoader.LoadEffectiveSettings(ProjectDir, Options()).LiteLLM.StreamIdleTimeoutSeconds.Should().BeNull();
+    }
+
+    [Fact]
     public void Subagent_models_load_from_litellm_section()
     {
         WriteUser("""
