@@ -278,6 +278,31 @@ public sealed class AgentLoop
 
     private const string ShortCircuitedResultMarker = "loop-break";
 
+    // ── Orchestrator-level dispatch-loop guard (Grup A) ──────────────────────────────────────────
+    // The tool-loop detector above keys on the RESULT hash, but a re-dispatched subagent returns a
+    // slightly different report every time, so an orchestrator that keeps handing out the SAME task
+    // (the "[Run tests…] #4" pattern) never trips it — and each fresh, ephemeral subagent redoes the
+    // work from scratch. This guard tracks Agent dispatches by (subagent_type + normalised prompt),
+    // independent of the result, so identical re-dispatches are caught and short-circuited before a
+    // whole new subagent is spawned. Per-user-turn state (reset in RunTurnAsync); guarded by a lock
+    // because parallel fan-out dispatches touch it concurrently. Only the orchestrator has the Agent
+    // tool (subagents can't recurse), so this naturally fires only where the loop actually happens.
+    private readonly Dictionary<string, int> _dispatchCounts = new(StringComparer.Ordinal);
+    private readonly object _dispatchLock = new();
+    private int _totalDispatches;
+    /// <summary>Set once a dispatch loop / budget is hit — the next model round drops all tools so the
+    /// orchestrator is forced to write a final summary instead of spinning subagents forever.</summary>
+    private volatile bool _dispatchHardStop;
+
+    /// <summary>Block the Nth identical (subagent_type + prompt) dispatch. 3 = two free tries, then stop.</summary>
+    private const int DispatchRepeatThreshold = 3;
+    /// <summary>Same fingerprint hammered this many times (warnings ignored) → hard-stop the turn.</summary>
+    private const int DispatchHardStopCount = 6;
+    /// <summary>Total Agent dispatches in one user turn before the runaway backstop hard-stops. Generous
+    /// so a legitimate wide fan-out of DISTINCT sub-tasks isn't clipped; the fingerprint guard above is
+    /// the precise fix for the reported same-task loop.</summary>
+    private const int MaxDispatchesPerTurn = 50;
+
     /// <summary>Compiled once — used by <see cref="HashResult"/> to collapse cosmetic whitespace differences.</summary>
     private static readonly Regex WhitespaceRun = new(@"\s+", RegexOptions.Compiled);
 
@@ -378,6 +403,10 @@ public sealed class AgentLoop
         Interlocked.Exchange(ref _consecutiveLoopBreaks, 0);
         lock (_recentToolCallsLock) _recentToolCalls.Clear();
 
+        // Dispatch-loop guard is per-turn too: a fresh user intent gets a fresh dispatch budget.
+        lock (_dispatchLock) { _dispatchCounts.Clear(); _totalDispatches = 0; }
+        _dispatchHardStop = false;
+
         // Bootstrap system prompt the first time the session is touched.
         if (session.Messages.Count == 0)
         {
@@ -469,8 +498,21 @@ public sealed class AgentLoop
 
         try
         {
+        // One-shot flag so the dispatch hard-stop notice prints once, not every subsequent iteration.
+        var dispatchHardStopAnnounced = false;
+
         for (var turn = 1; turn <= _options.MaxTurns; turn++)
         {
+            // A dispatch loop/budget was hit → this round runs with NO tools (see the StreamChatAsync
+            // call below), forcing the orchestrator to write a final summary instead of spawning more.
+            if (_dispatchHardStop && !dispatchHardStopAnnounced)
+            {
+                dispatchHardStopAnnounced = true;
+                await status.WriteLineAsync(Palette.Gold("  ⚇ dispatch loop:") + " " + Palette.Mute(
+                    "too many unproductive subagent dispatches — stopping fan-out for this turn and asking " +
+                    "the orchestrator to summarise.")).ConfigureAwait(false);
+            }
+
             var assistantText = new StringBuilder();
             var pending = new SortedDictionary<int, ToolCallAccumulator>();
             int? turnPromptTokens = null;
@@ -525,7 +567,11 @@ public sealed class AgentLoop
 
                 try
                 {
-                await foreach (var chunk in _client.StreamChatAsync(session.Messages, toolDefList, session.Model, ct, turnReasoningEffort).ConfigureAwait(false))
+                // Hard-stop drops all tools so the model can only produce prose (its final summary).
+                // XML mode carries the tool roster in the frozen system prompt, so nulling here only
+                // fully disarms native mode — the dispatch block above is still the backstop for XML.
+                var turnTools = _dispatchHardStop ? null : toolDefList;
+                await foreach (var chunk in _client.StreamChatAsync(session.Messages, turnTools, session.Model, ct, turnReasoningEffort).ConfigureAwait(false))
                 {
                     switch (chunk)
                     {
@@ -869,7 +915,9 @@ public sealed class AgentLoop
                 // follow-up turns. So instead of finishing, record this answer for context (don't show
                 // it), append the forced-dispatch nudge as a user turn, and re-run ONCE (the guard
                 // fires at most once per user turn, so a genuine read-only reply can still terminate).
-                if (_teamMode?.InTeamMode == true && !teamDispatchNudged
+                // ...unless a dispatch hard-stop is active: then we WANT this final summary to end the
+                // turn, so don't re-inject the delegation nudge (which would fight the no-tools round).
+                if (_teamMode?.InTeamMode == true && !teamDispatchNudged && !_dispatchHardStop
                     && teamAgentDispatches == 0 && teamDidNonDelegatingWork)
                 {
                     teamDispatchNudged = true;
@@ -1371,6 +1419,19 @@ public sealed class AgentLoop
             return msg;
         }
 
+        // Dispatch-loop guard (Agent tool only): the exact-repeat check above is blind to re-dispatch
+        // (subagent reports differ every time), so this catches an orchestrator handing out the same
+        // task over and over BEFORE a whole new subagent is spawned — the expensive part of the loop.
+        var dispatchBreak = CheckDispatchLoop(call);
+        if (dispatchBreak is not null)
+        {
+            sw.Stop();
+            Interlocked.Increment(ref _turnToolErrorCount);
+            await SafeNotifyAsync(_observer?.OnToolResultAsync(call.FunctionName, dispatchBreak, true, sw.Elapsed, ct))
+                .ConfigureAwait(false);
+            return dispatchBreak;
+        }
+
         var (content, isError) = await ExecuteToolCoreAsync(call, ctx, ct).ConfigureAwait(false);
         sw.Stop();
         if (isError) Interlocked.Increment(ref _turnToolErrorCount);
@@ -1564,6 +1625,104 @@ public sealed class AgentLoop
         $"[loop-break-final] You have ignored {MaxConsecutiveBreaks} consecutive loop-break warnings. " +
         "Stop calling tools and write your final response based on the information you've already " +
         "gathered. Do not call any more tools this turn.";
+
+    /// <summary>
+    /// Pre-execute dispatch-loop guard for the Agent tool. Fingerprints the dispatch by
+    /// (subagent_type + normalised prompt) and counts it against this turn's budget. Returns a
+    /// short-circuit message (the subagent is NOT spawned) when the same task is re-dispatched past
+    /// <see cref="DispatchRepeatThreshold"/>, or null to let it run. Escalates to a hard-stop (drops
+    /// all tools next round) when a fingerprint is hammered past <see cref="DispatchHardStopCount"/> or
+    /// the per-turn total exceeds <see cref="MaxDispatchesPerTurn"/>. Non-Agent tools return null.
+    /// </summary>
+    private string? CheckDispatchLoop(ToolCall call)
+    {
+        if (!string.Equals(call.FunctionName, Zdtllm.Tools.TaskTool.ToolName, StringComparison.Ordinal))
+            return null;
+
+        var (type, fingerprint) = DispatchFingerprint(call.Arguments);
+        int fpCount, total;
+        lock (_dispatchLock)
+        {
+            _dispatchCounts.TryGetValue(fingerprint, out var prev);
+            fpCount = prev + 1;
+            _dispatchCounts[fingerprint] = fpCount;
+            total = ++_totalDispatches;
+        }
+
+        // Stubborn same-task hammering (warnings ignored), or a global runaway → hard-stop: no more
+        // subagents this turn, and the next model round drops all tools to force a final summary.
+        if (fpCount >= DispatchHardStopCount || total >= MaxDispatchesPerTurn)
+        {
+            _dispatchHardStop = true;
+            return total >= MaxDispatchesPerTurn
+                ? BuildDispatchBudgetMessage(total)
+                : BuildDispatchFinalMessage(type, fpCount);
+        }
+
+        // Same task re-dispatched too often. Its subagents keep returning slightly different reports so
+        // the result-hash loop detector is blind to it — block this dispatch and demand a new strategy.
+        if (fpCount >= DispatchRepeatThreshold)
+            return BuildDispatchLoopMessage(type, fpCount);
+
+        return null; // distinct / within budget — let it run
+    }
+
+    /// <summary>
+    /// Fingerprint an Agent dispatch as <c>subagent_type + \x1f + normalised(prompt)</c> so trivially
+    /// reworded re-dispatches of the same task collide. Unparseable args fall back to a hash of the raw
+    /// bytes (still a stable identifier). Returns the type too, for the warning messages.
+    /// </summary>
+    private static (string Type, string Fingerprint) DispatchFingerprint(string argsJson)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
+            var root = doc.RootElement;
+            var type = root.TryGetProperty("subagent_type", out var t) && t.ValueKind == JsonValueKind.String
+                ? (t.GetString() ?? "") : "";
+            if (string.IsNullOrWhiteSpace(type)) type = "general-purpose"; // TaskTool's default
+            var prompt = root.TryGetProperty("prompt", out var p) && p.ValueKind == JsonValueKind.String
+                ? (p.GetString() ?? "") : "";
+            return (type, type + "\x1f" + NormalizeForFingerprint(prompt));
+        }
+        catch (JsonException)
+        {
+            return ("general-purpose", "raw\x1f" + HashArgs(argsJson));
+        }
+    }
+
+    /// <summary>Case-fold + collapse whitespace runs to single spaces + trim: a cheap prompt-similarity
+    /// so "Run the tests and fix failures" and "run  the tests and fix failures\n\n" fingerprint alike.</summary>
+    private static string NormalizeForFingerprint(string s)
+    {
+        var sb = new StringBuilder(s.Length);
+        var prevWs = false;
+        foreach (var ch in s.AsSpan().Trim())
+        {
+            if (char.IsWhiteSpace(ch)) { if (!prevWs) { sb.Append(' '); prevWs = true; } }
+            else { sb.Append(char.ToLowerInvariant(ch)); prevWs = false; }
+        }
+        return sb.ToString();
+    }
+
+    private static string BuildDispatchLoopMessage(string type, int count) =>
+        $"[dispatch-loop] You have dispatched the same task (subagent_type='{type}') {count} times this " +
+        "turn and it is NOT converging — each fresh subagent starts from an empty context and hits the " +
+        "same wall. Stop re-dispatching it. Instead: (a) break the task into smaller, concrete sub-steps " +
+        "and dispatch those, (b) do the read-only investigation yourself (Read/Grep/Glob) to find what is " +
+        "actually blocking before delegating again, or (c) report to the user what was accomplished, what " +
+        "is blocked, and what you need. Do NOT dispatch this same task again.";
+
+    private static string BuildDispatchFinalMessage(string type, int count) =>
+        $"[dispatch-loop-final] You have ignored repeated dispatch-loop warnings ({count} attempts at the " +
+        $"same task, subagent_type='{type}'). No more subagents will be spawned this turn. Write your final " +
+        "response to the user NOW: summarise what the subagents accomplished, what remains blocked and why, " +
+        "and your recommended next step.";
+
+    private static string BuildDispatchBudgetMessage(int total) =>
+        $"[dispatch-budget] You have dispatched {total} subagents this turn without converging. No more " +
+        "will be spawned. Write your final summary to the user now: what is done, what is blocked, and " +
+        "what you recommend.";
 
     /// <summary>
     /// Recursive JSON normaliser: sorts object keys lexicographically, preserves array
