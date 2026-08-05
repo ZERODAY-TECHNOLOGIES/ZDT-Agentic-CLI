@@ -437,6 +437,14 @@ public sealed class AgentLoop
         bool nativeSalvageWarned = false;
         // Native-mode "tool-call tags leaked into content and were stripped" hint — once per run.
         bool nativeLeakWarned = false;
+        // Team-mode forced-dispatch accounting (whole user turn, across all iterations). The
+        // orchestrator is allowed to research read-only, but it must hand real work to a subagent —
+        // so if it did non-delegating tool work yet dispatched nothing, we nudge once (guard below)
+        // and re-run instead of letting the turn end. Only meaningful when _teamMode is active; always
+        // false for subagents (they run with teamMode == null).
+        int teamAgentDispatches = 0;
+        bool teamDidNonDelegatingWork = false;
+        bool teamDispatchNudged = false;
         // Auto-compact "can't free anything" notice is printed at most once per context level, not
         // every iteration — otherwise a single long task that sits above the threshold spams the
         // identical "[context ~X%]" line on every tool round. Reset to -1 whenever a pass frees space.
@@ -638,6 +646,24 @@ public sealed class AgentLoop
                 }
             }
 
+            // Team-mode dispatch accounting: tally this iteration's executable calls so the
+            // forced-dispatch guard (in the no-calls block below) knows, at turn end, whether the
+            // orchestrator delegated or merely did read-only work / a blocked mutating attempt. Uses
+            // the calls that will actually execute (native first, else XML/salvaged).
+            if (_teamMode?.InTeamMode == true)
+            {
+                IEnumerable<string> iterCallNames = nativeCalls.Length > 0
+                    ? nativeCalls.Select(c => c.FunctionName)
+                    : xmlCalls.Select(c => c.FunctionName);
+                foreach (var fn in iterCallNames)
+                {
+                    if (string.Equals(fn, Zdtllm.Tools.TaskTool.ToolName, StringComparison.Ordinal))
+                        teamAgentDispatches++;
+                    else
+                        teamDidNonDelegatingWork = true;
+                }
+            }
+
             // Format-breakdown detection: model produced XML-shaped markup but the strict
             // parser found 0 calls and the recovery path also failed. Almost always means an
             // upstream proxy/chat template chewed the open tag (we still see </function_calls>
@@ -784,6 +810,27 @@ public sealed class AgentLoop
                         await status.WriteLineAsync(Palette.Mute(
                             "  ↳ model produced no visible answer" + why)).ConfigureAwait(false);
                     }
+                }
+
+                // Team-mode hard guarantee: the orchestrator just ended a turn in which it did
+                // non-delegating tool work (read-only research, or a blocked mutating attempt) yet
+                // dispatched no subagent. Blocking the mutating tools stops it doing the work itself;
+                // it does NOT stop it quietly answering without delegating — the exact drift on
+                // follow-up turns. So instead of finishing, record this answer for context (don't show
+                // it), append the forced-dispatch nudge as a user turn, and re-run ONCE (the guard
+                // fires at most once per user turn, so a genuine read-only reply can still terminate).
+                if (_teamMode?.InTeamMode == true && !teamDispatchNudged
+                    && teamAgentDispatches == 0 && teamDidNonDelegatingWork)
+                {
+                    teamDispatchNudged = true;
+                    await status.WriteLineAsync(Palette.Gold(
+                        "  ⚇ team mode: no subagent was dispatched — requiring delegation before finishing."))
+                        .ConfigureAwait(false);
+                    session.AddAssistant(
+                        content: displayText.Length > 0 ? displayText : null,
+                        toolCalls: ImmutableArray<ToolCall>.Empty);
+                    session.AddUser(Agents.TeamModeState.ForcedDispatchNudge);
+                    continue;
                 }
 
                 if (_richConsole is not null && displayText.Length > 0)

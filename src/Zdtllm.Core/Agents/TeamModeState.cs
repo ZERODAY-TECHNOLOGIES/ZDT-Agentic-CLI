@@ -85,6 +85,22 @@ public sealed class TeamModeState : ITeamModeSwitch
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Forced-dispatch nudge. The schema filter + block only stop the orchestrator from MUTATING;
+    /// they don't stop it from quietly answering a task with read-only tools and never delegating —
+    /// which is exactly the drift on follow-up turns (the model settles into "just answer"). When a
+    /// team-mode turn does non-delegating work but dispatches no subagent, AgentLoop appends this as a
+    /// user turn and re-runs once, so the orchestrator has to actually hand the work off. The escape
+    /// clause keeps a genuine read-only question from being trapped in a delegate-forever loop.
+    /// </summary>
+    public const string ForcedDispatchNudge =
+        "[TEAM MODE] You finished this task without dispatching a subagent. You are the ORCHESTRATOR: " +
+        "any task that creates, modifies, runs, or otherwise changes code MUST be carried out by a " +
+        "subagent via the Agent tool — do not describe a change, or report it as done, unless a " +
+        "subagent actually performed it. Break the task into focused sub-tasks and dispatch each to a " +
+        "fitting subagent_type now (independent ones in parallel). ONLY if this was a pure read-only " +
+        "question that needs no code changes at all, restate your answer as-is and it will be accepted.";
+
     /// <summary>The tool-result message handed back when the orchestrator tries a blocked tool anyway
     /// (a backstop for XML mode / stale context where the tool wasn't filtered out of the schema).</summary>
     public static string BlockedMessage(string toolName) =>

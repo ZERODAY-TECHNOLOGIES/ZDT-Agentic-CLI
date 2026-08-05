@@ -50,7 +50,10 @@ public sealed class AgentLoopTeamModeTests
     {
         var handler = new StubHandler(
             Sse(ToolCallRound("Write", "{\"path\":\"x.txt\",\"content\":\"hi\"}")),
-            Sse(FinalRound("delegating")));
+            Sse(FinalRound("delegating")),
+            // The blocked Write is non-delegating work, so the forced-dispatch guard nudges once and
+            // re-runs — this third response answers that re-run.
+            Sse(FinalRound("dispatched")));
 
         var registry = new ToolRegistry();
         var write = new CountingTool("Write");
@@ -68,7 +71,10 @@ public sealed class AgentLoopTeamModeTests
     {
         var handler = new StubHandler(
             Sse(ToolCallRound("Peek", "{}")),
-            Sse(FinalRound("done")));
+            Sse(FinalRound("done")),
+            // Read-only work with no dispatch trips the forced-dispatch guard once; the third
+            // response is the re-run (where a genuine read-only turn may just restate its answer).
+            Sse(FinalRound("still read-only")));
 
         var registry = new ToolRegistry();
         var peek = new CountingTool("Peek"); // not in the blocked set
@@ -137,6 +143,75 @@ public sealed class AgentLoopTeamModeTests
         await agent.RunOneShotAsync("ship the feature", new StringWriter(), new StringWriter());
 
         handler.RequestBodies[0].Should().NotContain("TEAM MODE ON");
+    }
+
+    [Fact]
+    public async Task Answering_without_dispatching_forces_a_delegation_nudge_and_reruns()
+    {
+        // Model does read-only work then answers with no Agent dispatch → the hard guarantee must
+        // inject the forced-dispatch nudge and re-run the turn instead of letting it end.
+        var handler = new StubHandler(
+            Sse(ToolCallRound("Read", "{}")),   // req0: read-only research
+            Sse(FinalRound("here is the answer")), // req1: answers, dispatched nothing → nudge + rerun
+            Sse(FinalRound("restating as read-only"))); // req2: the re-run
+
+        var registry = new ToolRegistry();
+        registry.Register(new CountingTool("Read"));
+
+        var agent = BuildAgent(handler, registry, new TeamModeState(active: true));
+        await agent.RunOneShotAsync("do the task", new StringWriter(), new StringWriter());
+
+        // A third request proves the turn was forced to continue after the non-delegating answer.
+        handler.RequestBodies.Should().HaveCount(3);
+        handler.RequestBodies[2].Should().Contain("without dispatching a subagent");
+    }
+
+    [Fact]
+    public async Task Dispatching_a_subagent_does_not_trigger_the_nudge()
+    {
+        // A turn that actually calls the Agent tool has delegated — no forced-dispatch nudge.
+        var handler = new StubHandler(
+            Sse(ToolCallRound("Agent", "{}")), // dispatch
+            Sse(FinalRound("integrated the subagent's result")));
+
+        var registry = new ToolRegistry();
+        registry.Register(new CountingTool("Agent")); // stands in for the real Task/Agent tool
+
+        var agent = BuildAgent(handler, registry, new TeamModeState(active: true));
+        await agent.RunOneShotAsync("ship it", new StringWriter(), new StringWriter());
+
+        handler.RequestBodies.Should().HaveCount(2); // no re-run
+        handler.RequestBodies.Should().NotContain(b => b.Contains("without dispatching a subagent"));
+    }
+
+    [Fact]
+    public async Task Pure_conversational_answer_is_not_forced_to_dispatch()
+    {
+        // No tool use at all (e.g. a greeting / concept question) → nothing to delegate, no nudge.
+        var handler = new StubHandler(Sse(FinalRound("hello")));
+
+        var agent = BuildAgent(handler, new ToolRegistry(), new TeamModeState(active: true));
+        await agent.RunOneShotAsync("hi", new StringWriter(), new StringWriter());
+
+        handler.RequestBodies.Should().HaveCount(1);
+    }
+
+    [Fact]
+    public async Task No_forced_dispatch_when_team_mode_is_off()
+    {
+        // Same read-then-answer shape, but team mode off → the turn ends normally, no re-run.
+        var handler = new StubHandler(
+            Sse(ToolCallRound("Read", "{}")),
+            Sse(FinalRound("answer")));
+
+        var registry = new ToolRegistry();
+        registry.Register(new CountingTool("Read"));
+
+        var agent = BuildAgent(handler, registry, new TeamModeState(active: false));
+        await agent.RunOneShotAsync("look", new StringWriter(), new StringWriter());
+
+        handler.RequestBodies.Should().HaveCount(2);
+        handler.RequestBodies.Should().NotContain(b => b.Contains("without dispatching a subagent"));
     }
 
     private sealed class CountingTool : ITool
