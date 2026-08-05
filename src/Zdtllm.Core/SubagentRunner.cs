@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using Zdtllm.Core.Agents;
 using Zdtllm.Core.Sessions;
 using Zdtllm.Tools;
@@ -225,7 +226,9 @@ public sealed class SubagentRunner : ISubagentRunner
         var subOptions = _parent.Options with
         {
             Model = resolvedModel,
-            SystemPrompt = SystemPromptFor(request.Type),
+            // Grup C: every subagent is asked to end with a STATUS line so the orchestrator can tell
+            // "done" from "gave up" and stop blindly re-dispatching a blocked task.
+            SystemPrompt = SystemPromptFor(request.Type) + StatusLineInstruction,
             MaxTurns = request.MaxTurns,
         };
 
@@ -286,13 +289,50 @@ public sealed class SubagentRunner : ISubagentRunner
                 Turns: result.Turns,
                 PromptTokens: result.PromptTokens,
                 CompletionTokens: result.CompletionTokens,
-                Model: resolvedModel);
+                Model: resolvedModel,
+                Status: DetectStatus(result.FinalText, result.Turns, request.MaxTurns));
         }
         finally
         {
             output.Dispose();
             status.Dispose();
         }
+    }
+
+    /// <summary>Grup C: appended to every subagent's system prompt so it declares an outcome the
+    /// orchestrator can act on. Kept short — the hard signal is the parsed status, not this prose.</summary>
+    internal const string StatusLineInstruction =
+        "\n\n# Reporting back\n" +
+        "You were dispatched by an orchestrator that reads ONLY your final message. End that message with " +
+        "a single status line, on its own line, as the very last thing:\n" +
+        "- `STATUS: completed` — you fully did the task.\n" +
+        "- `STATUS: partial — <what remains>` — you did part of it.\n" +
+        "- `STATUS: blocked — <what stopped you>` — you could not proceed.\n" +
+        "Be honest: a false `completed` makes the orchestrator think the work is done when it isn't; a " +
+        "clear `blocked`/`partial` reason lets it fix the real obstacle instead of re-dispatching the same task.";
+
+    private static readonly Regex StatusLine = new(
+        @"STATUS:\s*(completed|complete|done|blocked|partial|incomplete)\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
+    /// Determine the subagent's outcome. An explicit trailing <c>STATUS:</c> line (the LAST one, if the
+    /// model emitted several) wins; otherwise infer <c>"partial"</c> when it exhausted its turn budget
+    /// (ran out of room rather than declaring done), else <c>"completed"</c>. Never throws.
+    /// </summary>
+    internal static string DetectStatus(string? finalText, int turns, int maxTurns)
+    {
+        var matches = StatusLine.Matches(finalText ?? string.Empty);
+        if (matches.Count > 0)
+        {
+            return matches[^1].Groups[1].Value.ToLowerInvariant() switch
+            {
+                "completed" or "complete" or "done" => "completed",
+                "blocked" => "blocked",
+                _ => "partial", // partial / incomplete
+            };
+        }
+        return maxTurns > 0 && turns >= maxTurns ? "partial" : "completed";
     }
 
     /// <summary>Registry-first tool set: a project agent's own tool policy wins over a built-in of the

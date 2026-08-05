@@ -54,7 +54,14 @@ public sealed record SubagentResult(
     /// (litellm.subagentModels) took effect. Surfaced in TaskTool's result preamble so the
     /// caller can see e.g. <c>[subagent code-reviewer — 3 turn(s), model: glm-fast]</c>.
     /// </summary>
-    string? Model = null);
+    string? Model = null,
+    /// <summary>
+    /// Outcome the subagent reported: <c>"completed"</c>, <c>"partial"</c>, or <c>"blocked"</c> — parsed
+    /// from a trailing <c>STATUS:</c> line it was instructed to emit, or inferred (<c>"partial"</c> when
+    /// it hit the turn cap). Null when unknown. Lets the orchestrator tell "done" from "gave up" so it
+    /// doesn't blindly re-dispatch a task that was blocked. Surfaced in TaskTool's result header.
+    /// </summary>
+    string? Status = null);
 
 /// <summary>
 /// What /agents and the Task-tool error messages need to know about a profile.

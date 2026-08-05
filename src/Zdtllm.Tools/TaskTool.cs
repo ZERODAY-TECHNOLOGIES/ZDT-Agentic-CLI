@@ -122,14 +122,26 @@ public sealed class TaskTool : ITool
             var result = await _runner.RunAsync(request, ct).ConfigureAwait(false);
 
             var sb = new StringBuilder();
-            sb.Append("[subagent ").Append(type)
-              .Append(" — ").Append(result.Turns).Append(" turn(s)");
+            sb.Append("[subagent ").Append(type);
+            // Grup C: lead with the reported outcome so the orchestrator can tell "done" from "gave up".
+            if (!string.IsNullOrEmpty(result.Status))
+                sb.Append(" — STATUS: ").Append(result.Status);
+            sb.Append(" — ").Append(result.Turns).Append(" turn(s)");
             if (!string.IsNullOrEmpty(result.Model))
                 sb.Append(", model: ").Append(result.Model);
             if (result.PromptTokens is int p) sb.Append(", ").Append(p).Append(" prompt tokens");
             if (result.CompletionTokens is int c) sb.Append(", ").Append(c).Append(" completion tokens");
             sb.AppendLine("]");
             sb.AppendLine();
+            // A subagent that did NOT complete must not be silently re-dispatched: tell the orchestrator
+            // to act on the blocker instead. The dispatch-loop guard already caps blind re-dispatch.
+            if (result.Status is "blocked" or "partial")
+            {
+                sb.AppendLine(
+                    "(this subagent did NOT complete the task — read its report, then address the specific " +
+                    "blocker or take a different approach; do not simply re-dispatch the same task.)");
+                sb.AppendLine();
+            }
             sb.Append(result.FinalText);
 
             return ToolResult.Success(sb.ToString());

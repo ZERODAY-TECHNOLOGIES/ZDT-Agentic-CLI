@@ -166,6 +166,35 @@ public sealed class TaskToolTests
         tool.GetSpecifierForPermissions(doc.RootElement).Should().Be("explore");
     }
 
+    [Fact]
+    public async Task Blocked_status_is_surfaced_in_the_header_with_a_do_not_redispatch_hint()
+    {
+        var runner = new RecordingRunner(
+            new SubagentResult("could not find the DB creds", Turns: 4, PromptTokens: null,
+                CompletionTokens: null, Model: null, Status: "blocked"));
+        var tool = new TaskTool(runner);
+
+        var result = await InvokeAsync(tool, new { description = "x", prompt = "y", subagent_type = "general-purpose" });
+
+        result.Content.Should().Contain("STATUS: blocked");
+        result.Content.Should().Contain("did NOT complete");     // the orchestrator hint
+        result.Content.Should().Contain("could not find the DB creds"); // report body preserved
+    }
+
+    [Fact]
+    public async Task Completed_status_shows_no_redispatch_hint()
+    {
+        var runner = new RecordingRunner(
+            new SubagentResult("all done", Turns: 2, PromptTokens: null, CompletionTokens: null,
+                Model: null, Status: "completed"));
+        var tool = new TaskTool(runner);
+
+        var result = await InvokeAsync(tool, new { description = "x", prompt = "y" });
+
+        result.Content.Should().Contain("STATUS: completed");
+        result.Content.Should().NotContain("did NOT complete");
+    }
+
     private sealed class RecordingRunner : ISubagentRunner
     {
         private readonly SubagentResult _result;
