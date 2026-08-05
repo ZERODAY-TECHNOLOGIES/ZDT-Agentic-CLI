@@ -107,6 +107,12 @@ public sealed record LiteLLMSettings(
     /// <summary>top_p passthrough. Null = omit (server default, 0.95 for GLM-5.2). Tune temperature
     /// OR top_p, never both.</summary>
     double? TopP = null,
+    /// <summary>top_k passthrough (non-OpenAI; forwarded to llama.cpp / vLLM). Null = omit → server
+    /// default. Auto-defaults to 20 for Qwen3 models (llama.cpp's built-in 40 is wrong for Qwen3).</summary>
+    int? TopK = null,
+    /// <summary>min_p passthrough (non-OpenAI; forwarded to llama.cpp / vLLM). Null = omit → server
+    /// default. Auto-defaults to 0 for Qwen3 models (llama.cpp's built-in 0.05 is wrong for Qwen3).</summary>
+    double? MinP = null,
     /// <summary>max_tokens (output cap) passthrough. Null = omit (uncapped up to the model's limit,
     /// 128K for GLM-5.2).</summary>
     int? MaxTokens = null,
@@ -138,6 +144,8 @@ public sealed record LiteLLMSettings(
         ReasoningEffort: null,
         Temperature: null,
         TopP: null,
+        TopK: null,
+        MinP: null,
         MaxTokens: null,
         FrequencyPenalty: null,
         PresencePenalty: null,
@@ -156,6 +164,8 @@ public sealed record LiteLLMSettings(
         ReasoningEffort: higher.ReasoningEffort ?? ReasoningEffort,
         Temperature: higher.Temperature ?? Temperature,
         TopP: higher.TopP ?? TopP,
+        TopK: higher.TopK ?? TopK,
+        MinP: higher.MinP ?? MinP,
         MaxTokens: higher.MaxTokens ?? MaxTokens,
         FrequencyPenalty: higher.FrequencyPenalty ?? FrequencyPenalty,
         PresencePenalty: higher.PresencePenalty ?? PresencePenalty,

@@ -214,6 +214,12 @@ internal sealed class RawLiteLLM
     /// <summary>top_p passthrough — see <see cref="LiteLLMSettings.TopP"/>.</summary>
     public double? TopP { get; set; }
 
+    /// <summary>top_k passthrough — see <see cref="LiteLLMSettings.TopK"/>.</summary>
+    public int? TopK { get; set; }
+
+    /// <summary>min_p passthrough — see <see cref="LiteLLMSettings.MinP"/>.</summary>
+    public double? MinP { get; set; }
+
     /// <summary>max_tokens output-cap passthrough — see <see cref="LiteLLMSettings.MaxTokens"/>.</summary>
     public int? MaxTokens { get; set; }
 
@@ -242,6 +248,8 @@ internal sealed class RawLiteLLM
         ReasoningEffort: EnvironmentExpander.ExpandNullable(ReasoningEffort, envRead),
         Temperature: Temperature,
         TopP: TopP,
+        TopK: TopK,
+        MinP: MinP,
         MaxTokens: MaxTokens,
         FrequencyPenalty: FrequencyPenalty,
         PresencePenalty: PresencePenalty,

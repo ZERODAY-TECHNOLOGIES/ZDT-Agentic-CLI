@@ -47,6 +47,12 @@ public sealed record LiteLLMClientOptions
     public string? ReasoningEffort { get; init; }
     public double? Temperature { get; init; }
     public double? TopP { get; init; }
+    /// <summary>top_k passthrough (non-OpenAI; llama.cpp / vLLM accept it). Null = omit. Qwen3 wants
+    /// 20 — llama.cpp's built-in default is 40, which the server applies when this is absent.</summary>
+    public int? TopK { get; init; }
+    /// <summary>min_p passthrough (non-OpenAI; llama.cpp / vLLM accept it). Null = omit. Qwen3 wants
+    /// 0 — llama.cpp's built-in default is 0.05, which the server applies when this is absent.</summary>
+    public double? MinP { get; init; }
     public int? MaxTokens { get; init; }
     /// <summary>frequency_penalty passthrough — anti-repetition lever. Null = omit. Fixes GLM's
     /// tendency to repeat tool calls at the source rather than at the app-layer loop detector.</summary>
@@ -414,6 +420,8 @@ public sealed class LiteLLMClient
             ReasoningEffort = reasoningEffortOverride ?? _options.ReasoningEffort,
             Temperature = _options.Temperature,
             TopP = _options.TopP,
+            TopK = _options.TopK,
+            MinP = _options.MinP,
             MaxTokens = _options.MaxTokens,
             FrequencyPenalty = _options.FrequencyPenalty,
             PresencePenalty = _options.PresencePenalty,
@@ -484,6 +492,8 @@ internal sealed class RequestPayload
     public string? ReasoningEffort { get; init; }
     public double? Temperature { get; init; }
     public double? TopP { get; init; }
+    public int? TopK { get; init; }
+    public double? MinP { get; init; }
     public int? MaxTokens { get; init; }
     public double? FrequencyPenalty { get; init; }
     public double? PresencePenalty { get; init; }

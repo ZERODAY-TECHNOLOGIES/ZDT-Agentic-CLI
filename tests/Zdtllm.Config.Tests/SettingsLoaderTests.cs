@@ -207,6 +207,39 @@ public sealed class SettingsLoaderTests : IDisposable
     }
 
     [Fact]
+    public void TopK_and_MinP_load_from_litellm_section()
+    {
+        WriteUser("""
+        {
+          "litellm": {
+            "temperature": 0.6,
+            "topP": 0.95,
+            "topK": 20,
+            "minP": 0
+          }
+        }
+        """);
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options());
+
+        s.LiteLLM.Temperature.Should().Be(0.6);
+        s.LiteLLM.TopP.Should().Be(0.95);
+        s.LiteLLM.TopK.Should().Be(20);
+        s.LiteLLM.MinP.Should().Be(0);
+    }
+
+    [Fact]
+    public void TopK_and_MinP_default_to_null_when_unset()
+    {
+        WriteUser("""{ "litellm": { "baseUrl": "http://x" } }""");
+
+        var s = SettingsLoader.LoadEffectiveSettings(ProjectDir, Options());
+
+        s.LiteLLM.TopK.Should().BeNull();
+        s.LiteLLM.MinP.Should().BeNull();
+    }
+
+    [Fact]
     public void Subagent_models_load_from_litellm_section()
     {
         WriteUser("""

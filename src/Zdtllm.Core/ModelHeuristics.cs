@@ -52,4 +52,20 @@ public static class ModelHeuristics
     /// </summary>
     public static bool LooksLikeGlm(string? modelName) =>
         !string.IsNullOrEmpty(modelName) && modelName.Contains("glm", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// True when the model id looks like a Qwen3-family model (Qwen3, Qwen3.5/3.6, and the A3B MoE
+    /// variants / community fine-tunes like <c>Qwen3.6-35B-A3B-…</c>). Matched as a case-insensitive
+    /// substring on <c>"qwen3"</c> so versioned ids still trigger.
+    /// <para>
+    /// Used to default Qwen3's documented sampling profile (temperature 0.6 / top_p 0.95 / top_k 20 /
+    /// min_p 0) when the user hasn't pinned it. This matters specifically for local llama.cpp routes:
+    /// llama.cpp does NOT read the model's HF <c>generation_config.json</c>, and its built-in sampler
+    /// defaults (temp 0.8 / top_k 40 / min_p 0.05 / top_p 0.9) are wrong for Qwen3 — they cause
+    /// quality loss and the repetition loops these MoE models are prone to. The client must send the
+    /// right values explicitly on every request. Any explicit <c>litellm.*</c> value still wins.
+    /// </para>
+    /// </summary>
+    public static bool LooksLikeQwen3(string? modelName) =>
+        !string.IsNullOrEmpty(modelName) && modelName.Contains("qwen3", StringComparison.OrdinalIgnoreCase);
 }

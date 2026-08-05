@@ -142,30 +142,52 @@ internal static class Program
             : TimeSpan.FromSeconds(configuredTimeout.Value);
         using var http = new HttpClient { Timeout = httpTimeout };
 
+        // Resolve the alias to the real model id once, so the per-model tuning heuristics below all
+        // see the concrete id (e.g. "Qwen3.6-35B-A3B-…") rather than a short alias.
+        var tuningAlias = parsed.Model ?? settings.Model;
+        var tuningModel = tuningAlias is not null && settings.LiteLLM.Models.TryGetValue(tuningAlias, out var rm)
+            ? rm : tuningAlias;
+
         // GLM-5.2 is reasoning-first: with reasoning_effort unset the server thinks at its default
         // 'max' tier on EVERY turn (including trivial tool-continuation turns). Default it to 'high'
         // — the documented guidance — for a GLM model when the user hasn't pinned it. Any explicit
         // litellm.reasoningEffort still wins; non-GLM models are unaffected (stays null → omitted).
         var reasoningEffort = settings.LiteLLM.ReasoningEffort;
-        if (reasoningEffort is null)
+        if (reasoningEffort is null && Zdtllm.Core.ModelHeuristics.LooksLikeGlm(tuningModel))
+            reasoningEffort = "high";
+
+        // Qwen3 sampling profile. Critical for local llama.cpp routes: llama.cpp does NOT read the
+        // model's HF generation_config.json, and its built-in sampler defaults (temp 0.8 / top_p 0.9 /
+        // top_k 40 / min_p 0.05) are wrong for Qwen3 — they degrade quality and trigger the repetition
+        // loops the A3B MoE models are prone to. Send Qwen3's documented thinking/coding profile
+        // explicitly. Only fills a knob the user left unset (each ??= respects an explicit litellm.*
+        // value); non-Qwen3 models are untouched (stays null → omitted → byte-identical body).
+        var temperature = settings.LiteLLM.Temperature;
+        var topP = settings.LiteLLM.TopP;
+        var topK = settings.LiteLLM.TopK;
+        var minP = settings.LiteLLM.MinP;
+        if (Zdtllm.Core.ModelHeuristics.LooksLikeQwen3(tuningModel))
         {
-            var alias = parsed.Model ?? settings.Model;
-            var resolvedModel = alias is not null && settings.LiteLLM.Models.TryGetValue(alias, out var rm) ? rm : alias;
-            if (Zdtllm.Core.ModelHeuristics.LooksLikeGlm(resolvedModel))
-                reasoningEffort = "high";
+            temperature ??= 0.6;
+            topP ??= 0.95;
+            topK ??= 20;
+            minP ??= 0;
         }
 
         var client = new LiteLLMClient(http, new LiteLLMClientOptions
         {
             BaseUrl = settings.LiteLLM.BaseUrl!,
             ApiKey = settings.LiteLLM.ApiKey!,
-            // Optional request-shaping passthroughs (all null/empty unless set in settings.json).
-            // For GLM-5.2: reasoningEffort defaults to "high" (above); leave temperature UNSET (GLM
-            // is trained at 1.0 — do not lower it). frequency/presence penalties are opt-in
-            // anti-repetition levers. These are per-model-safe: unset → omitted → byte-identical body.
+            // Optional request-shaping passthroughs (all null/empty unless set in settings.json or
+            // supplied by a per-model default above). For GLM-5.2: reasoningEffort defaults to "high",
+            // temperature stays UNSET (GLM is trained at 1.0 — do not lower it). For Qwen3: temp/top_p/
+            // top_k/min_p get the profile above. frequency/presence penalties are opt-in anti-repetition
+            // levers. Per-model-safe: unset → omitted → byte-identical body.
             ReasoningEffort = reasoningEffort,
-            Temperature = settings.LiteLLM.Temperature,
-            TopP = settings.LiteLLM.TopP,
+            Temperature = temperature,
+            TopP = topP,
+            TopK = topK,
+            MinP = minP,
             MaxTokens = settings.LiteLLM.MaxTokens,
             FrequencyPenalty = settings.LiteLLM.FrequencyPenalty,
             PresencePenalty = settings.LiteLLM.PresencePenalty,
@@ -916,6 +938,8 @@ internal static class Program
         sb.AppendLine().Append(Row("litellm.reasoningEffort", l.ReasoningEffort));
         sb.AppendLine().Append(Row("litellm.temperature", l.Temperature?.ToString()));
         sb.AppendLine().Append(Row("litellm.topP", l.TopP?.ToString()));
+        sb.AppendLine().Append(Row("litellm.topK", l.TopK?.ToString()));
+        sb.AppendLine().Append(Row("litellm.minP", l.MinP?.ToString()));
         sb.AppendLine().Append(Row("litellm.maxTokens", l.MaxTokens?.ToString()));
         sb.AppendLine().Append(Row("litellm.frequencyPenalty", l.FrequencyPenalty?.ToString()));
         sb.AppendLine().Append(Row("litellm.presencePenalty", l.PresencePenalty?.ToString()));

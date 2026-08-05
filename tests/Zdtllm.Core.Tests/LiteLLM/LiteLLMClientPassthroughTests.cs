@@ -46,9 +46,55 @@ public sealed class LiteLLMClientPassthroughTests
         body.Should().NotContain("max_tokens");
         body.Should().NotContain("frequency_penalty");
         body.Should().NotContain("presence_penalty");
+        body.Should().NotContain("top_k");
+        body.Should().NotContain("min_p");
         // Load-bearing shape unchanged.
         body.Should().Contain("\"stream\":true");
         body.Should().Contain("\"drop_params\":false");
+    }
+
+    [Fact]
+    public async Task TopK_and_MinP_serialize_snake_cased_when_set()
+    {
+        var handler = new StubHandler(Sse("data: [DONE]\n\n"));
+        var opts = new LiteLLMClientOptions
+        {
+            BaseUrl = "http://localhost:4000", ApiKey = "k", MaxRetries = 0,
+            InitialBackoff = TimeSpan.FromMilliseconds(1),
+            // The Qwen3 profile zdt auto-applies for a Qwen3 model.
+            Temperature = 0.6, TopP = 0.95, TopK = 20, MinP = 0,
+        };
+        var body = await BodyOf(Build(handler, opts), handler);
+
+        body.Should().Contain("\"temperature\":0.6");
+        body.Should().Contain("\"top_p\":0.95");
+        body.Should().Contain("\"top_k\":20");
+        body.Should().Contain("\"min_p\":0");
+    }
+
+    [Fact]
+    public async Task Typed_TopK_wins_over_an_extraParams_top_k_but_extraParams_still_fills_an_unset_one()
+    {
+        // Typed TopK set → the typed value is on the payload, so an extraParams top_k is skipped.
+        var handlerA = new StubHandler(Sse("data: [DONE]\n\n"));
+        var typed = new LiteLLMClientOptions
+        {
+            BaseUrl = "http://localhost:4000", ApiKey = "k", MaxRetries = 0,
+            InitialBackoff = TimeSpan.FromMilliseconds(1),
+            TopK = 20,
+            ExtraParams = new Dictionary<string, JsonElement> { ["top_k"] = El("40") },
+        };
+        (await BodyOf(Build(handlerA, typed), handlerA)).Should().Contain("\"top_k\":20").And.NotContain("40");
+
+        // Typed TopK unset → the escape hatch still works (back-compat with pre-typed configs).
+        var handlerB = new StubHandler(Sse("data: [DONE]\n\n"));
+        var viaExtra = new LiteLLMClientOptions
+        {
+            BaseUrl = "http://localhost:4000", ApiKey = "k", MaxRetries = 0,
+            InitialBackoff = TimeSpan.FromMilliseconds(1),
+            ExtraParams = new Dictionary<string, JsonElement> { ["top_k"] = El("40") },
+        };
+        (await BodyOf(Build(handlerB, viaExtra), handlerB)).Should().Contain("\"top_k\":40");
     }
 
     [Fact]
