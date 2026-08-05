@@ -164,13 +164,15 @@ public static partial class XmlToolCallParser
         // tool_call dialect — same scan with the Hermes extractor.
         SalvageDialect(sanitized, "</tool_call>", calls, ExtractHermes);
 
-        // No close tag at all but stray invoke/function markers — try inner extractors directly
-        // on the whole text. The inner regexes match standalone <invoke .../> and <function=...>
-        // so this catches the worst-case "both wrapper tags eaten" breakdown.
+        // No close tag at all but stray invoke/function markers — try inner extraction directly on
+        // the whole text. ExtractOpenHands already cross-tries the Hermes <function=..> form (and
+        // ExtractHermes the <invoke> form), so run the second extractor ONLY if the first found
+        // nothing — otherwise a bare <invoke>/<function=> would be counted twice.
         if (calls.Count == 0)
         {
             ExtractOpenHands(sanitized, calls);
-            ExtractHermes(sanitized, calls);
+            if (calls.Count == 0)
+                ExtractHermes(sanitized, calls);
         }
     }
 
@@ -279,12 +281,17 @@ public static partial class XmlToolCallParser
 
     private static void ExtractOpenHands(string blockBody, List<ParsedXmlToolCall> calls)
     {
+        var before = calls.Count;
         foreach (Match invoke in InvokeRegex().Matches(blockBody))
-        {
-            var name = invoke.Groups[1].Value;
-            var body = invoke.Groups[2].Value;
-            calls.Add(BuildCall(name, body, OpenHandsParamRegex()));
-        }
+            calls.Add(BuildCall(invoke.Groups[1].Value.Trim(), invoke.Groups[2].Value));
+        if (calls.Count > before) return;
+
+        // Dialect-mix fallback: a Hermes <function=NAME> block that leaked inside a <function_calls>
+        // wrapper (a Qwen/Hermes-trained model asked for the OpenHands format mixes the two). Only
+        // when no <invoke> matched, so a clean OpenHands call whose parameter VALUE happens to contain
+        // <function=…> markup isn't misparsed into a bogus call.
+        foreach (Match func in HermesFunctionRegex().Matches(blockBody))
+            calls.Add(BuildCall(func.Groups[1].Value.Trim(), func.Groups[2].Value));
     }
 
     private static void ExtractHermes(string blockBody, List<ParsedXmlToolCall> calls)
@@ -304,14 +311,16 @@ public static partial class XmlToolCallParser
         // Tag form: <function=NAME>...<parameter=NAME>VALUE</parameter>...</function>
         var before = calls.Count;
         foreach (Match func in HermesFunctionRegex().Matches(blockBody))
-        {
-            var name = func.Groups[1].Value.Trim();
-            var body = func.Groups[2].Value;
-            calls.Add(BuildCall(name, body, HermesParamRegex()));
-        }
+            calls.Add(BuildCall(func.Groups[1].Value.Trim(), func.Groups[2].Value));
         if (calls.Count > before) return;
 
-        // GLM-5.x native form (last resort — only when neither JSON nor <function=..> matched):
+        // Dialect-mix fallback: an OpenHands <invoke name="X"> that leaked inside a <tool_call>
+        // wrapper. Only when no <function=> matched, so clean Hermes calls are untouched.
+        foreach (Match invoke in InvokeRegex().Matches(blockBody))
+            calls.Add(BuildCall(invoke.Groups[1].Value.Trim(), invoke.Groups[2].Value));
+        if (calls.Count > before) return;
+
+        // GLM-5.x native form (last resort — only when no JSON / <function=..> / <invoke> matched):
         //   <tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>
         // The name is the leading token before the first <arg_key>; each pair becomes one argument.
         var argMatches = GlmArgPairRegex().Matches(blockBody);
@@ -373,18 +382,33 @@ public static partial class XmlToolCallParser
         }
     }
 
-    private static ParsedXmlToolCall BuildCall(string name, string body, Regex paramRegex)
+    private static ParsedXmlToolCall BuildCall(string name, string body)
     {
         using var ms = new MemoryStream();
         using (var w = new Utf8JsonWriter(ms))
         {
             w.WriteStartObject();
-            foreach (Match param in paramRegex.Matches(body))
+            // Parameters may be written in EITHER dialect regardless of the wrapper the model chose:
+            // a Qwen/Hermes-trained model asked for the OpenHands format routinely emits an
+            // <invoke name="..."> wrapper but Hermes-style <parameter=name> params inside it — which
+            // used to yield an empty argument object (the "chronic Agent tool" failure). Prefer the
+            // OpenHands (quoted-attr) dialect; only fall back to the Hermes (=name) dialect when the
+            // first found nothing, so a clean call whose VALUE contains the other dialect's markup
+            // isn't misparsed into phantom parameters.
+            var wroteAny = false;
+            foreach (Match param in OpenHandsParamRegex().Matches(body))
             {
-                var pName = param.Groups[1].Value;
-                var pValue = param.Groups[2].Value;
-                w.WritePropertyName(pName);
-                WriteParameterValue(w, pValue);
+                wroteAny = true;
+                w.WritePropertyName(param.Groups[1].Value);
+                WriteParameterValue(w, param.Groups[2].Value);
+            }
+            if (!wroteAny)
+            {
+                foreach (Match param in HermesParamRegex().Matches(body))
+                {
+                    w.WritePropertyName(param.Groups[1].Value);
+                    WriteParameterValue(w, param.Groups[2].Value);
+                }
             }
             w.WriteEndObject();
         }

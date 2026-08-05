@@ -675,11 +675,14 @@ public sealed class AgentLoop
                 && XmlToolCallParser.LooksLikeBrokenXml(assistantText.ToString()))
             {
                 formatBreakdownDetected = true;
+                // Include a one-line snippet of the offending markup so the exact shape the model
+                // produced is visible (which dialect, where it broke) instead of having to guess.
+                var rawSnippet = Truncate(assistantText.ToString().ReplaceLineEndings(" "), 240);
                 var breakdownDetails =
-                    "assistant emitted XML tool-call markup but the open tag was malformed " +
+                    "assistant emitted XML tool-call markup but no call could be parsed " +
                     "(close tag with no matching open, or stray <invoke>/<function=> marker). " +
                     "Upstream proxy/chat template likely stripped bytes; check LiteLLM config " +
-                    "or try --tool-calling native if the model supports it.";
+                    "or try --tool-calling native if the model supports it. Raw: " + rawSnippet;
                 await status.WriteLineAsync(Palette.Red("  ⚠ format breakdown:") + " " + Palette.Mute(breakdownDetails))
                     .ConfigureAwait(false);
                 await SafeNotifyAsync(_observer?.OnFormatBreakdownAsync(breakdownDetails, ct))

@@ -530,4 +530,96 @@ public sealed class XmlToolCallParserTests
         stripped.Should().NotContain("</function_calls>");
         stripped.Should().NotContain("<invoke");
     }
+
+    // ─── Dialect-mix hybrids: a Qwen/Hermes model asked for the OpenHands format mixes the two ───
+
+    [Fact]
+    public void Hybrid_openhands_invoke_with_hermes_params_still_captures_arguments()
+    {
+        // THE chronic Agent-tool bug: <invoke name=".."> wrapper (OpenHands) but <parameter=name>
+        // params (Hermes). This used to yield an empty argument object — the call ran with no args.
+        var text =
+            """
+            <function_calls>
+            <invoke name="Agent">
+            <parameter=description>Research the model</parameter>
+            <parameter=subagent_type>general-purpose</parameter>
+            <parameter=prompt>Do the research
+            across multiple lines</parameter>
+            </invoke>
+            </function_calls>
+            """;
+
+        var calls = XmlToolCallParser.ExtractCalls(text);
+
+        calls.Should().HaveCount(1);
+        calls[0].FunctionName.Should().Be("Agent");
+        using var doc = JsonDocument.Parse(calls[0].ArgumentsJson);
+        doc.RootElement.GetProperty("description").GetString().Should().Be("Research the model");
+        doc.RootElement.GetProperty("subagent_type").GetString().Should().Be("general-purpose");
+        // Multi-line value is captured whole (assert line-ending-agnostically — the source raw
+        // string is CRLF on Windows).
+        var prompt = doc.RootElement.GetProperty("prompt").GetString();
+        prompt.Should().Contain("Do the research").And.Contain("across multiple lines");
+    }
+
+    [Fact]
+    public void Hybrid_hermes_wrapper_with_openhands_invoke_is_extracted_not_dropped()
+    {
+        // <tool_call> wrapper (Hermes) but <invoke name=".."> inside (OpenHands). Used to extract 0
+        // calls → silently dropped → "no visible answer / reasoning fallback".
+        var text =
+            """
+            <tool_call>
+            <invoke name="Read"><parameter name="path">./README.md</parameter></invoke>
+            </tool_call>
+            """;
+
+        var calls = XmlToolCallParser.ExtractCalls(text);
+
+        calls.Should().HaveCount(1);
+        calls[0].FunctionName.Should().Be("Read");
+        using var doc = JsonDocument.Parse(calls[0].ArgumentsJson);
+        doc.RootElement.GetProperty("path").GetString().Should().Be("./README.md");
+    }
+
+    [Fact]
+    public void Hybrid_openhands_wrapper_with_hermes_function_is_extracted()
+    {
+        // <function_calls> wrapper (OpenHands) but <function=NAME> inside (Hermes).
+        var text =
+            """
+            <function_calls>
+            <function=Grep><parameter=pattern>TODO</parameter></function>
+            </function_calls>
+            """;
+
+        var calls = XmlToolCallParser.ExtractCalls(text);
+
+        calls.Should().HaveCount(1);
+        calls[0].FunctionName.Should().Be("Grep");
+        using var doc = JsonDocument.Parse(calls[0].ArgumentsJson);
+        doc.RootElement.GetProperty("pattern").GetString().Should().Be("TODO");
+    }
+
+    [Fact]
+    public void Clean_openhands_call_whose_value_contains_other_dialect_markup_is_not_double_parsed()
+    {
+        // Guard for the fallback-only design: a real OpenHands call whose parameter VALUE mentions
+        // Hermes markup must NOT spawn a phantom call or phantom params.
+        var text =
+            """
+            <function_calls>
+            <invoke name="Echo"><parameter name="text">see <function=Fake> and <parameter=foo>bar</parameter></parameter></invoke>
+            </function_calls>
+            """;
+
+        var calls = XmlToolCallParser.ExtractCalls(text);
+
+        calls.Should().HaveCount(1);
+        calls[0].FunctionName.Should().Be("Echo");
+        calls.Should().NotContain(c => c.FunctionName == "Fake");
+        using var doc = JsonDocument.Parse(calls[0].ArgumentsJson);
+        doc.RootElement.TryGetProperty("foo", out _).Should().BeFalse("the fallback dialect must not run once the primary matched");
+    }
 }
