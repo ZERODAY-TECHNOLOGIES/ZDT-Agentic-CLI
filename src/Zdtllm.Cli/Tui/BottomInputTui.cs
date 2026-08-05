@@ -54,6 +54,14 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     // support it (older conhost) simply ignore the sequences.
     private const string SyncBegin = "\x1b[?2026h";
     private const string SyncEnd = "\x1b[?2026l";
+
+    // DEC 2026 synchronized output is UNRELIABLE on some terminals / multiplexers: they buffer
+    // everything after "?2026h" but present it late (or only on the next activity), so a whole frame
+    // — status-row tick AND output — appears stuck until a keypress forces the next frame out. That is
+    // exactly the "freezes, press Enter to update" symptom. Opt out with ZDT_TUI_NO_SYNC=1 to fall
+    // back to plain frame writes (each frame is still one atomic Console.Write, so no interleaving).
+    private static readonly bool UseSyncOutput =
+        !string.Equals(Environment.GetEnvironmentVariable("ZDT_TUI_NO_SYNC"), "1", StringComparison.Ordinal);
     private const int MaxInputRows = 8;
 
     private readonly IUserInputQueue _queue;
@@ -543,12 +551,18 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     // Every paint path composes ONE frame into a StringBuilder and writes it in a single
     // Console.Write, wrapped in DEC 2026 synchronized output. One write = no interleaving with
     // other writers mid-frame; sync markers = the terminal presents it atomically (no flicker).
-    private static StringBuilder BeginFrame() => new StringBuilder(256).Append(SyncBegin);
+    private static StringBuilder BeginFrame()
+    {
+        var sb = new StringBuilder(256);
+        if (UseSyncOutput) sb.Append(SyncBegin);
+        return sb;
+    }
 
     private static void EndFrame(StringBuilder sb)
     {
-        sb.Append(SyncEnd);
+        if (UseSyncOutput) sb.Append(SyncEnd);
         Console.Write(sb.ToString());
+        Console.Out.Flush(); // force presentation — don't rely on the console writer's auto-flush
     }
 
     private void EmitOutputLine(string line)
