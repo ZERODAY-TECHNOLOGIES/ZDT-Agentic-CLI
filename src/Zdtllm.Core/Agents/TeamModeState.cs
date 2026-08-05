@@ -59,8 +59,10 @@ public sealed class TeamModeState : ITeamModeSwitch
             "dispatch EACH one to a subagent with the Agent tool (pick the subagent_type that fits). " +
             "Dispatch independent sub-tasks in parallel. Use Read/Grep/Glob only to understand the code " +
             "well enough to write a precise prompt for each subagent. When subagents report back, verify " +
-            "and integrate their results, then summarise for the user. If a needed specialist is missing, " +
-            "say so — the user can add one with /team.");
+            "and integrate their results, then summarise for the user. Each subagent ends with a STATUS " +
+            "(completed / partial / blocked); if one returns blocked or partial, act on the stated blocker " +
+            "— do NOT re-dispatch the same task (identical re-dispatches are blocked): change the approach " +
+            "or split it smaller. If a needed specialist is missing, say so — the user can add one with /team.");
 
         if (projectAgents.Count > 0)
         {
