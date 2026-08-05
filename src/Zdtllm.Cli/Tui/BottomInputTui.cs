@@ -88,6 +88,7 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     private Task? _reader;
     private volatile bool _started;
     private int _disposed;
+    private uint? _savedConsoleInputMode;          // original Win32 console input mode, restored on exit
     private bool _exclusive;                       // guarded by _render: an exclusive renderer owns the screen
     private readonly List<string> _deferred = new(); // guarded by _render: output held back while exclusive
     private int _regionBottom = -1;                // last DECSTBM bottom row actually emitted (-1 = none)
@@ -126,6 +127,7 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
     {
         if (_started) return;
         _started = true;
+        DisableQuickEditMode(); // so a mouse selection can't suspend our output and "freeze" the TUI
         RefreshDims();
         lock (_render)
         {
@@ -845,6 +847,40 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
         catch (InvalidOperationException) { return false; }
     }
 
+    // Turn OFF Windows QuickEdit mode: a mouse text-selection otherwise puts the console into "mark"
+    // mode, which SUSPENDS our stdout (every Console.Write blocks) until the selection is cleared with
+    // Enter/Esc — so the whole TUI looks frozen and "unfreezes" on the next keypress. Saves the prior
+    // mode for restore. Best-effort: a redirected/absent console (tests, pipes) just keeps its mode.
+    private void DisableQuickEditMode()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        try
+        {
+            var h = NativeConsoleMode.GetStdHandle(NativeConsoleMode.STD_INPUT_HANDLE);
+            if (h == IntPtr.Zero || h == NativeConsoleMode.INVALID_HANDLE_VALUE) return;
+            if (!NativeConsoleMode.GetConsoleMode(h, out var mode)) return;
+            _savedConsoleInputMode = mode;
+            // Clear QuickEdit; EXTENDED_FLAGS must be set for the QuickEdit change to take effect. Every
+            // other bit (mouse/window input, etc.) is preserved.
+            var updated = (mode & ~NativeConsoleMode.ENABLE_QUICK_EDIT_MODE) | NativeConsoleMode.ENABLE_EXTENDED_FLAGS;
+            NativeConsoleMode.SetConsoleMode(h, updated);
+        }
+        catch { /* no console mode to change — leave it */ }
+    }
+
+    private void RestoreQuickEditMode()
+    {
+        if (!OperatingSystem.IsWindows() || _savedConsoleInputMode is not { } saved) return;
+        try
+        {
+            var h = NativeConsoleMode.GetStdHandle(NativeConsoleMode.STD_INPUT_HANDLE);
+            if (h != IntPtr.Zero && h != NativeConsoleMode.INVALID_HANDLE_VALUE)
+                NativeConsoleMode.SetConsoleMode(h, saved);
+        }
+        catch { }
+        _savedConsoleInputMode = null;
+    }
+
     public void Dispose()
     {
         // Idempotent: the normal finally AND the ProcessExit hook (hard Ctrl+C exits) both call
@@ -853,6 +889,7 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
         try { _cts?.Cancel(); } catch { }
         try { _reader?.Wait(TimeSpan.FromMilliseconds(400)); } catch { }
         _cts?.Dispose();
+        RestoreQuickEditMode(); // put the user's console mode back the way we found it
         if (_started)
         {
             try
