@@ -847,13 +847,16 @@ public sealed class BottomInputTui : IReplInputSource, ITurnInputCapture, IInter
         catch (InvalidOperationException) { return false; }
     }
 
-    // Turn OFF Windows QuickEdit mode: a mouse text-selection otherwise puts the console into "mark"
-    // mode, which SUSPENDS our stdout (every Console.Write blocks) until the selection is cleared with
-    // Enter/Esc — so the whole TUI looks frozen and "unfreezes" on the next keypress. Saves the prior
-    // mode for restore. Best-effort: a redirected/absent console (tests, pipes) just keeps its mode.
+    // Turn OFF Windows QuickEdit mode — but ONLY in the legacy console host, where a mouse selection
+    // puts the console into "mark" mode that SUSPENDS our stdout (every Console.Write blocks) until the
+    // selection is cleared with Enter/Esc, so the whole TUI looks frozen and "unfreezes" on the next
+    // keypress. Modern terminals (Windows Terminal, VS Code, ConEmu, …) do UI-side selection that never
+    // freezes output AND need QuickEdit ON to select at all — there we leave it be so the user keeps
+    // copy/paste. Saves the prior mode for restore. Best-effort: a redirected/absent console (tests,
+    // pipes) or a non-Windows OS just keeps its mode.
     private void DisableQuickEditMode()
     {
-        if (!OperatingSystem.IsWindows()) return;
+        if (!NativeConsoleMode.ShouldDisableQuickEdit()) return;
         try
         {
             var h = NativeConsoleMode.GetStdHandle(NativeConsoleMode.STD_INPUT_HANDLE);
