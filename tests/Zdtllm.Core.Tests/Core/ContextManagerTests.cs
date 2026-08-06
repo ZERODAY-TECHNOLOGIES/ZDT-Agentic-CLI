@@ -2,6 +2,7 @@ using System.Collections.Immutable;
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Zdtllm.Core;
 using Zdtllm.Core.Sessions;
 using Zdtllm.Core.Tests.LiteLLM;
@@ -206,6 +207,35 @@ public sealed class ContextManagerTests : IDisposable
         handler.RequestBodies.Should().ContainSingle();
         handler.RequestBodies[0].Should().Contain("\"model\":\"qwen-medium\"");
         handler.RequestBodies[0].Should().Contain("Summarize the following conversation history");
+    }
+
+    [Fact]
+    public async Task Repeated_compaction_does_not_stack_summary_blocks()
+    {
+        // The "context creeps up after each compact" bug: each compaction used to APPEND a new
+        // <conversation_summary> to the system prompt, so N compactions = N stacked blocks. Now the
+        // prior block is stripped and folded into the new one → always exactly one block.
+        var store = SessionStore.Create(_tempDir);
+        using var session = Session.NewPersistent(store, "m");
+        session.AddSystem("you are zdt");
+        for (var i = 1; i <= 6; i++) { session.AddUser($"u{i}"); session.AddAssistant($"a{i}", ImmutableArray<ToolCall>.Empty); }
+
+        var handler = new StubHandler(CompletionResponse("RECAP-ONE"), CompletionResponse("RECAP-TWO"));
+        var client = BuildClient(handler);
+        var ctx = new ContextManager(100_000, "qwen-medium");
+
+        await ctx.CompactAsync(session, client); // 1st: folds RECAP-ONE into the system prompt
+        for (var i = 7; i <= 12; i++) { session.AddUser($"u{i}"); session.AddAssistant($"a{i}", ImmutableArray<ToolCall>.Empty); }
+        await ctx.CompactAsync(session, client); // 2nd: must REPLACE the old block, not stack a second
+
+        var system = session.Messages[0];
+        system.Role.Should().Be("system");
+        Regex.Matches(system.Content!, "<conversation_summary>").Count.Should().Be(1); // exactly ONE block
+        system.Content.Should().Contain("you are zdt");   // original prompt survives every pass
+        system.Content.Should().Contain("RECAP-TWO");      // newest summary is the one kept
+        system.Content.Should().NotContain("RECAP-ONE");   // the old block was folded in, not appended
+        // ...and the prior summary was carried into the 2nd summarisation request so nothing is lost.
+        handler.RequestBodies[^1].Should().Contain("RECAP-ONE");
     }
 
     [Fact]

@@ -1,4 +1,6 @@
 using System.Collections.Immutable;
+using System.Text;
+using System.Text.RegularExpressions;
 using Zdtllm.Core.Sessions;
 using Zdtllm.LiteLLM;
 
@@ -119,18 +121,26 @@ public sealed class ContextManager
 
         if (summarizable.Count == 0) return 0;
 
-        var summary = await SummarizeAsync(summarizable, client, ct).ConfigureAwait(false);
+        // Pull the system content, stripping any <conversation_summary> a PRIOR compaction folded in.
+        // Without this, every compaction would APPEND a fresh ~500-word summary block and the system
+        // prompt would grow unbounded across a long session — the "context creeps up after each compact"
+        // bug. The prior summary is NOT lost: it is fed to the summariser as the story-so-far so the
+        // single new block stays cumulative but bounded (the prompt caps it at ~500 words).
+        var systemContents = systemPart
+            .Where(m => m.Role == "system" && !string.IsNullOrEmpty(m.Content))
+            .Select(m => m.Content!)
+            .ToList();
+        var priorSummary = StripSummaryBlocks(systemContents);
+
+        var summary = await SummarizeAsync(summarizable, client, priorSummary, ct).ConfigureAwait(false);
 
         // Fold the summary into a SINGLE leading system message. Chat templates for Qwen3.x
         // (and GLM via vLLM) hard-require the only system message to be first and raise
         // "System message must be at the beginning" for any other — so the summary must NOT be
         // its own second system message, or every turn after compaction 400s. Concatenate the
-        // original system prompt with the <conversation_summary> block instead.
+        // original system prompt with the (single) <conversation_summary> block instead.
         var summaryBlock = $"<conversation_summary>\n{summary.Trim()}\n</conversation_summary>";
-        var systemText = string.Join("\n\n", systemPart
-            .Where(m => m.Role == "system" && !string.IsNullOrEmpty(m.Content))
-            .Select(m => m.Content!)
-            .Append(summaryBlock));
+        var systemText = string.Join("\n\n", systemContents.Append(summaryBlock));
 
         var rebuilt = new List<ChatMessage>(1 + tail.Count) { ChatMessage.System(systemText) };
         // Preserve any non-system head messages (there are none in a normal session, whose head
@@ -268,13 +278,49 @@ public sealed class ContextManager
         return (head, body, tail);
     }
 
-    private async Task<string> SummarizeAsync(IReadOnlyList<ChatMessage> body, LiteLLMClient client, CancellationToken ct)
+    private static readonly Regex SummaryBlock = new(
+        @"<conversation_summary>\s*(.*?)\s*</conversation_summary>",
+        RegexOptions.Singleline | RegexOptions.Compiled);
+
+    /// <summary>
+    /// Remove every <c>&lt;conversation_summary&gt;</c> block a prior compaction folded into the system
+    /// content (a build that stacked them may have several) and return their combined inner text, so the
+    /// caller carries it into the NEW summary instead of re-appending — keeping exactly one block. Mutates
+    /// <paramref name="systemContents"/> in place; entries left empty after stripping are dropped.
+    /// </summary>
+    private static string StripSummaryBlocks(List<string> systemContents)
+    {
+        var prior = new StringBuilder();
+        for (var i = 0; i < systemContents.Count; i++)
+        {
+            var content = systemContents[i];
+            var matches = SummaryBlock.Matches(content);
+            if (matches.Count == 0) continue;
+            foreach (Match m in matches)
+            {
+                if (prior.Length > 0) prior.Append("\n\n");
+                prior.Append(m.Groups[1].Value.Trim());
+            }
+            systemContents[i] = SummaryBlock.Replace(content, string.Empty).Trim();
+        }
+        systemContents.RemoveAll(string.IsNullOrEmpty);
+        return prior.ToString();
+    }
+
+    private async Task<string> SummarizeAsync(
+        IReadOnlyList<ChatMessage> body, LiteLLMClient client, string priorSummary, CancellationToken ct)
     {
         var rendered = RenderForSummary(body);
+        // Carry a prior summary forward as the story-so-far so repeated compaction stays cumulative
+        // (one bounded block) instead of stacking blocks or losing older history.
+        var userContent = string.IsNullOrWhiteSpace(priorSummary)
+            ? rendered
+            : "Summary of the conversation SO FAR (compacted earlier — fold it into your new summary so " +
+              "nothing is lost):\n" + priorSummary + "\n\n--- newer conversation to fold in ---\n" + rendered;
         var summaryRequest = new[]
         {
             ChatMessage.System(CompactionPrompt),
-            ChatMessage.User(rendered),
+            ChatMessage.User(userContent),
         };
         return await client.GetCompletionAsync(summaryRequest, MediumModel, ct).ConfigureAwait(false);
     }
