@@ -25,6 +25,11 @@ internal static class Program
 
     public static async Task<int> Main(string[] args)
     {
+        // Capture faults on ANY thread (background workflow/agent tasks, the status ticker) to a crash
+        // log. The TUI teardown can wipe a last-second stderr message, and a fault that never unwinds to
+        // the catch below would otherwise vanish — so an unhandled failure reads as an abrupt, silent
+        // exit. (A truly external kill — AV, OS — writes NO log, which is itself a useful signal.)
+        CrashLog.InstallGlobalHandlers();
         try
         {
             // Windows defaults the console to a non-UTF-8 codepage, which mangles the
@@ -63,7 +68,10 @@ internal static class Program
         }
         catch (Exception ex)
         {
+            var log = CrashLog.Write(ex, "Program.Main");
             await Console.Error.WriteLineAsync($"zdt: {ex.Message}").ConfigureAwait(false);
+            if (log is not null)
+                await Console.Error.WriteLineAsync($"zdt: full details (stack trace) written to {log}").ConfigureAwait(false);
             return 1;
         }
     }
