@@ -309,6 +309,13 @@ internal static class Program
         registry.Register(new EditTool());
         registry.Register(new NotebookEditTool());
         registry.Register(new BashTool(cwd));
+        // Native Windows shells alongside Bash: let the model drive powershell.exe / cmd.exe directly
+        // instead of tunnelling through Git Bash. Windows-only (cmd.exe doesn't exist elsewhere).
+        if (OperatingSystem.IsWindows())
+        {
+            registry.Register(new PowerShellTool(cwd));
+            registry.Register(new CmdTool(cwd));
+        }
         registry.Register(new GlobTool());
         registry.Register(new GrepTool());
         registry.Register(new TodoWriteTool());

@@ -20,7 +20,8 @@ public sealed class TeamModeStateTests
     [Fact]
     public void Blocks_exactly_the_mutating_tools()
     {
-        TeamModeState.BlockedTools.Should().BeEquivalentTo(new[] { "Write", "Edit", "NotebookEdit", "Bash" });
+        TeamModeState.BlockedTools.Should().BeEquivalentTo(
+            new[] { "Write", "Edit", "NotebookEdit", "Bash", "PowerShell", "Cmd" });
         TeamModeState.BlockedTools.Should().NotContain("Read");
         TeamModeState.BlockedTools.Should().NotContain("Agent");
     }

@@ -40,7 +40,7 @@ public sealed class TeamModeState : ITeamModeSwitch
     /// on exactly the mutating surface. The Agent tool and read-only tools stay available.
     /// </summary>
     public static readonly IReadOnlySet<string> BlockedTools =
-        new HashSet<string>(StringComparer.Ordinal) { "Write", "Edit", "NotebookEdit", "Bash" };
+        new HashSet<string>(StringComparer.Ordinal) { "Write", "Edit", "NotebookEdit", "Bash", "PowerShell", "Cmd" };
 
     /// <summary>
     /// Grounding text appended to every user turn while team mode is on, so any model — however far
