@@ -3,16 +3,16 @@ using System.Runtime.InteropServices;
 namespace Zdtllm.Cli.Tui;
 
 /// <summary>
-/// Win32 console-mode interop, used only to turn OFF QuickEdit. In the LEGACY Windows console host
-/// (conhost), selecting text with the mouse puts the console into "mark" mode, which SUSPENDS the
-/// application's stdout — every <c>Console.Write</c> blocks — until the selection is cleared with
-/// Enter/Esc. To the user the whole TUI looks frozen (the status clock stops, output stalls) and
-/// "unfreezes" the moment they hit Enter. Clearing <c>ENABLE_QUICK_EDIT_MODE</c> stops that.
+/// Win32 console-mode interop for QuickEdit. QuickEdit is what lets the user select text with the mouse
+/// to copy it — so by default we LEAVE IT ON (every terminal, including the legacy conhost), because
+/// selection is what users want most.
 ///
-/// But modern terminals (Windows Terminal, VS Code, ConEmu, WezTerm, Alacritty) do their OWN UI-side
-/// selection that never blocks output — and they need QuickEdit left ON for click-drag to select at
-/// all. Disabling it there only robs the user of copy/paste for no benefit. So <see cref="ShouldDisableQuickEdit()"/>
-/// gates the change to the legacy host only; the original mode is restored on exit either way.
+/// The one cost is legacy-conhost-only: while a selection is active, conhost enters "mark" mode which
+/// pauses the app's stdout until the selection is cleared (Enter/Esc/click). That's expected behaviour —
+/// you're reading/copying — and output resumes the instant you clear it; Windows Terminal has no such
+/// pause (its selection is UI-side). A user who prefers the never-pause behaviour (at the cost of losing
+/// selection in conhost) opts in with <c>ZDT_TUI_NO_QUICKEDIT=1</c>, which clears
+/// <c>ENABLE_QUICK_EDIT_MODE</c>. The original mode is restored on exit either way.
 /// </summary>
 internal static class NativeConsoleMode
 {
@@ -22,36 +22,18 @@ internal static class NativeConsoleMode
     public static readonly IntPtr INVALID_HANDLE_VALUE = new(-1);
 
     /// <summary>
-    /// Pure policy (testable): should we turn QuickEdit OFF? Only the legacy conhost suspends output
-    /// on a mouse selection, so disable there; in a modern terminal leave it ON so the user keeps
-    /// click-drag selection (which never freezes output there). Explicit env overrides win.
+    /// Pure policy (testable): should we turn QuickEdit OFF? No — by default keep it ON so mouse
+    /// text-selection works in every terminal. Only the explicit <c>ZDT_TUI_NO_QUICKEDIT=1</c> opt-out
+    /// disables it (trading selection for conhost's never-pause output). Non-Windows: nothing to do.
     /// </summary>
-    internal static bool ShouldDisableQuickEdit(
-        bool isWindows, bool modernTerminal, bool keepOverride, bool forceDisableOverride)
+    internal static bool ShouldDisableQuickEdit(bool isWindows, bool forceDisableOverride)
     {
         if (!isWindows) return false;
-        if (keepOverride) return false;         // ZDT_TUI_KEEP_QUICKEDIT — always keep selection
-        if (forceDisableOverride) return true;  // ZDT_TUI_NO_QUICKEDIT  — always disable
-        return !modernTerminal;
+        return forceDisableOverride; // default false → keep QuickEdit ON → selection works
     }
 
-    /// <summary>
-    /// Known modern terminals whose selection is UI-side (no output-suspend) and which rely on
-    /// QuickEdit being ON for click-drag selection — detected via the env vars they each set.
-    /// Anything else (a bare conhost window) is treated as legacy.
-    /// </summary>
-    internal static bool IsModernTerminal(Func<string, string?> env)
-    {
-        ArgumentNullException.ThrowIfNull(env);
-        static bool Has(Func<string, string?> e, string k) => !string.IsNullOrEmpty(e(k));
-        return Has(env, "WT_SESSION") || Has(env, "WT_PROFILE_ID")                                   // Windows Terminal
-            || string.Equals(env("TERM_PROGRAM"), "vscode", StringComparison.OrdinalIgnoreCase)      // VS Code
-            || Has(env, "ConEmuPID")                                                                 // ConEmu / Cmder
-            || Has(env, "WEZTERM_PANE")                                                              // WezTerm
-            || Has(env, "ALACRITTY_WINDOW_ID");                                                      // Alacritty
-    }
-
-    /// <summary>Runtime wrapper: reads process env + OS to decide. Used by the TUI at startup.</summary>
+    /// <summary>Runtime wrapper: reads process env + OS to decide. Used by the TUI at startup. QuickEdit
+    /// stays ON (selection works) unless <c>ZDT_TUI_NO_QUICKEDIT=1</c> opts out.</summary>
     internal static bool ShouldDisableQuickEdit()
     {
         static bool Flag(string k) =>
@@ -59,8 +41,6 @@ internal static class NativeConsoleMode
             && (v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase));
         return ShouldDisableQuickEdit(
             isWindows: OperatingSystem.IsWindows(),
-            modernTerminal: IsModernTerminal(Environment.GetEnvironmentVariable),
-            keepOverride: Flag("ZDT_TUI_KEEP_QUICKEDIT"),
             forceDisableOverride: Flag("ZDT_TUI_NO_QUICKEDIT"));
     }
 
