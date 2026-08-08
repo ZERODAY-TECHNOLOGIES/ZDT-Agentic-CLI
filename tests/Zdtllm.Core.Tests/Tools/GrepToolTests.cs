@@ -50,6 +50,19 @@ public sealed class GrepToolTests : IDisposable
     }
 
     [Fact]
+    public async Task Skips_the_zdtllm_state_dir()
+    {
+        WriteFile("src.txt", "needle here\n");
+        WriteFile(".zdtllm/sessions/session.jsonl", "needle in the session file\n");
+
+        var result = await GrepAsync(new() { ["pattern"] = "needle" });
+
+        result.IsError.Should().BeFalse();
+        result.Content.Should().Contain("src.txt");
+        result.Content.Should().NotContain("session.jsonl"); // .zdtllm pruned — no grepping our own session
+    }
+
+    [Fact]
     public async Task Content_mode_prints_matched_lines()
     {
         WriteFile("a.txt", "hello world\nanother line\nworld again\n");

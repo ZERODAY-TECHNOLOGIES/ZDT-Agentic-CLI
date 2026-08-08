@@ -8,6 +8,17 @@ public sealed class ReadTool : ITool
     private const int DefaultLimit = 2000;
 
     /// <summary>
+    /// Per-call output budget (characters). Read paginates by LINE (offset/limit), but a file can hold a
+    /// huge amount on few lines — e.g. a 1.5 MB minified/JSON data blob on ONE line — and line limits
+    /// don't bound that. Without a byte budget a single Read could dump ~975k tokens and blow the model's
+    /// context window. So we cap each call at ~this many chars and PAGINATE: for multi-line files, stop at
+    /// a line boundary and tell the model the next offset; for a single over-budget line, show the head
+    /// and point at Grep / Bash byte-slicing for the rest. ~100k chars ≈ 25k tokens — generous for real
+    /// source, small enough that ten reads don't exhaust the window.
+    /// </summary>
+    private const int MaxCharsPerRead = 100_000;
+
+    /// <summary>
     /// Hard cap on file size before <see cref="ExecuteAsync"/> bails out. Defense-in-depth
     /// against the agent reading multi-MB / multi-GB blobs (assets, dumps, parquet, wasm) —
     /// <see cref="File.ReadAllLinesAsync(string, CancellationToken)"/> materialises the
@@ -28,7 +39,7 @@ public sealed class ReadTool : ITool
 
     public ToolSchema Schema { get; } = new(
         Name: "Read",
-        Description: "Read a file from the local filesystem and return its contents with line numbers (1-indexed). Supports an optional offset and limit (in lines).",
+        Description: "Read a file from the local filesystem and return its contents with line numbers (1-indexed). Supports an optional offset and limit (in lines). Output is capped per call (~100KB) and paginated: when a file is large the result ends with the next offset to continue from.",
         Parameters: JsonSerializer.SerializeToElement(new
         {
             type = "object",
@@ -73,18 +84,65 @@ public sealed class ReadTool : ITool
         try
         {
             var lines = await File.ReadAllLinesAsync(fullPath, ct);
-            var slice = lines.Skip(offset - 1).Take(limit).ToArray();
+            var total = lines.Length;
+            if (total == 0) return ToolResult.Success("(empty file)");
 
-            var sb = new StringBuilder(capacity: slice.Length * 80);
-            for (var i = 0; i < slice.Length; i++)
+            var startIdx = offset - 1; // 0-based
+            if (startIdx >= total)
+                return ToolResult.Success($"[offset {offset} is past the end of the file ({total} lines)]");
+
+            var sb = new StringBuilder(capacity: Math.Min(MaxCharsPerRead, 64 * 1024));
+            var emitted = 0;         // lines emitted this call
+            var chars = 0;           // chars written so far (budget)
+            var budgetHit = false;   // stopped because the char budget was reached
+            var partialLine = false; // a single line exceeded the whole budget; we showed its head only
+
+            var i = startIdx;
+            for (; i < total && emitted < limit; i++)
             {
-                sb.Append((offset + i).ToString().PadLeft(6));
-                sb.Append('\t');
-                sb.AppendLine(slice[i]);
+                var prefix = (i + 1).ToString().PadLeft(6);
+                var line = lines[i];
+                var cost = prefix.Length + 1 /*tab*/ + line.Length + 1 /*newline*/;
+
+                if (chars == 0 && cost > MaxCharsPerRead)
+                {
+                    // One line bigger than the entire budget — show a leading slice, then stop.
+                    var room = Math.Max(0, MaxCharsPerRead - prefix.Length - 1);
+                    sb.Append(prefix).Append('\t').Append(line.AsSpan(0, Math.Min(room, line.Length))).Append('\n');
+                    emitted++;
+                    partialLine = true;
+                    budgetHit = true;
+                    break;
+                }
+                if (chars > 0 && chars + cost > MaxCharsPerRead)
+                {
+                    budgetHit = true;
+                    break;
+                }
+
+                sb.Append(prefix).Append('\t').Append(line).Append('\n');
+                chars += cost;
+                emitted++;
             }
 
-            if (offset > 1 || lines.Length > offset - 1 + slice.Length)
-                sb.AppendLine($"\n[showing lines {offset}-{offset + slice.Length - 1} of {lines.Length}]");
+            var lastShown = offset + emitted - 1;
+
+            if (partialLine)
+            {
+                var lineLen = lines[startIdx].Length;
+                sb.Append($"\n[line {offset} is very large ({lineLen:N0} chars) — showed the first ~{MaxCharsPerRead / 1000}K only. " +
+                    "Looks like a single-line data blob (minified/JSON). Read specific parts with Grep for a key, or " +
+                    $"slice bytes with Bash (e.g. `cut -c {MaxCharsPerRead + 1}-{MaxCharsPerRead * 2} <file>`) — reading it whole wastes context.]");
+            }
+            else if (budgetHit)
+            {
+                sb.Append($"\n[showing lines {offset}-{lastShown} of {total} — output capped at ~{MaxCharsPerRead / 1000}K. " +
+                    $"Continue with offset: {lastShown + 1}]");
+            }
+            else if (offset > 1 || total > lastShown)
+            {
+                sb.Append($"\n[showing lines {offset}-{lastShown} of {total}]");
+            }
 
             return ToolResult.Success(sb.ToString());
         }

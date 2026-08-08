@@ -135,6 +135,56 @@ public sealed class ReadToolTests : IDisposable
     }
 
     [Fact]
+    public async Task Caps_output_and_paginates_a_large_multiline_file()
+    {
+        // 3000 lines of 100 chars ≈ 300 KB — well over the ~100 KB per-call budget, so the read is
+        // capped mid-file and told where to continue (line-offset pagination, not a hard truncation).
+        var content = string.Join('\n', Enumerable.Repeat(new string('x', 100), 3000)) + "\n";
+        await File.WriteAllTextAsync(Path.Combine(_tempDir, "big.txt"), content);
+
+        var result = await ReadAsync("big.txt");
+
+        result.IsError.Should().BeFalse();
+        result.Content.Length.Should().BeLessThan(110_000);      // capped near the ~100 KB budget
+        result.Content.Should().Contain("     1\t");             // starts from line 1
+        result.Content.Should().Contain("output capped");
+        result.Content.Should().MatchRegex(@"Continue with offset: \d+");
+    }
+
+    [Fact]
+    public async Task Continuation_offset_reads_the_next_page()
+    {
+        var content = string.Join('\n', Enumerable.Repeat(new string('x', 100), 3000)) + "\n";
+        await File.WriteAllTextAsync(Path.Combine(_tempDir, "big.txt"), content);
+
+        var first = await ReadAsync("big.txt");
+        var m = System.Text.RegularExpressions.Regex.Match(first.Content, @"Continue with offset: (\d+)");
+        m.Success.Should().BeTrue();
+        var next = int.Parse(m.Groups[1].Value);
+
+        var second = await ReadAsync("big.txt", offset: next);
+
+        second.IsError.Should().BeFalse();
+        second.Content.Should().Contain($"{next}\t");            // the next page begins exactly where we left off
+        first.Content.Should().NotContain($"\n{next}\t");        // ...and the first page did NOT already include it
+    }
+
+    [Fact]
+    public async Task Single_huge_line_shows_only_the_head_and_guides_to_byte_slicing()
+    {
+        // The exact shape that blew the context window: a big minified/JSON blob on ONE line. Line limits
+        // don't bound it, so the byte budget must — show the head, then point at Grep / Bash slicing.
+        await File.WriteAllTextAsync(Path.Combine(_tempDir, "blob.json"), new string('J', 300_000));
+
+        var result = await ReadAsync("blob.json");
+
+        result.IsError.Should().BeFalse();
+        result.Content.Length.Should().BeLessThan(110_000);      // only the head, not all 300 KB
+        result.Content.Should().Contain("very large");
+        result.Content.Should().Contain("cut -c");               // Bash byte-slice guidance for the rest
+    }
+
+    [Fact]
     public async Task File_path_takes_precedence_when_both_aliases_provided()
     {
         await File.WriteAllTextAsync(Path.Combine(_tempDir, "win.txt"), "winner\n");

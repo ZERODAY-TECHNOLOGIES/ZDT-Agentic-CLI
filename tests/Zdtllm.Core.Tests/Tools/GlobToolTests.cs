@@ -54,6 +54,23 @@ public sealed class GlobToolTests : IDisposable
     }
 
     [Fact]
+    public async Task Excludes_zdtllm_and_build_dirs_from_recursive_glob()
+    {
+        Touch("src/a.cs");
+        Touch(".zdtllm/sessions/huge.jsonl");
+        Touch("bin/Debug/x.dll");
+        Touch("obj/y.cs");
+
+        var result = await GlobAsync("**/*");
+
+        result.IsError.Should().BeFalse();
+        result.Content.Should().Contain("a.cs");
+        result.Content.Should().NotContain("huge.jsonl"); // .zdtllm pruned — stops the session-file feedback loop
+        result.Content.Should().NotContain("x.dll");      // bin pruned
+        result.Content.Should().NotContain("y.cs");       // obj pruned
+    }
+
+    [Fact]
     public async Task Recursive_double_star_finds_files_in_subdirectories()
     {
         Touch("a.txt");

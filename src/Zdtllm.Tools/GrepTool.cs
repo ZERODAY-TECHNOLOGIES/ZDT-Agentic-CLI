@@ -10,12 +10,8 @@ public sealed class GrepTool : ITool
 {
     private const int DefaultHeadLimit = 250;
 
-    // Build-output / VCS / IDE directories that ripgrep would skip via .gitignore. Scanning them
-    // buries real hits under compiled artefacts and thrashes I/O; prune them during enumeration.
-    private static readonly HashSet<string> IgnoredDirs = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".git", ".hg", ".svn", "node_modules", "bin", "obj", ".vs", ".idea", ".vscode", "dist",
-    };
+    // Ignored dirs (VCS/build/IDE noise + zdt's own .zdtllm state) live in the shared SearchExclusions
+    // so Grep and Glob prune identically. See SearchExclusions for why .zdtllm matters (feedback loop).
 
     // Common ripgrep --type aliases → globs. Only the frequent ones; unknown types fall back to
     // "scan everything" so the tool never errors on an unmapped alias.
@@ -116,7 +112,7 @@ public sealed class GrepTool : ITool
                 // Matcher walks the whole tree — drop hits under an ignored dir so bin/obj/node_modules
                 // don't sneak back in via a glob/type filter.
                 files = result.Files
-                    .Where(f => !IsUnderIgnoredDir(f.Path))
+                    .Where(f => !SearchExclusions.IsUnderIgnoredDir(f.Path))
                     .Select(f => Path.Combine(fullPath, f.Path));
             }
             else
@@ -232,7 +228,7 @@ public sealed class GrepTool : ITool
             foreach (var sub in subDirs)
             {
                 var name = Path.GetFileName(sub);
-                if (IgnoredDirs.Contains(name)) continue;
+                if (SearchExclusions.IsIgnoredDirName(name)) continue;
                 stack.Push(sub);
             }
 
@@ -243,13 +239,6 @@ public sealed class GrepTool : ITool
 
             foreach (var f in filesInDir) yield return f;
         }
-    }
-
-    private static bool IsUnderIgnoredDir(string relativePath)
-    {
-        foreach (var seg in relativePath.Split('/', '\\'))
-            if (IgnoredDirs.Contains(seg)) return true;
-        return false;
     }
 
     /// <summary>Cheap binary sniff: a NUL byte in the first 8 KiB means "not text" — skip it so a

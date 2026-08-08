@@ -7,7 +7,11 @@ namespace Zdtllm.Tools;
 
 public sealed class GlobTool : ITool
 {
-    private const int MaxResults = 5000;
+    // Lower than the old 5000: a glob returning thousands of paths is unusable and eats the context
+    // window. Combined with SearchExclusions (which prunes .git/bin/obj/node_modules AND zdt's own
+    // .zdtllm session dir), a real pattern returns a manageable list; over-broad ones get truncated
+    // with a "narrow it" hint rather than dumping the whole tree.
+    private const int MaxResults = 1000;
 
     public ToolSchema Schema { get; } = new(
         Name: "Glob",
@@ -50,21 +54,27 @@ public sealed class GlobTool : ITool
             matcher.AddInclude(pattern);
             var result = matcher.Execute(new DirectoryInfoWrapper(new DirectoryInfo(fullPath)));
 
-            var matched = result.Files
+            var all = result.Files
+                .Where(f => !SearchExclusions.IsUnderIgnoredDir(f.Path)) // skip .git/bin/obj/.zdtllm/…
                 .Select(f => Path.Combine(fullPath, f.Path))
                 .Where(File.Exists)
                 .Select(p => new FileInfo(p))
                 .OrderByDescending(fi => fi.LastWriteTimeUtc)
-                .Take(MaxResults)
+                .ToList();
+
+            if (all.Count == 0)
+                return Task.FromResult(ToolResult.Success("(no matches)"));
+
+            var truncated = all.Count > MaxResults;
+            var shown = all.Take(MaxResults)
                 .Select(fi => Path.GetRelativePath(fullPath, fi.FullName))
                 .ToList();
 
-            if (matched.Count == 0)
-                return Task.FromResult(ToolResult.Success("(no matches)"));
-
             var sb = new StringBuilder();
-            sb.AppendLine($"{matched.Count} match(es):");
-            foreach (var rel in matched)
+            sb.AppendLine(truncated
+                ? $"{shown.Count} of {all.Count} match(es) (truncated — narrow the pattern or search a subdirectory):"
+                : $"{shown.Count} match(es):");
+            foreach (var rel in shown)
                 sb.AppendLine(rel);
 
             return Task.FromResult(ToolResult.Success(sb.ToString()));
