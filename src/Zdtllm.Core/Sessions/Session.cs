@@ -11,7 +11,8 @@ namespace Zdtllm.Core.Sessions;
 public sealed class Session : IDisposable
 {
     private readonly List<ChatMessage> _messages = new();
-    private readonly SessionStore? _store;
+    // Not readonly: /incognito detaches the store mid-session (sets it null) so nothing more is persisted.
+    private SessionStore? _store;
 
     public string Id { get; }
     public string Model { get; private set; }
@@ -224,6 +225,21 @@ public sealed class Session : IDisposable
         {
             AddUser(nudge);
         }
+    }
+
+    /// <summary>
+    /// Switch to incognito: stop persisting future events AND delete whatever this session already wrote
+    /// to disk. The conversation continues purely in memory and vanishes when the process exits. No-op if
+    /// the session was never persistent. After this <see cref="IsPersistent"/> is false. Returns true if a
+    /// persisted file was actually detached/deleted (false if already ephemeral).
+    /// </summary>
+    public bool GoIncognito()
+    {
+        var store = _store;
+        _store = null; // future mutations are in-memory only
+        if (store is null) return false;
+        try { store.DeleteFile(); } catch { /* best effort — losing the file is the whole point */ }
+        return true;
     }
 
     public void Rename(string? newName)

@@ -91,6 +91,20 @@ public sealed class SessionStore : IDisposable
         }
     }
 
+    /// <summary>
+    /// Close the writer and delete the on-disk JSONL. Used by incognito mode to erase everything written
+    /// so far while the conversation keeps running in memory. Best-effort: a locked or already-gone file
+    /// is ignored. The store is spent afterwards (further <see cref="Append"/> throws; Dispose is a no-op).
+    /// </summary>
+    public void DeleteFile()
+    {
+        try { _writer?.Flush(); } catch { /* best effort */ }
+        try { _writer?.Dispose(); } catch { /* best effort */ }
+        _writer = null;
+        _disposed = true;
+        try { if (File.Exists(_path)) File.Delete(_path); } catch { /* best effort — the file may be locked */ }
+    }
+
     public void Dispose()
     {
         if (_disposed) return;

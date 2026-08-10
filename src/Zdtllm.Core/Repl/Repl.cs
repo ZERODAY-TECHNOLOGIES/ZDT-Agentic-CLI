@@ -162,6 +162,16 @@ public sealed class Repl
                     _richInput?.TakePendingImages(); // a built-in slash command carries no attachment
                     var slashResult = await HandleSlashAsync(trimmed, ct).ConfigureAwait(false);
                     if (slashResult == SlashOutcome.Exit) return 0;
+                    // A message typed while the command ran (e.g. during /compact's summarise) lands in
+                    // the queue, but a command — unlike a turn — doesn't drain it. Run it now so queued
+                    // input after /compact isn't stranded until the user submits something else.
+                    if (_inputQueue is not null && _inputQueue.TryDequeue(out var queuedAfterCmd))
+                    {
+                        await _output.WriteLineAsync(
+                            Palette.Cyan("▶ running queued message: ") + Palette.Mute(Truncate(queuedAfterCmd, 80)))
+                            .ConfigureAwait(false);
+                        await RunTurnAndFollowupsAsync(queuedAfterCmd, ct).ConfigureAwait(false);
+                    }
                     continue;
                 }
 
@@ -468,6 +478,11 @@ public sealed class Repl
                 await HandleCompactCommandAsync(ct).ConfigureAwait(false);
                 return SlashOutcome.Continue;
 
+            case "/incognito":
+            case "/private":
+                await HandleIncognitoCommandAsync().ConfigureAwait(false);
+                return SlashOutcome.Continue;
+
             case "/context":
                 await HandleContextCommandAsync().ConfigureAwait(false);
                 return SlashOutcome.Continue;
@@ -529,6 +544,7 @@ public sealed class Repl
         await WriteCommandRowAsync("/permissions", "show the current permission rule set").ConfigureAwait(false);
         await WriteCommandRowAsync("/init", "create ZDTLLM.md (project memory file) in the cwd").ConfigureAwait(false);
         await WriteCommandRowAsync("/compact", "summarize older turns to free context").ConfigureAwait(false);
+        await WriteCommandRowAsync("/incognito", "stop saving this conversation & delete its file (in-memory only)").ConfigureAwait(false);
         await WriteCommandRowAsync("/plan", "toggle plan mode (read-only; propose a plan before changes)").ConfigureAwait(false);
         await WriteCommandRowAsync("/workflows", "list declarative workflows in .zdtllm/workflows/").ConfigureAwait(false);
         await WriteCommandRowAsync("/workflow <name> [k=v]", "run a multi-agent workflow").ConfigureAwait(false);
@@ -753,6 +769,23 @@ public sealed class Repl
             return;
         }
         await _output.WriteLineAsync(_configDump()).ConfigureAwait(false);
+    }
+
+    private async Task HandleIncognitoCommandAsync()
+    {
+        if (!_session.IsPersistent)
+        {
+            await _output.WriteLineAsync(
+                Palette.Mute("Already incognito — this conversation isn't being saved to disk.")).ConfigureAwait(false);
+            return;
+        }
+
+        _session.GoIncognito();
+        await _output.WriteLineAsync(
+            Palette.Cyan("● incognito on") + " " +
+            Palette.Mute("— this conversation is no longer saved, and the record written so far has been " +
+            "deleted. It now lives only in memory until you exit. (Files the model writes still persist.)"))
+            .ConfigureAwait(false);
     }
 
     private async Task HandleCompactCommandAsync(CancellationToken ct)

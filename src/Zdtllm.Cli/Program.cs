@@ -1440,6 +1440,14 @@ internal static class Program
         string cwd,
         bool defaultPersistent)
     {
+        // Incognito wins over everything: a purely in-memory session, no file created, no resume — the
+        // conversation leaves no trace on disk. (Tool side-effects on the workspace still happen.)
+        if (parsed.Incognito)
+        {
+            var (im, imo) = ResolveModelAndMode(parsed, settings);
+            return Session.NewEphemeral(im, imo);
+        }
+
         if (parsed.SessionId is not null)
         {
             var path = Path.Combine(sessionsDir, $"{parsed.SessionId}.jsonl");

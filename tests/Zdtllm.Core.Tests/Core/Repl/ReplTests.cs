@@ -95,6 +95,36 @@ public sealed class ReplTests : IDisposable
     }
 
     [Fact]
+    public async Task Message_queued_during_a_slash_command_runs_after_it()
+    {
+        // A line typed while a command ran (e.g. during /compact's summarise) lands in the queue. A
+        // command doesn't drain it like a turn does, so the fix must run it once the command returns —
+        // otherwise it's stranded until the user submits something else.
+        var queue = new UserInputQueue();
+        queue.Enqueue("what is 2+2?");
+
+        var session = Session.NewEphemeral("test-model");
+        var handler = new StubHandler(SimpleTextResponse("four"));
+        var client = new LiteLLMClient(new HttpClient(handler), new LiteLLMClientOptions
+        {
+            BaseUrl = "http://stub", ApiKey = "k", MaxRetries = 0, InitialBackoff = TimeSpan.FromMilliseconds(1),
+        });
+        var agent = new AgentLoop(client, new ToolRegistry(), PermissionRuleSet.Empty,
+            new AgentLoopOptions { Model = "test-model" });
+        var output = new StringWriter();
+        var repl = new Zdtllm.Core.Repl.Repl(
+            session, agent, new StringReader("/help\n/exit\n"), output, new StringWriter(), _tempDir,
+            inputQueue: queue);
+
+        await repl.RunAsync();
+
+        var text = output.ToString();
+        text.Should().Contain("running queued message");
+        text.Should().Contain("four");        // the queued turn actually ran and produced its answer
+        queue.HasPending.Should().BeFalse();   // and the queue was drained
+    }
+
+    [Fact]
     public async Task Slash_exit_returns_zero_immediately()
     {
         var (repl, _, _, _) = BuildRepl("/exit\n");

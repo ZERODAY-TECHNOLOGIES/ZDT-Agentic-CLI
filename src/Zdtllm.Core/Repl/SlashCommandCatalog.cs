@@ -23,6 +23,7 @@ public static class SlashCommandCatalog
         new SlashCommandInfo("/workflows", "list declarative workflows in .zdtllm/workflows/"),
         new SlashCommandInfo("/context", "show context-window usage and per-role breakdown"),
         new SlashCommandInfo("/compact", "summarize older turns to free context"),
+        new SlashCommandInfo("/incognito", "stop saving this conversation & delete its file (in-memory only)"),
         new SlashCommandInfo("/status", "show session id, model, mode, message count"),
         new SlashCommandInfo("/cost", "show token usage for this session"),
         new SlashCommandInfo("/export", "write the conversation to a markdown file (/export [path])"),

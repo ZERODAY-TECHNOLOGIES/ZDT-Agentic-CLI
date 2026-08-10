@@ -35,6 +35,10 @@ internal static class ArgumentParser
                 case "--no-wizard":
                     result.NoWizard = true;
                     break;
+                case "--incognito":
+                case "--private":
+                    result.Incognito = true;
+                    break;
                 case "--bare":
                     result.Bare = true;
                     break;
@@ -181,6 +185,11 @@ internal sealed class ParsedArgs
     public int? MaxParallel { get; set; }
     public bool DangerouslySkipPermissions { get; set; }
     public bool NoWizard { get; set; }
+
+    /// <summary>Incognito: run a purely in-memory session — nothing is written to the sessions dir, and
+    /// (interactively via <c>/incognito</c>) an already-persisted file is deleted. Tool side-effects on
+    /// the workspace still happen; only the conversation record is ephemeral.</summary>
+    public bool Incognito { get; set; }
     public bool Bare { get; set; }
     /// <summary>Start the interactive session in plan mode (read-only; drafts a plan for approval).</summary>
     public bool Plan { get; set; }
