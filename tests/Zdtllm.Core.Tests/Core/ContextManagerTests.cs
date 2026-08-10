@@ -394,6 +394,34 @@ public sealed class ContextManagerTests : IDisposable
     }
 
     [Fact]
+    public void TruncateOldToolResults_also_shortens_xml_mode_tool_result_user_turns()
+    {
+        // XML tool-calling feeds results back as synthetic user turns ("EXECUTION RESULT of [Tool]:"),
+        // not role="tool". Truncation must treat those the same, or a tool-heavy XML-mode session
+        // accumulates unbounded output (as user turns) and blows the context window.
+        using var session = Session.NewEphemeral("m");
+        var ctx = new ContextManager(contextWindow: 100_000, mediumModel: "med");
+
+        session.AddSystem("sys");
+        session.AddUser("do the big task");
+        for (var i = 0; i < 6; i++)
+        {
+            session.AddAssistant($"<function_calls> read {i}", ImmutableArray<ToolCall>.Empty);
+            session.AddUser("EXECUTION RESULT of [Read]:\n" + new string((char)('a' + i), 6_000));
+        }
+
+        var truncated = ctx.TruncateOldToolResults(session, keepLastToolResults: 3, perResultCap: 2_000);
+
+        truncated.Should().Be(3); // the three oldest of the six XML tool-result turns
+        var toolTurns = session.Messages
+            .Where(m => m.Role == "user" && m.Content!.StartsWith("EXECUTION RESULT of [", StringComparison.Ordinal))
+            .ToList();
+        toolTurns.Should().HaveCount(6);
+        toolTurns.Take(3).Should().OnlyContain(m => m.Content!.Contains("truncated") && m.Content!.Length < 6_000);
+        toolTurns.Skip(3).Should().OnlyContain(m => m.Content!.Length >= 6_000); // freshest kept verbatim
+    }
+
+    [Fact]
     public void TruncateOldToolResults_is_a_noop_when_too_few_tool_results()
     {
         using var session = Session.NewEphemeral("m");

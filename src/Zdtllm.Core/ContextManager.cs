@@ -209,10 +209,13 @@ public sealed class ContextManager
 
         var msgs = session.Messages;
 
-        // Index of every tool-result message, in order.
+        // Index of every tool-result message, in order. Covers BOTH tool-calling shapes: the native
+        // `tool` role, and XML mode's synthetic `user` turn framed as "EXECUTION RESULT of [Tool]:".
+        // Without the XML case a tool-heavy XML-mode session accumulates tool output (as user turns) that
+        // this pass can't touch, and the context window blows (a request hit ~261k tokens at the limit).
         var toolIdx = new List<int>();
         for (var i = 0; i < msgs.Count; i++)
-            if (msgs[i].Role == "tool") toolIdx.Add(i);
+            if (IsToolResultMessage(msgs[i])) toolIdx.Add(i);
 
         if (toolIdx.Count <= keepLastToolResults) return 0;
 
@@ -224,7 +227,7 @@ public sealed class ContextManager
         for (var i = 0; i < msgs.Count; i++)
         {
             var m = msgs[i];
-            if (m.Role == "tool" && i < firstKept
+            if (IsToolResultMessage(m) && i < firstKept
                 && m.Content is { Length: > 0 } content && content.Length > perResultCap)
             {
                 var elided = content.Length - perResultCap;
@@ -247,6 +250,17 @@ public sealed class ContextManager
         LastPromptTokens = 0;
         return truncated;
     }
+
+    /// <summary>
+    /// A message holding tool output that <see cref="TruncateOldToolResults"/> may shorten: either the
+    /// native <c>tool</c> role, or XML mode's representation — a synthetic <c>user</c> turn whose content
+    /// begins with <c>EXECUTION RESULT of [</c>. A real user message never starts with that literal, so
+    /// the check can't misfire on genuine prompts.
+    /// </summary>
+    private static bool IsToolResultMessage(ChatMessage m) =>
+        m.Role == "tool"
+        || (m.Role == "user" && m.Content is { Length: > 0 } c
+            && c.StartsWith("EXECUTION RESULT of [", StringComparison.Ordinal));
 
     /// <summary>
     /// Visible for tests. Splits the message list into (system+, summarizable, tail).
